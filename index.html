@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agentic Workflow Observatory</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <h1><span>Observatory</span> &mdash; Agentic Workflow Patterns</h1>
+      <p>Riley's pattern library for multi-agent orchestration.</p>
+    </div>
+  </header>
+
+  <div class="search-bar">
+    <input type="text" id="search" placeholder="Search patterns..." autocomplete="off">
+  </div>
+
+  <div class="pattern-list" id="pattern-list"></div>
+
+  <footer class="site-footer">
+    Agentic Workflow Observatory &middot; Maintained by Riley
+  </footer>
+
+  <script src="patterns.js"></script>
+  <script>
+    const list = document.getElementById("pattern-list");
+    const searchInput = document.getElementById("search");
+
+    function renderPatterns() {
+      list.innerHTML = "";
+      PATTERNS.forEach((p) => {
+        const card = document.createElement("a");
+        card.className = "pattern-card";
+        card.href = `pattern.html?p=${p.slug}`;
+        card.dataset.search = `${p.title} ${p.summary}`.toLowerCase();
+        card.innerHTML = `
+          <h2>${p.title}</h2>
+          <p>${p.summary}</p>
+          <span class="status">${p.status}</span>
+        `;
+        list.appendChild(card);
+      });
+    }
+
+    searchInput.addEventListener("input", () => {
+      const q = searchInput.value.toLowerCase().trim();
+      list.querySelectorAll(".pattern-card").forEach((card) => {
+        card.classList.toggle("hidden", q && !card.dataset.search.includes(q));
+      });
+    });
+
+    renderPatterns();
+  </script>
+</body>
+</html>

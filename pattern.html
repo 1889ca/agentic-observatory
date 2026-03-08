@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pattern — Observatory</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="inner">
+      <h1><a href="index.html" style="color: inherit; text-decoration: none;"><span>Observatory</span></a></h1>
+    </div>
+  </header>
+
+  <div class="pattern-content" id="content">
+    <a href="index.html" class="back">&larr; All patterns</a>
+    <div class="loading">Loading pattern...</div>
+  </div>
+
+  <footer class="site-footer">
+    Agentic Workflow Observatory &middot; Maintained by Riley
+  </footer>
+
+  <script src="patterns.js"></script>
+  <script>
+    const content = document.getElementById("content");
+    const params = new URLSearchParams(window.location.search);
+    const slug = params.get("p");
+
+    const meta = PATTERNS.find((p) => p.slug === slug);
+
+    if (!slug || !meta) {
+      content.innerHTML = `
+        <a href="index.html" class="back">&larr; All patterns</a>
+        <h1>Pattern not found</h1>
+        <p>No pattern matching "${slug || "(none)"}". <a href="index.html">Back to all patterns</a>.</p>
+      `;
+    } else {
+      document.title = `${meta.title} — Observatory`;
+      fetch(`patterns/${slug}.md`)
+        .then((r) => {
+          if (!r.ok) throw new Error("Not found");
+          return r.text();
+        })
+        .then((md) => {
+          content.innerHTML = `
+            <a href="index.html" class="back">&larr; All patterns</a>
+            ${renderMarkdown(md)}
+          `;
+        })
+        .catch(() => {
+          content.innerHTML = `
+            <a href="index.html" class="back">&larr; All patterns</a>
+            <h1>${meta.title}</h1>
+            <p class="summary">${meta.summary}</p>
+            <p>Pattern content not yet available.</p>
+          `;
+        });
+    }
+
+    /**
+     * Minimal markdown renderer — no dependencies.
+     * Handles: h1, h2, h3, blockquote, ul, code blocks, inline code, links, paragraphs.
+     */
+    function renderMarkdown(md) {
+      const lines = md.split("\n");
+      let html = "";
+      let inCode = false;
+      let inList = false;
+      let buf = "";
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+
+        // Fenced code blocks
+        if (line.startsWith("```")) {
+          if (inCode) {
+            html += escapeHtml(buf) + "</code></pre>";
+            buf = "";
+            inCode = false;
+          } else {
+            if (inList) { html += "</ul>"; inList = false; }
+            inCode = true;
+            html += "<pre><code>";
+          }
+          continue;
+        }
+        if (inCode) {
+          buf += (buf ? "\n" : "") + line;
+          continue;
+        }
+
+        // Close list if non-list line
+        if (inList && !line.startsWith("- ")) {
+          html += "</ul>";
+          inList = false;
+        }
+
+        // Headings
+        if (line.startsWith("# ")) {
+          html += `<h1>${inline(line.slice(2))}</h1>`;
+        } else if (line.startsWith("## ")) {
+          html += `<h2>${inline(line.slice(3))}</h2>`;
+        } else if (line.startsWith("### ")) {
+          html += `<h3>${inline(line.slice(4))}</h3>`;
+        }
+        // Blockquote
+        else if (line.startsWith("> ")) {
+          html += `<p class="summary">${inline(line.slice(2))}</p>`;
+        }
+        // List item
+        else if (line.startsWith("- ")) {
+          if (!inList) { html += "<ul>"; inList = true; }
+          html += `<li>${inline(line.slice(2))}</li>`;
+        }
+        // HTML comment (skip)
+        else if (line.trim().startsWith("<!--")) {
+          continue;
+        }
+        // Blank line
+        else if (line.trim() === "") {
+          continue;
+        }
+        // Paragraph
+        else {
+          html += `<p>${inline(line)}</p>`;
+        }
+      }
+
+      if (inList) html += "</ul>";
+      return html;
+    }
+
+    function inline(text) {
+      return text
+        // inline code
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        // bold
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        // italic
+        .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+        // links — rewrite .md hrefs to pattern.html?p=slug
+        .replace(/\[([^\]]+)\]\(\.\/([^)]+)\.md\)/g, (_, label, file) => {
+          return `<a href="pattern.html?p=${file}">${label}</a>`;
+        })
+        // external links
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,253 @@
+:root {
+  --bg: #0a0a0f;
+  --surface: #12121a;
+  --surface-hover: #1a1a26;
+  --border: #2a2a3a;
+  --text: #e0e0e8;
+  --text-muted: #8888a0;
+  --accent: #7c6cf0;
+  --accent-dim: #5a4ec0;
+  --tag-bg: #1e1e30;
+  --code-bg: #0e0e16;
+  --max-width: 900px;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* Header */
+.site-header {
+  border-bottom: 1px solid var(--border);
+  padding: 2rem 1.5rem;
+}
+
+.site-header .inner {
+  max-width: var(--max-width);
+  margin: 0 auto;
+}
+
+.site-header h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.site-header h1 span {
+  color: var(--accent);
+}
+
+.site-header p {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-top: 0.25rem;
+}
+
+/* Search */
+.search-bar {
+  max-width: var(--max-width);
+  margin: 2rem auto 0;
+  padding: 0 1.5rem;
+}
+
+.search-bar input {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.95rem;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.search-bar input::placeholder {
+  color: var(--text-muted);
+}
+
+.search-bar input:focus {
+  border-color: var(--accent-dim);
+}
+
+/* Pattern List */
+.pattern-list {
+  max-width: var(--max-width);
+  margin: 1.5rem auto;
+  padding: 0 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.pattern-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  transition: background 0.15s, border-color 0.15s;
+  display: block;
+}
+
+.pattern-card:hover {
+  background: var(--surface-hover);
+  border-color: var(--accent-dim);
+  text-decoration: none;
+}
+
+.pattern-card h2 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
+.pattern-card p {
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+
+.pattern-card .status {
+  display: inline-block;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  background: var(--tag-bg);
+  color: var(--text-muted);
+  margin-top: 0.5rem;
+}
+
+/* Pattern Page */
+.pattern-content {
+  max-width: var(--max-width);
+  margin: 2rem auto;
+  padding: 0 1.5rem 4rem;
+}
+
+.pattern-content .back {
+  display: inline-block;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  margin-bottom: 1.5rem;
+}
+
+.pattern-content .back:hover {
+  color: var(--accent);
+}
+
+.pattern-content h1 {
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.5rem;
+}
+
+.pattern-content .summary {
+  color: var(--text-muted);
+  font-size: 1rem;
+  margin-bottom: 2rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.pattern-content h2 {
+  font-size: 1.2rem;
+  font-weight: 600;
+  margin-top: 2rem;
+  margin-bottom: 0.75rem;
+  color: var(--accent);
+}
+
+.pattern-content p,
+.pattern-content li {
+  font-size: 0.95rem;
+  line-height: 1.7;
+  margin-bottom: 0.5rem;
+}
+
+.pattern-content ul {
+  padding-left: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.pattern-content pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+  overflow-x: auto;
+  margin: 1rem 0;
+}
+
+.pattern-content code {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.85rem;
+}
+
+.pattern-content p code {
+  background: var(--code-bg);
+  padding: 0.15rem 0.4rem;
+  border-radius: 3px;
+}
+
+/* Related patterns */
+.related-patterns {
+  margin-top: 2.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+}
+
+.related-patterns h2 {
+  margin-top: 0;
+}
+
+/* Footer */
+.site-footer {
+  border-top: 1px solid var(--border);
+  padding: 1.5rem;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+/* Loading / Error */
+.loading {
+  text-align: center;
+  color: var(--text-muted);
+  padding: 4rem 0;
+}
+
+/* Hidden for search */
+.hidden {
+  display: none;
+}
+
+@media (max-width: 600px) {
+  .site-header {
+    padding: 1.5rem 1rem;
+  }
+  .search-bar,
+  .pattern-list,
+  .pattern-content {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+}
