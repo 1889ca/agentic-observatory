@@ -31,10 +31,12 @@
     const meta = PATTERNS.find((p) => p.slug === slug);
 
     if (!slug || !meta) {
+      const safe = document.createElement("span");
+      safe.textContent = slug || "(none)";
       content.innerHTML = `
         <a href="index.html" class="back">&larr; All patterns</a>
         <h1>Pattern not found</h1>
-        <p>No pattern matching "${slug || "(none)"}". <a href="index.html">Back to all patterns</a>.</p>
+        <p>No pattern matching "${safe.innerHTML}". <a href="index.html">Back to all patterns</a>.</p>
       `;
     } else {
       document.title = `${meta.title} — Observatory`;
