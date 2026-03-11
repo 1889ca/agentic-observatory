@@ -135,6 +135,16 @@ a:hover {
   margin-top: 0.5rem;
 }
 
+.pattern-card .status.published {
+  background: #1a2e1a;
+  color: #6ec96e;
+}
+
+.pattern-card .status.draft {
+  background: #2e2a1a;
+  color: #c9b86e;
+}
+
 /* Pattern Page */
 .pattern-content {
   max-width: var(--max-width);

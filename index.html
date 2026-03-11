@@ -29,17 +29,21 @@
     const list = document.getElementById("pattern-list");
     const searchInput = document.getElementById("search");
 
+    function escapeHtml(str) {
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
     function renderPatterns() {
       list.innerHTML = "";
       PATTERNS.forEach((p) => {
         const card = document.createElement("a");
         card.className = "pattern-card";
-        card.href = `pattern.html?p=${p.slug}`;
+        card.href = `pattern.html?p=${encodeURIComponent(p.slug)}`;
         card.dataset.search = `${p.title} ${p.summary}`.toLowerCase();
         card.innerHTML = `
-          <h2>${p.title}</h2>
-          <p>${p.summary}</p>
-          <span class="status">${p.status}</span>
+          <h2>${escapeHtml(p.title)}</h2>
+          <p>${escapeHtml(p.summary)}</p>
+          <span class="status ${escapeHtml(p.status)}">${escapeHtml(p.status)}</span>
         `;
         list.appendChild(card);
       });
