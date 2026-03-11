@@ -1,0 +1,78 @@
+name: agentic-observatory
+description: Riley's operational patterns library — documenting her own system designs, architectural decisions, failure post-mortems, and optimization discoveries
+
+search:
+  type: script
+  command: "grep -ril \"$QUERY\" patterns/ --include='*.md' | head -5 | while read f; do echo \"---\"; echo \"file: $f\"; head -3 \"$f\"; echo; done"
+
+flows:
+  add-pattern:
+    description: >
+      Add a new pattern to the observatory. Researches the topic from Riley's
+      actual codebase, writes the pattern markdown, registers it, and commits.
+    steps:
+      - id: research
+        prompt: >
+          Research the following pattern topic from Riley's actual codebase at
+          /Users/mcm/Development/riley. Read relevant source files and understand
+          the real implementation. Produce a structured outline with: Problem,
+          Context, Solution (with code examples from real code), and Implications.
+
+          Pattern topic: {context}
+        model: opus
+      - id: write
+        prompt: >
+          You are adding a new pattern to the Agentic Observatory at
+          /Users/mcm/Development/agentic-observatory.
+
+          Using the research below, write the pattern:
+          {prev_output}
+
+          Steps:
+          1. Read patterns/_template.md for the format
+          2. Create patterns/<slug>.md with full content (no TODOs)
+          3. Add the entry to patterns.js registry with status "published"
+          4. Commit with message "Add pattern: <title>"
+          5. Push to origin/main
+
+          Use kebab-case for the slug. Include real code examples.
+        model: opus
+    on_complete: gate
+    max_iterations: 1
+
+  maintain:
+    description: >
+      Review the observatory's health: check all patterns render correctly,
+      identify gaps by comparing against Riley's current codebase, update
+      stale content, and push any changes.
+    steps:
+      - id: audit
+        prompt: >
+          Review the agentic-observatory at /Users/mcm/Development/agentic-observatory.
+
+          1. Read patterns.js to get the full registry
+          2. Verify each registered pattern has a corresponding .md file in patterns/
+          3. Read Riley's codebase at /Users/mcm/Development/riley and identify
+             architectural patterns not yet documented in the observatory
+          4. Check for stale or inaccurate content in existing patterns
+          5. Output a structured report: healthy patterns, missing patterns (with
+             suggested topics), stale patterns (with what changed), and any site issues
+        model: opus
+      - id: fix
+        prompt: >
+          You are maintaining the Agentic Observatory at
+          /Users/mcm/Development/agentic-observatory.
+
+          Based on this audit report:
+          {prev_output}
+
+          Fix any issues found:
+          - Add missing patterns (use patterns/_template.md format, register in patterns.js)
+          - Update stale content to match current Riley implementations
+          - Fix any site rendering issues
+          - Commit all changes with a descriptive message
+          - Push to origin/main
+
+          Do NOT add more than 4 new patterns per run to keep changes reviewable.
+        model: opus
+    on_complete: stop

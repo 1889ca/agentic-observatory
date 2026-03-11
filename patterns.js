@@ -69,4 +69,34 @@ const PATTERNS = [
     summary: "Pluggable project registration via declarative manifests for orchestrator capability discovery.",
     status: "published",
   },
+  {
+    slug: "declarative-capability-system",
+    title: "Declarative Capability System",
+    summary: "Four-tier capability model (tools, skills, reflexes, workflows) with JSON Schema declarations for LLM-native tool use.",
+    status: "published",
+  },
+  {
+    slug: "evolution-and-self-improvement",
+    title: "Evolution and Self-Improvement",
+    summary: "Observe-analyze-propose-apply cycle for autonomous system improvement from operational data.",
+    status: "published",
+  },
+  {
+    slug: "unified-event-system",
+    title: "Unified Event System",
+    summary: "Dual-mode event bus with debounced entity events and immediate system events for reactive UI.",
+    status: "published",
+  },
+  {
+    slug: "message-processing-pipeline",
+    title: "Message Processing Pipeline",
+    summary: "End-to-end flow from user input through context assembly, LLM dispatch, tool loop, and response delivery.",
+    status: "published",
+  },
+  {
+    slug: "error-triage-and-recovery",
+    title: "Error Triage and Recovery",
+    summary: "Categorize failures into protocol, transient, and runtime classes with distinct recovery strategies.",
+    status: "published",
+  },
 ];
