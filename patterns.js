@@ -99,4 +99,34 @@ const PATTERNS = [
     summary: "Categorize failures into protocol, transient, and runtime classes with distinct recovery strategies.",
     status: "published",
   },
+  {
+    slug: "intent-driven-self-scheduling",
+    title: "Intent-Driven Self-Scheduling",
+    summary: "An agent schedules its own future wake-ups rather than relying on external polling or fixed cron intervals.",
+    status: "published",
+  },
+  {
+    slug: "inner-monologue-and-reflection",
+    title: "Inner Monologue and Reflection",
+    summary: "Private reflection cycle where an agent thinks without broadcasting, deciding what to surface and what to resolve internally.",
+    status: "published",
+  },
+  {
+    slug: "decision-gating-and-autonomy-tiers",
+    title: "Decision Gating and Autonomy Tiers",
+    summary: "Route autonomous agent decisions through notification tiers to prevent alert fatigue while ensuring critical actions reach humans.",
+    status: "published",
+  },
+  {
+    slug: "narrative-memory-generation",
+    title: "Narrative Memory Generation",
+    summary: "Convert structured operational data into story-form memories with semantic valence for richer retrieval and learning.",
+    status: "published",
+  },
+  {
+    slug: "domain-aware-memory-scoring",
+    title: "Domain-Aware Memory Scoring",
+    summary: "Score memory relevance using domain-specific thresholds and recency decay rather than raw similarity alone.",
+    status: "published",
+  },
 ];
