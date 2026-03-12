@@ -71,7 +71,7 @@ All layers share the `jobId` as a correlation key, enabling drill-down from high
 ## Implications
 
 - JSONL logs grow indefinitely per day — needs periodic cleanup (not yet implemented)
-- Audit sessions are SQLite-backed, so queries are fast but schema is fixed
+- Audit sessions are PostgreSQL-backed (with pgvector for embeddings), so queries are fast and support semantic search
 - Event stream is ephemeral — only shows currently active jobs
 - No aggregation across days without custom queries
 - Byte count tracking is a rough proxy for "how much work happened" — not all bytes are equal

@@ -47,7 +47,7 @@ Budget-aware assembly ensures the total context stays within model limits. Diffe
 const response = await model.generate({
   systemInstruction: systemPrompt,   // Includes learned anti-patterns
   contents: assembledContext,
-  tools: capabilities.getDeclarations()  // ~57+ tool declarations
+  tools: capabilities.getDeclarations()  // 225+ tool declarations
 });
 ```
 

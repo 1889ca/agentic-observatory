@@ -52,7 +52,7 @@ Capabilities are not loaded at startup. On the first incoming message, the regis
 async function ensureCapabilities() {
   if (initialized) return;
   await capabilities.init();          // Load tools, skills, reflexes, workflows
-  declarations = capabilities.getDeclarations(); // ~57+ tool declarations
+  declarations = capabilities.getDeclarations(); // 225+ tool declarations
   initialized = true;
 }
 ```
@@ -92,7 +92,7 @@ This prevents breaking existing skills and reflexes that reference old tool name
 - The LLM sees all available actions as a flat tool list, regardless of whether they're tools, skills, or reflexes under the hood
 - Lazy loading means first-message latency includes capability init
 - Autonomy gating adds a decision point to every tool execution
-- The declaration count (~57+) approaches LLM context limits for tool-heavy dispatches
+- The declaration count (225+) approaches LLM context limits for tool-heavy dispatches
 - Aliases accumulate technical debt if old names are never fully migrated
 
 ## Code Example

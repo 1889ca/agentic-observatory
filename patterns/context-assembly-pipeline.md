@@ -67,11 +67,11 @@ Results are scored and ranked, then trimmed to fit the token budget. Trimming pr
 
 ### Two-Tier Dispatch
 
-The assembled context feeds a two-tier model system:
-- **Fast triage layer** (Haiku): Evaluates all incoming items with minimal context. Marks complex items with `ESCALATE:` prefix
-- **Deliberative layer** (Sonnet): Receives escalated items with full context budget. Maintains persistent session for continuity
+The assembled context feeds a two-tier model system with dynamic model switching:
+- **Fast triage layer**: Evaluates all incoming items with minimal context. Marks complex items with `ESCALATE:` prefix
+- **Deliberative layer**: Receives escalated items with full context budget. Maintains persistent session for continuity
 
-This separation means routine items (status updates, simple queries) get fast answers without burning expensive context assembly on them.
+Models are selected dynamically (Claude, Gemini, etc.) based on task characteristics and cost/latency requirements, rather than being fixed to specific model families. This separation means routine items (status updates, simple queries) get fast answers without burning expensive context assembly on them.
 
 ## Implications
 
@@ -92,14 +92,14 @@ async function dispatch(message, source) {
 
   // Triage layer — fast evaluation
   if (dispatchType !== 'user') {
-    const triage = await haiku.send(message, { context: minimal(context) });
+    const triage = await triageModel.send(message, { context: minimal(context) });
     if (!triage.includes('ESCALATE:')) {
       return triage; // handled at triage level
     }
   }
 
   // Deliberative layer — full context
-  return await sonnet.send(message, {
+  return await deliberativeModel.send(message, {
     context,
     sessionId: currentSessionId // persistent session for continuity
   });

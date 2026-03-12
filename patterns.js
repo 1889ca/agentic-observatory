@@ -129,4 +129,28 @@ const PATTERNS = [
     summary: "Score memory relevance using domain-specific thresholds and recency decay rather than raw similarity alone.",
     status: "published",
   },
+  {
+    slug: "plugin-system-and-hot-reload",
+    title: "Plugin System and Hot-Reload",
+    summary: "Extensible plugin architecture with file watching, context building, and graceful lifecycle management.",
+    status: "published",
+  },
+  {
+    slug: "skill-extraction-and-fast-path-routing",
+    title: "Skill Extraction and Fast-Path Routing",
+    summary: "Embeddings-based semantic skill matching with learned reflex promotion for progressively faster dispatch.",
+    status: "published",
+  },
+  {
+    slug: "autonomous-agent-cycle",
+    title: "Autonomous Agent Cycle",
+    summary: "Priority-driven action cycle with working hours, autonomy tiers, and batch approval for self-directed agent behavior.",
+    status: "published",
+  },
+  {
+    slug: "dynamic-system-prompt-composition",
+    title: "Dynamic System Prompt Composition",
+    summary: "Runtime assembly of system prompts from persona, capabilities, behavioral rules, and contextual signals.",
+    status: "published",
+  },
 ];
