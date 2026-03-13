@@ -1,16 +1,16 @@
 # Flow Recovery and Resilience
 
-> How to restart interrupted flows and maintain state consistency across orchestrator restarts.
+> Persist flow state at each step so multi-step agent pipelines can resume after crashes without re-executing completed work.
 
 ## Problem
 
-Flows break. Satellites crash, context windows fill up, permissions block, network drops. When a multi-step flow fails partway through, the orchestrator needs to know what completed, what didn't, and how to resume without re-doing finished work or corrupting state. Worse, the orchestrator itself might restart — it must recover in-flight flows from persistent state.
+Multi-step agent pipelines break. Workers crash, context windows fill up, network connections drop, permissions block. When a flow fails partway through, the orchestrator needs to know what completed, what didn't, and how to resume without re-doing finished work or corrupting state. Worse, the orchestrator itself might restart — it must recover in-flight flows from persistent state, not just in-memory data structures.
 
 ## Context
 
-- Multi-step flows dispatched by an orchestrator to satellite workers
-- Steps that have side effects (commits, API calls, file writes)
-- Long-running operations that exceed CC session limits (45-minute timeout)
+- Multi-step flows dispatched by an orchestrator to worker agents
+- Steps that have side effects (commits, API calls, file writes) and cannot safely be re-run
+- Long-running operations that may exceed worker session limits
 - Concurrent flows that share resources
 - Orchestrator restarts (crashes, updates, system reboots)
 
@@ -18,116 +18,124 @@ Flows break. Satellites crash, context windows fill up, permissions block, netwo
 
 ### State Machine with Persistent Checkpoints
 
-Every flow is stored in SQLite with step-level progress:
+Every flow is tracked in a database with step-level progress. The schema captures enough to resume from any point:
 
 ```sql
 CREATE TABLE flows (
   id TEXT PRIMARY KEY,
-  project TEXT, flow_name TEXT,
-  current_step INTEGER,      -- checkpoint: which step we're on
-  iteration INTEGER,         -- for looping flows
-  status TEXT,               -- running | paused | done | stopped | error
-  context TEXT,              -- accumulated context across steps
-  step_started_at TEXT,      -- when current step began
-  job_id TEXT                -- satellite job running this step
+  project TEXT,
+  flow_name TEXT,
+  current_step INTEGER,
+  iteration INTEGER DEFAULT 0,
+  status TEXT CHECK (status IN ('running', 'paused', 'done', 'stopped', 'error')),
+  context TEXT,
+  step_started_at TIMESTAMPTZ,
+  job_id TEXT
 );
 ```
 
-Status transitions: `running → paused` (loop mode), `running → done` (all steps complete), `running → error` (unrecoverable failure), `running → stopped` (manual cancellation).
+Status transitions follow a simple state machine: `running -> paused` (loop mode cycle complete), `running -> done` (all steps complete), `running -> error` (unrecoverable failure), `running -> stopped` (manual cancellation). Any terminal state can be manually reset to `running` for retry.
 
 ### Two-Part Recovery System
 
-**1. Startup Reconnection (3-second delayed):**
+Recovery happens at two timescales:
 
-On orchestrator restart, scan for flows with `status='running'`:
+**1. Startup Reconnection:** On orchestrator restart, query for flows with `status='running'` and check which worker jobs are still alive:
 
 ```javascript
-// Query satellite for surviving jobs
-const satStatus = await getSatelliteStatus();
-const activeJobIds = new Set(satStatus.jobs.map(j => j.id));
+const activeJobs = await getActiveWorkerJobs();
+const activeJobIds = new Set(activeJobs.map(j => j.id));
 
 for (const flow of runningFlows) {
   if (activeJobIds.has(flow.job_id)) {
-    // Job survived restart — reconnect to it
-    await subscribeToJob(flow.job_id, taskId, satId);
-  } else if (stepAge < 2 * 60 * 1000) {
-    // Young step, might still start — wait
+    // Job survived the restart — reconnect and monitor it
+    await reconnectToJob(flow.job_id);
+  } else if (stepAge < GRACE_PERIOD_MS) {
+    // Recently started step — may still be spinning up, skip for now
   } else {
-    // Old step, job is dead — retry from this step
-    await executeStep(flow.id);
+    // Stale step with no live worker — retry from current step
+    await executeStep(flow.id, flow.current_step);
   }
 }
 ```
 
-**2. Watchdog Loop (every 60 seconds):**
+**2. Periodic Watchdog:** A background loop (e.g., every 60 seconds) monitors active flows:
+- Detects dead worker processes and retries their steps
+- Cancels steps that exceed a timeout threshold (e.g., 50 minutes)
+- Cleans up orphaned flows stuck in `running` with no active worker
 
-Continuous health check for active flows:
-- Dead child process detection: if `!isRunActive(taskId)`, retry the step
-- Stale step detection: steps running >50 minutes get cancelled and marked as error
-- Orphan cleanup: flows stuck in `running` with no active child for >50 minutes
-
-### Loop and Gate Control
+### Loop and Gate Control Modes
 
 Flows support three completion modes:
 
 - **Single pass** (default): Run all steps once, mark done
-- **Loop mode** (`on_complete: 'loop'`): Pause after each cycle, wait for manual resume via API
-- **Gate mode** (`on_complete: 'gate'`): Autonomous looping — parse final step output for STOP/CONTINUE keywords. Capped by `max_iterations` (default 10)
+- **Loop mode** (`on_complete: 'loop'`): Pause after each cycle, wait for external resume signal via API
+- **Gate mode** (`on_complete: 'gate'`): Autonomous looping — parse the final step's output for STOP/CONTINUE signals. Capped by `max_iterations` to prevent runaway loops
 
 ```javascript
-// Gate mode decision logic
+// Gate mode: the agent decides whether to loop
 const tail = output.slice(-500);
 if (/\bSTOP\b/i.test(tail)) {
-  markDone(flowId);
+  await updateFlowStatus(flowId, 'done');
 } else if (/\bCONTINUE\b/i.test(tail)) {
-  loop(flowId, output); // output becomes new context
+  await loopFlow(flowId, output); // output becomes next iteration's context
 }
 ```
 
-### Context Threading
+### Context Threading Between Steps
 
-Each step receives interpolated context:
-- `{context}` — the original flow context (from `startFlow()`)
-- `{prev_output}` — output from the previous step
+Each step's prompt template supports interpolation variables:
+- `{context}` — the original flow context provided at creation
+- `{prev_output}` — the output from the previous step
 
-This enables multi-step pipelines where each step builds on the last without the orchestrator needing to understand the domain.
+This enables pipelines where each step builds on the last without the orchestrator needing domain knowledge. The orchestrator just threads data forward.
 
-### Guard Against Duplicate Execution
+### Duplicate Execution Guard
 
-An in-memory `executingFlows` Map prevents race conditions:
+An in-memory lock prevents race conditions between the watchdog and reconnection logic:
 
 ```javascript
-if (executingFlows.has(flowId)) return; // already running
-executingFlows.set(flowId, taskId);
+if (executingFlows.has(flowId)) return;
+executingFlows.set(flowId, jobId);
 ```
 
 ## Implications
 
-- Step-level granularity means partial side effects from a failed step may need manual cleanup
-- The 50-minute hard timeout is slightly above the satellite's 45-minute limit, creating a small window where both timeout mechanisms fire
-- Reconnection after restart only works if the satellite worker daemon survived — if both crash, jobs are lost
-- Gate mode's keyword parsing is fragile — agents must reliably emit STOP/CONTINUE in their final output
-- No rollback mechanism for completed steps — idempotent step design is the author's responsibility
-- SQLite single-writer constraint means flow operations are serialized
+- Step-level granularity means a failed step's partial side effects may need manual cleanup — there is no automatic rollback
+- Reconnection only works if the worker survived the orchestrator's restart. If both crash, the watchdog handles retry on next tick
+- Gate mode depends on the agent reliably emitting STOP/CONTINUE keywords — fragile if the agent's output format varies
+- Idempotent step design is the flow author's responsibility, since steps may be retried
+- Sub-flows (steps that spawn nested flows) add complexity: the parent flow must poll or subscribe to the child's completion
 
 ## Code Example
 
 ```javascript
-// Sub-flow delegation — steps can spawn nested flows
-if (step.run_flow) {
-  const subId = `${project}:${step.run_flow}:sub:${Date.now()}`;
-  await startFlow(project, step.run_flow, context);
-  // Poll until sub-flow completes
-  const poll = setInterval(async () => {
-    const sub = getFlow(subId);
-    if (sub.status === 'done') {
-      clearInterval(poll);
-      advanceFlow(flowId, sub.context);
-    } else if (sub.status === 'error') {
-      clearInterval(poll);
-      markError(flowId, 'Sub-flow failed');
-    }
-  }, 5000);
+// Reference implementation: Riley orchestrator (PostgreSQL-backed)
+
+// Starting a flow
+const flowId = `${project}:${flowName}:${Date.now()}`;
+await db.query(
+  `INSERT INTO flows (id, project, flow_name, current_step, status, context)
+   VALUES ($1, $2, $3, 0, 'running', $4)`,
+  [flowId, project, flowName, JSON.stringify(context)]
+);
+await executeStep(flowId, 0);
+
+// Advancing to next step after completion
+async function advanceFlow(flowId, prevOutput) {
+  const flow = await getFlow(flowId);
+  const nextStep = flow.current_step + 1;
+
+  if (nextStep >= flow.steps.length) {
+    await handleFlowCompletion(flowId, prevOutput); // done, loop, or gate
+    return;
+  }
+
+  await db.query(
+    `UPDATE flows SET current_step = $1, step_started_at = NOW() WHERE id = $2`,
+    [nextStep, flowId]
+  );
+  await executeStep(flowId, nextStep);
 }
 ```
 

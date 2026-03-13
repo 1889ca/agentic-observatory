@@ -28,19 +28,21 @@
     const params = new URLSearchParams(window.location.search);
     const slug = params.get("p");
 
-    const meta = PATTERNS.find((p) => p.slug === slug);
+    // Validate slug contains only safe characters
+    const safeSlug = slug && /^[a-z0-9-]+$/.test(slug) ? slug : null;
+    const meta = safeSlug ? PATTERNS.find((p) => p.slug === safeSlug) : null;
 
-    if (!slug || !meta) {
+    if (!safeSlug || !meta) {
       const safe = document.createElement("span");
       safe.textContent = slug || "(none)";
       content.innerHTML = `
         <a href="index.html" class="back">&larr; All patterns</a>
         <h1>Pattern not found</h1>
-        <p>No pattern matching "${safe.innerHTML}". <a href="index.html">Back to all patterns</a>.</p>
+        <p>No pattern matching "${escapeHtml(safe.textContent)}". <a href="index.html">Back to all patterns</a>.</p>
       `;
     } else {
       document.title = `${meta.title} — Observatory`;
-      fetch(`patterns/${slug}.md`)
+      fetch(`patterns/${safeSlug}.md`)
         .then((r) => {
           if (!r.ok) throw new Error("Not found");
           return r.text();
@@ -54,8 +56,8 @@
         .catch(() => {
           content.innerHTML = `
             <a href="index.html" class="back">&larr; All patterns</a>
-            <h1>${meta.title}</h1>
-            <p class="summary">${meta.summary}</p>
+            <h1>${escapeHtml(meta.title)}</h1>
+            <p class="summary">${escapeHtml(meta.summary)}</p>
             <p>Pattern content not yet available.</p>
           `;
         });
@@ -135,6 +137,8 @@
     }
 
     function inline(text) {
+      // Escape HTML first, then apply markdown formatting
+      text = escapeHtml(text);
       return text
         // inline code
         .replace(/`([^`]+)`/g, "<code>$1</code>")
@@ -144,10 +148,10 @@
         .replace(/\*([^*]+)\*/g, "<em>$1</em>")
         // links — rewrite .md hrefs to pattern.html?p=slug
         .replace(/\[([^\]]+)\]\(\.\/([^)]+)\.md\)/g, (_, label, file) => {
-          return `<a href="pattern.html?p=${file}">${label}</a>`;
+          return `<a href="pattern.html?p=${encodeURI(file)}">${label}</a>`;
         })
-        // external links
-        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+        // external links (only allow http/https)
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" rel="noopener noreferrer" target="_blank">$1</a>');
     }
 
     function escapeHtml(str) {

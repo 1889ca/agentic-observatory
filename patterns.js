@@ -6,13 +6,13 @@ const PATTERNS = [
   {
     slug: "orchestrator-satellite-communication",
     title: "Orchestrator-Satellite Communication",
-    summary: "Structured protocol for reliable communication between an orchestrator and its worker agents.",
+    summary: "Event-driven worker pool protocol for dispatching and monitoring AI agent jobs across distributed workers.",
     status: "published",
   },
   {
     slug: "satellite-permission-escalation",
     title: "Satellite Permission Escalation",
-    summary: "Graceful handling of CC permission constraints in multi-agent delegated work.",
+    summary: "Detecting and recovering from permission-blocked workers in multi-agent dispatch.",
     status: "published",
   },
   {
@@ -42,7 +42,7 @@ const PATTERNS = [
   {
     slug: "scheduled-autonomous-maintenance",
     title: "Scheduled Autonomous Maintenance",
-    summary: "Self-managing projects through cron-scheduled satellite tasks with orchestrator oversight.",
+    summary: "Cron-scheduled autonomous tasks with API-driven management and concurrent execution guards.",
     status: "published",
   },
   {
@@ -66,7 +66,7 @@ const PATTERNS = [
   {
     slug: "capability-manifest-registration",
     title: "Capability Manifest Registration",
-    summary: "Pluggable project registration via declarative manifests for orchestrator capability discovery.",
+    summary: "Declarative capability registration for extensible orchestrator tool and workflow discovery.",
     status: "published",
   },
   {
@@ -102,7 +102,7 @@ const PATTERNS = [
   {
     slug: "intent-driven-self-scheduling",
     title: "Intent-Driven Self-Scheduling",
-    summary: "An agent schedules its own future wake-ups rather than relying on external polling or fixed cron intervals.",
+    summary: "Agents dynamically create and manage their own scheduled tasks via API rather than relying on fixed external cron jobs.",
     status: "published",
   },
   {
@@ -126,7 +126,7 @@ const PATTERNS = [
   {
     slug: "domain-aware-memory-scoring",
     title: "Domain-Aware Memory Scoring",
-    summary: "Score memory relevance using domain-specific thresholds and recency decay rather than raw similarity alone.",
+    summary: "Combined scoring of embedding similarity, recency decay, and access frequency for vector-based memory retrieval.",
     status: "published",
   },
   {
@@ -151,6 +151,30 @@ const PATTERNS = [
     slug: "dynamic-system-prompt-composition",
     title: "Dynamic System Prompt Composition",
     summary: "Runtime assembly of system prompts from persona, capabilities, behavioral rules, and contextual signals.",
+    status: "published",
+  },
+  {
+    slug: "knowledge-graph-and-relationship-discovery",
+    title: "Knowledge Graph and Relationship Discovery",
+    summary: "Entity extraction, relationship scoring, and multi-hop graph traversal for enriching agent context.",
+    status: "published",
+  },
+  {
+    slug: "anticipation-engine",
+    title: "Anticipation Engine",
+    summary: "Temporal and sequential pattern prediction for proactive agent behavior before explicit requests.",
+    status: "published",
+  },
+  {
+    slug: "cognitive-processing-loop",
+    title: "Cognitive Processing Loop",
+    summary: "Background event-driven processing with rule matching for continuous autonomous awareness.",
+    status: "published",
+  },
+  {
+    slug: "unified-trigger-system",
+    title: "Unified Trigger System",
+    summary: "Polymorphic trigger registry unifying notifications, tool calls, job dispatch, and approval workflows.",
     status: "published",
   },
 ];

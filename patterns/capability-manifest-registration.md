@@ -1,157 +1,160 @@
 # Capability Manifest Registration
 
-> Pluggable project registration via declarative manifests, enabling the orchestrator to discover and use project capabilities without hardcoding.
+> Declarative capability registration so an orchestrator can discover and dispatch tools, skills, and workflows without hardcoding.
 
 ## Problem
 
-An orchestrator managing multiple projects needs to know what each project offers — its search endpoints, available flows, environment variables, MCP servers, and task definitions. Hardcoding this in the orchestrator creates tight coupling: adding a project means editing orchestrator code. Worse, different projects have different capabilities (some have MCP servers, some have CLI tools, some have HTTP APIs), so the integration surface is inconsistent.
+An orchestrator managing multiple tools and workflows needs to know what's available — which actions it can take, what parameters they require, and how to invoke them. Hardcoding capabilities in the orchestrator creates tight coupling: adding a new capability means editing core orchestrator code. As the system grows, the mapping between "what the user wants" and "what the system can do" becomes a sprawling switch statement that's impossible to maintain.
 
 ## Context
 
-- One orchestrator managing 5-50 independent projects
-- Each project has different capabilities (search, flows, tasks, MCP tools)
-- Projects are added and removed over time
-- The orchestrator needs to discover capabilities at startup
-- Different projects use different integration patterns (MCP, HTTP, CLI scripts)
+- An orchestrator that dispatches work across multiple tools, skills, or workflows
+- Capabilities evolve over time — new ones are added, old ones are deprecated
+- Each capability has different parameter requirements, invocation methods, and output formats
+- Need for the orchestrator to reason about available capabilities at runtime (e.g., for AI-driven tool selection)
+- Implementation can be internal (programmatic registration at startup) or external (config files discovered from project directories) — the pattern applies to both
 
 ## Solution
 
-### Declarative Capability Files
+### Capability Registry
 
-Each project declares its capabilities in a `.riley/capabilities.yaml` file at its root:
+A central registry where capabilities are declared with structured metadata. Each capability entry describes what it does, what inputs it accepts (via JSON Schema), and how to invoke it:
+
+```javascript
+const registry = new Map();
+
+function registerCapability(capability) {
+  const { name, tier, description, schema, handler } = capability;
+  registry.set(name, { name, tier, description, schema, handler });
+}
+
+// Registration at startup
+registerCapability({
+  name: 'search-docs',
+  tier: 'tool',          // direct invocation
+  description: 'Search documentation across all knowledge bases',
+  schema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Search query' },
+      scope: { type: 'string', enum: ['all', 'project', 'global'] }
+    },
+    required: ['query']
+  },
+  handler: async (params) => searchDocs(params.query, params.scope)
+});
+```
+
+### Tiered Capability Model
+
+Capabilities are organized into tiers based on their complexity and invocation pattern:
+
+- **Tools**: Direct, stateless operations (search, lookup, calculate). Invoked synchronously, return a result.
+- **Skills**: Multi-step operations with internal logic (code review, deployment). May invoke multiple tools.
+- **Reflexes**: Automatic triggers fired by events (new commit, error detected). No explicit invocation.
+- **Workflows**: Orchestrated multi-step pipelines with human checkpoints, branching, and state persistence.
+
+```javascript
+function getCapabilitiesByTier(tier) {
+  return [...registry.values()].filter(cap => cap.tier === tier);
+}
+
+// AI model can reason about available tools
+function getToolDescriptions() {
+  return getCapabilitiesByTier('tool').map(t => ({
+    name: t.name,
+    description: t.description,
+    parameters: t.schema
+  }));
+}
+```
+
+### Discovery and Dispatch
+
+The orchestrator queries the registry to find matching capabilities and dispatches to the appropriate handler:
+
+```javascript
+async function dispatch(capabilityName, params) {
+  const cap = registry.get(capabilityName);
+  if (!cap) throw new Error(`Unknown capability: ${capabilityName}`);
+
+  // Validate params against JSON Schema
+  const valid = validate(params, cap.schema);
+  if (!valid) throw new Error(`Invalid params: ${validate.errors}`);
+
+  return await cap.handler(params);
+}
+```
+
+### External Registration (Alternative)
+
+For systems where capabilities are declared in external config files rather than programmatically:
 
 ```yaml
-name: my-project
-description: What this project does
-
-env:
-  API_KEY: ${MY_PROJECT_API_KEY}
-
-mcp:
-  server: npx -y @my/mcp-server
-  headers:
-    Authorization: Bearer ${MY_PROJECT_TOKEN}
-
-search:
-  type: mcp          # or "http" or "script"
-  tool: search_docs   # MCP tool name
-  query_param: query   # parameter name for search queries
-
-flows:
-  deploy:
+# capabilities.yaml — declarative capability manifest
+capabilities:
+  - name: deploy
+    tier: workflow
     description: Build and deploy the project
+    schema:
+      type: object
+      properties:
+        environment: { type: string, enum: [staging, production] }
+      required: [environment]
     steps:
-      - build: Run npm build and verify output
-      - deploy: Push to production
-    on_complete: stop
-
-  audit:
-    description: Run security audit
-    steps:
-      - scan: Run dependency and code audit
-      - report: Generate findings report
-    on_complete: stop
+      - build: Run build and verify output
+      - deploy: Push to target environment
 ```
 
-### Startup Discovery
-
-At startup, the orchestrator scans all registered project directories for `.riley/capabilities.yaml`:
-
-```javascript
-async function loadCapabilities(projectDirs) {
-  const registry = {};
-  for (const dir of projectDirs) {
-    const capFile = path.join(dir, '.riley', 'capabilities.yaml');
-    if (fs.existsSync(capFile)) {
-      const caps = yaml.parse(fs.readFileSync(capFile, 'utf8'));
-      caps.workdir = dir;
-      registry[caps.name] = caps;
-    }
-  }
-  return registry;
-}
-```
-
-### Environment Variable Interpolation
-
-Capability files reference secrets via `${VAR_NAME}` syntax. The orchestrator resolves these from its environment at load time, keeping secrets out of project repos:
-
-```javascript
-function interpolateEnv(value) {
-  return value.replace(/\$\{(\w+)\}/g, (_, name) => process.env[name] || '');
-}
-```
-
-### Unified Search Interface
-
-Despite projects using different search backends (MCP tools, HTTP APIs, CLI scripts), the orchestrator presents a uniform search interface. The capability manifest declares which type and the orchestrator adapts:
-
-```javascript
-async function searchProject(project, query) {
-  const search = project.search;
-  switch (search.type) {
-    case 'mcp':
-      return await mcpCall(project.mcp, search.tool, { [search.query_param]: query });
-    case 'http':
-      return await fetch(`${search.url}?q=${encodeURIComponent(query)}`);
-    case 'script':
-      return await exec(search.command.replace('{query}', query), { cwd: project.workdir });
-  }
-}
-```
-
-### Autonomy Gating
-
-A companion file `.riley/autonomy.yaml` declares which decisions the orchestrator can make autonomously per project:
-
-```yaml
-decisions:
-  deploy: require_input           # always ask
-  pattern-update: self_approve    # do it silently
-  dependency-upgrade: require_input
-```
-
-This enables per-project governance without centralizing all rules in the orchestrator.
+The orchestrator discovers these at startup by scanning known directories or receiving registration calls from plugins.
 
 ## Implications
 
-- YAML parsing adds a dependency and potential for syntax errors in project configs
-- Environment variable interpolation means the orchestrator's env must have all project secrets
-- Capability discovery is startup-only — adding a project requires restarting the orchestrator (or implementing hot-reload)
-- No schema validation on capability files means malformed configs fail at runtime
-- The autonomy.yaml split means two files to maintain per project
-- MCP session management adds state that must be cleaned up on project removal
+- JSON Schema declarations add upfront authoring cost but enable validation, documentation generation, and AI-driven tool selection
+- Programmatic (internal) registration is simpler to debug — all capabilities are visible in one codebase
+- External (file-based) registration decouples capability authoring from orchestrator code but introduces config parsing, schema drift, and discovery timing issues
+- The tiered model helps the orchestrator reason about complexity — a "tool" call is cheap, a "workflow" may take hours
+- Hot-reloading capabilities at runtime adds complexity (stale references, in-flight dispatches to removed capabilities)
+- No schema validation on registration means malformed capability definitions fail at dispatch time, not load time
 
 ## Code Example
 
 ```javascript
-// Flow dispatch using capability registry
-async function startFlow(projectName, flowName, context) {
-  const project = registry[projectName];
-  if (!project) throw new Error(`Unknown project: ${projectName}`);
+// Full lifecycle: register, discover, dispatch
+class CapabilityRegistry {
+  constructor() {
+    this.capabilities = new Map();
+  }
 
-  const flowDef = project.flows?.[flowName];
-  if (!flowDef) throw new Error(`No flow '${flowName}' in ${projectName}`);
+  register(cap) {
+    this.capabilities.set(cap.name, cap);
+  }
 
-  const flowId = `${projectName}:${flowName}:${Date.now()}`;
-  await db.run(`INSERT INTO flows (id, project, flow_name, status, context)
-                VALUES (?, ?, ?, 'running', ?)`,
-    [flowId, projectName, flowName, context]);
+  find(query) {
+    // Simple keyword match — could be upgraded to semantic search
+    return [...this.capabilities.values()].filter(cap =>
+      cap.description.toLowerCase().includes(query.toLowerCase())
+    );
+  }
 
-  // Execute first step with project's working directory
-  await executeStep(flowId, 0, {
-    cwd: project.workdir,
-    env: resolveEnv(project.env),
-    prompt: interpolate(flowDef.steps[0].prompt, { context })
-  });
+  async dispatch(name, params) {
+    const cap = this.capabilities.get(name);
+    if (!cap) throw new Error(`Unknown: ${name}`);
+    return await cap.handler(params);
+  }
 
-  return flowId;
+  // Expose to AI model for tool-use decisions
+  toToolDefinitions() {
+    return [...this.capabilities.values()]
+      .filter(c => c.tier === 'tool')
+      .map(c => ({ name: c.name, description: c.description, input_schema: c.schema }));
+  }
 }
 ```
 
 ## Related Patterns
 
+- [Declarative Capability System](./declarative-capability-system.md)
 - [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
 - [Unified Search Across KBs](./unified-search-across-kbs.md)
-- [Flow Recovery and Resilience](./flow-recovery-and-resilience.md)
 - [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)

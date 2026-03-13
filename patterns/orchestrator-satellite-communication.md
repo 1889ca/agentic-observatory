@@ -1,126 +1,164 @@
 # Orchestrator-Satellite Communication
 
-> Structured protocol for reliable communication between an orchestrator and its worker agents.
+> Structured protocol for reliable communication between an orchestrator and its AI agent worker pool.
 
 ## Problem
 
-An orchestrator needs to dispatch work to multiple CC instances, monitor their progress, detect failures, and collect results. Standard process management (spawn + wait) is too coarse — you need streaming output, cancellation, concurrent job limits, and crash recovery. But building a full RPC framework is overkill for what amounts to "run this prompt and tell me what happens."
+An orchestrator needs to dispatch work to multiple AI agent instances, monitor their progress, detect failures, and collect results. Standard process management (spawn + wait) is too coarse — you need streaming output from long-running jobs, cancellation, concurrent job limits, and crash recovery. But building a full RPC framework is overkill for what amounts to "run this prompt and tell me what happens."
 
 ## Context
 
-- One orchestrator process managing N satellite worker instances
-- Satellites are long-lived daemon processes, not spawned per-task
-- Jobs can run for up to 45 minutes
+- One orchestrator process managing N worker instances (satellites)
+- Workers are long-lived processes, not spawned per-task
+- Jobs can run for extended periods (minutes to an hour)
 - Need for concurrent job limits, streaming output, and graceful shutdown
-- Orchestrator may restart independently of satellites (and vice versa)
+- Orchestrator and workers may restart independently of each other
+- Key transport decision: Socket.io (event-driven, reconnection built in), gRPC (typed, streaming), Unix sockets (simple, single-machine), or HTTP polling (stateless, distributed) — choose based on whether you need multi-machine, streaming, or simplicity
 
 ## Solution
 
-### Unix Socket + Newline-Delimited JSON
+### Event-Driven Worker Pool
 
-The satellite worker runs as a standalone daemon listening on a Unix socket. The protocol is dead simple — each message is one line of JSON:
+Workers connect to the orchestrator over a persistent connection (e.g., Socket.io). Each worker reports its capacity on connect. The orchestrator maintains a live view of the worker pool and dispatches jobs to available workers with conflict detection.
 
 ```javascript
-// Client → Satellite
-{ type: 'run', id: 'job-abc', prompt: '...', cwd: '/project', model: 'opus' }
-{ type: 'cancel', id: 'job-abc' }
-{ type: 'subscribe', id: 'job-abc' }  // Reconnect to surviving job
-{ type: 'status' }                     // Query all active jobs
-
-// Satellite → Client
-{ id: 'job-abc', status: 'started' }
-{ id: 'job-abc', chunk: 'Working on...', stderr: false }
-{ id: 'job-abc', output: 'Final result', exit_code: 0, done: true, logPath: '...' }
+// Worker connects and reports capacity
+io.on('connection', (socket) => {
+  socket.on('worker:register', ({ workerId, maxConcurrent }) => {
+    workers.set(workerId, {
+      socket,
+      maxConcurrent,
+      activeJobs: new Set(),
+      lastHeartbeat: Date.now()
+    });
+  });
+});
 ```
 
-Why Unix socket over HTTP: no serialization overhead, no port conflicts, no TLS complexity, and the OS handles connection lifecycle. The socket file acts as a natural service discovery mechanism — if the file exists, the satellite is (probably) running.
+### Capacity Checking and Conflict Detection
 
-### Concurrency Control
-
-The satellite enforces a hard limit on concurrent jobs (default: 4, configurable via `RILEY_SATELLITE_MAX_JOBS`). Requests beyond the limit are rejected immediately — the orchestrator can queue and retry.
+Before dispatching, the orchestrator checks that the target worker has capacity and that no conflicting job is already running (e.g., two jobs targeting the same project directory):
 
 ```javascript
-if (activeJobs.size >= maxJobs) {
-  socket.write(JSON.stringify({ id, error: 'at capacity' }) + '\n');
-  return;
-}
-```
+function findAvailableWorker(job) {
+  for (const [id, worker] of workers) {
+    // Capacity check
+    if (worker.activeJobs.size >= worker.maxConcurrent) continue;
 
-### Job Lifecycle
+    // Conflict detection — no two jobs in the same working directory
+    const hasConflict = [...worker.activeJobs].some(
+      activeJob => activeJob.cwd === job.cwd
+    );
+    if (hasConflict) continue;
 
-1. **Start:** Satellite spawns a CC process with the given prompt, cwd, and model
-2. **Stream:** Output chunks forwarded to client as they arrive
-3. **Complete:** Final message includes full output, exit code, and log path
-4. **Timeout:** Jobs exceeding 45 minutes are force-killed (configurable via `RILEY_SATELLITE_JOB_TIMEOUT_MS`)
-
-### Reconnection Protocol
-
-The `subscribe` message type enables crash recovery. After an orchestrator restart:
-
-1. Query satellite status to discover surviving jobs
-2. Subscribe to each surviving job by ID
-3. Receive remaining output chunks and final result
-4. Job results are cached briefly (30s) for race conditions where the job finishes between status query and subscribe
-
-```javascript
-// Orchestrator recovery sequence
-const status = await querySatellite({ type: 'status' });
-for (const job of status.jobs) {
-  if (myFlows.has(job.id)) {
-    await subscribeTo(job.id); // Resume receiving output
+    return { id, worker };
   }
+  return null; // All workers busy or conflicting
 }
+```
+
+### Job Dispatch and Streaming Results
+
+The orchestrator dispatches jobs as events and receives streaming output. Workers emit structured events for each phase of the job lifecycle:
+
+```javascript
+// Orchestrator dispatches work
+function dispatchJob(worker, job) {
+  worker.socket.emit('job:run', {
+    jobId: job.id,
+    prompt: job.prompt,
+    cwd: job.cwd,
+    model: job.model || 'sonnet'
+  });
+  worker.activeJobs.add(job);
+}
+
+// Worker streams results back
+socket.on('job:output', ({ jobId, chunk }) => {
+  // Stream output to UI, logs, or parent flow
+  emitToSubscribers(jobId, chunk);
+});
+
+socket.on('job:complete', ({ jobId, exitCode, output, logPath }) => {
+  const worker = findWorkerByJob(jobId);
+  worker.activeJobs.delete(jobId);
+  resolveJob(jobId, { success: exitCode === 0, output, logPath });
+});
+```
+
+### Reconnection and Recovery
+
+When a worker disconnects (crash, network issue), the orchestrator marks its jobs as orphaned. When the worker reconnects, surviving jobs can be reattached:
+
+```javascript
+socket.on('disconnect', () => {
+  const worker = findWorkerBySocket(socket);
+  for (const job of worker.activeJobs) {
+    job.status = 'orphaned';
+    job.orphanedAt = Date.now();
+  }
+});
+
+// On reconnect, worker reports surviving jobs
+socket.on('worker:reconnect', ({ workerId, survivingJobs }) => {
+  for (const jobId of survivingJobs) {
+    reattachJob(workerId, jobId); // Resume output streaming
+  }
+});
 ```
 
 ### Graceful Shutdown
 
-On SIGTERM/SIGINT:
-1. Stop accepting new connections
-2. Give active jobs 5-second grace period
-3. Force-kill remaining jobs
+On shutdown signal:
+1. Stop accepting new job dispatches
+2. Notify workers to finish current jobs (grace period)
+3. Force-cancel remaining jobs after timeout
 4. Log final state for each job
-5. Clean up socket file
 
 ## Implications
 
-- Unix socket limits to single-machine deployment — no distributed satellite pools (acceptable for personal orchestrator)
-- NDJSON has no built-in schema validation — malformed messages cause silent failures
-- The 30-second result cache means very fast jobs might be missed if subscribe arrives late
-- No authentication on the socket — relies on filesystem permissions
-- Single satellite daemon is a SPOF — if it dies, all jobs die (mitigated by launchd auto-restart)
-- No backpressure mechanism — fast-producing satellites can overwhelm slow consumers
+- Persistent connections (Socket.io, WebSocket) require heartbeat/keepalive logic to detect silent disconnects
+- Event-driven dispatch is inherently async — the orchestrator must track job state across multiple events
+- Conflict detection adds complexity but prevents data corruption from concurrent writes to the same project
+- Worker pool model means idle workers consume resources — consider auto-scaling or hibernation for large deployments
+- No built-in backpressure — fast-producing workers can overwhelm the orchestrator's event loop if output isn't consumed
+- For single-machine setups, Unix sockets eliminate port management and network overhead at the cost of distribution
 
 ## Code Example
 
 ```javascript
-// Task runner — complete dispatch cycle
-async function runTask(task) {
-  const jobId = `${task.id}-${Date.now()}`;
-  const socket = net.connect(SATELLITE_SOCKET);
+// Complete dispatch cycle with timeout and error handling
+async function runJob(job, timeoutMs = 45 * 60 * 1000) {
+  const match = findAvailableWorker(job);
+  if (!match) {
+    throw new Error('No available workers — queuing');
+  }
 
-  socket.write(JSON.stringify({
-    type: 'run',
-    id: jobId,
-    prompt: task.prompt,
-    cwd: task.workdir || process.cwd(),
-    model: task.model || 'sonnet'
-  }) + '\n');
+  const { id: workerId, worker } = match;
 
-  activeRuns.set(task.id, { jobId, startTime: Date.now() });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      worker.socket.emit('job:cancel', { jobId: job.id });
+      reject(new Error(`Job ${job.id} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
 
-  return new Promise((resolve) => {
-    let output = '';
-    socket.on('data', (buf) => {
-      for (const line of buf.toString().split('\n').filter(Boolean)) {
-        const msg = JSON.parse(line);
-        if (msg.chunk) {
-          output += msg.chunk;
-          agentEvents.emit('chunk', { taskId: task.id, jobId, text: msg.chunk });
-        }
-        if (msg.done) {
-          activeRuns.delete(task.id);
-          resolve({ success: msg.exit_code === 0, output: msg.output, jobId });
-        }
+    dispatchJob(worker, job);
+
+    worker.socket.on('job:complete', (result) => {
+      if (result.jobId === job.id) {
+        clearTimeout(timer);
+        resolve({
+          success: result.exitCode === 0,
+          output: result.output,
+          logPath: result.logPath
+        });
+      }
+    });
+
+    worker.socket.on('job:error', (err) => {
+      if (err.jobId === job.id) {
+        clearTimeout(timer);
+        reject(new Error(err.message));
       }
     });
   });

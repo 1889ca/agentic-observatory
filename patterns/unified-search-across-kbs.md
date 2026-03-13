@@ -1,30 +1,30 @@
 # Unified Search Across Knowledge Bases
 
-> Architecture for searching multiple project knowledge bases and memory simultaneously.
+> Fan-out search across multiple knowledge sources with graceful partial failure and token-budgeted context injection.
 
 ## Problem
 
-Knowledge is fragmented. Each project has its own KB (via MCP tools, HTTP endpoints, or shell scripts), Claude Code has auto-memory directories per project, and the orchestrator has its own embedding-backed memory store. Finding "that thing about ring buffers" means manually checking three or four different systems. Worse, when the orchestrator dispatches work to satellites, those satellites lack cross-project context that might be relevant.
+Knowledge is fragmented. Each project has its own knowledge base, the orchestrator has its own memory store, and relevant context might live in any combination of these sources. Finding "that thing about ring buffers" means manually checking multiple systems. Worse, when the orchestrator dispatches work to agents, those agents lack cross-project context that might be relevant to their task.
 
 ## Context
 
-- Multiple projects registered with the orchestrator, each with a KB
-- CC auto-memory directories per project (`.claude/` files)
-- Orchestrator's internal memory store with semantic search
-- Need for cross-cutting queries ("everything about authentication across all projects")
-- Results must be injected into satellite dispatches for context-aware work
+- Multiple projects registered with a central orchestrator, each potentially exposing searchable knowledge
+- The orchestrator maintains its own memory store with semantic search (e.g., PostgreSQL with pgvector)
+- Cross-cutting queries are common ("everything about authentication across all projects")
+- Search results must be injected into agent dispatch context without exceeding token budgets
+- Individual knowledge sources may be slow or temporarily unavailable — search must not block on failures
 
 ## Solution
 
 ### Parallel Multi-Source Fan-Out
 
-Queries fan out to all registered sources simultaneously using `Promise.allSettled()` — no single slow source blocks the results:
+Queries fan out to all registered knowledge sources simultaneously using `Promise.allSettled()`. No single slow or failing source blocks results from the others:
 
 ```javascript
 async function unifiedSearch(query) {
   const sources = [
-    searchLocalMemory(query),           // Orchestrator's own store
-    ...projects.map(p => searchProjectKB(p, query))  // All project KBs
+    searchOrchestratorMemory(query),
+    ...registeredSources.map(src => searchSource(src, query))
   ];
 
   const results = await Promise.allSettled(sources);
@@ -35,94 +35,85 @@ async function unifiedSearch(query) {
 }
 ```
 
-Failed sources are silently dropped — partial results are better than no results.
+Failed sources are silently dropped — partial results are better than no results. The `allSettled` pattern means a 30-second timeout on one source does not delay results from the four that responded in 200ms.
 
-### Three KB Backend Types
+### Orchestrator Memory as Primary Backend
 
-Each project declares its search interface in `.riley/capabilities.yaml`:
+The orchestrator's own memory store serves as the primary search backend, typically backed by PostgreSQL with pgvector for semantic search:
 
-**MCP Tool:**
-```yaml
-search:
-  type: mcp
-  tool: kb_search
-  query_param: query
-```
-The orchestrator maintains MCP session IDs per URL, auto-initializes on 400/404, and parses results from `result.content[].text` (handling nested `{ results: [...] }` wrappers).
+- **Embedding-based retrieval:** Queries are embedded and matched against stored memory vectors using cosine similarity
+- **Conflict detection:** Before storing new memories, check for high similarity (>0.85) with significant text divergence (>30%) to flag contradictions
+- **Supersession:** Old memories can be marked as superseded and filtered from query results
+- **Ranking:** Combines embedding similarity, domain relevance, access frequency, and recency
+- **Fallback:** Keyword search when the embedding service is unavailable
 
-**HTTP Endpoint:**
-```yaml
-search:
-  type: http
-  url: "http://localhost:3001/api/search"
-```
-Expects `{ results: [...] }` or plain array response.
+### Source Tagging and Ranking
 
-**Shell Script:**
-```yaml
-search:
-  type: script
-  command: "./search.sh"
-```
-Spawns shell process, passes query as argument, parses JSON stdout. 15-second timeout prevents hanging.
-
-### Automatic Context Injection
-
-Search results are automatically injected into every satellite dispatch:
+Every result is tagged with its source, allowing downstream consumers to understand provenance:
 
 ```javascript
-async function getUnifiedContext(message, tokenBudget = 600) {
-  const results = await unifiedSearch(message);
-  // Format results within token budget
-  // Inject as additional context in satellite prompt
+function rankResults(results) {
+  return results
+    .sort((a, b) => b.relevance - a.relevance)
+    .slice(0, maxResults);
 }
 ```
 
-This runs on every user message, ensuring satellites always have cross-project awareness without explicitly requesting it.
+Results from different sources use different relevance scoring (semantic similarity vs. keyword match vs. exact match), so cross-source ranking is best-effort. Source tags let the consumer weight results by trust level if needed.
 
-### Orchestrator Memory: Embedding-Based Search
+### Token-Budgeted Context Injection
 
-The orchestrator's own memory uses Gemini `embedding-001` for semantic search:
+Search results are automatically injected into agent dispatch context, constrained by a token budget:
 
-- **Conflict detection:** Before storing, checks if similarity >0.85 with text divergence >30% (flags contradictory memories)
-- **Supersession:** Old memories can be marked as superseded, filtered from queries
-- **Domain-aware thresholds:** Different similarity thresholds for different content types
-- **Ranking:** Combines embedding similarity + domain match + access frequency + recency
-- **Fallback:** Keyword search when embeddings are unavailable
+```javascript
+async function getSearchContext(message, tokenBudget = 600) {
+  const results = await unifiedSearch(message);
+  const ranked = rankResults(results);
+
+  let context = '';
+  for (const result of ranked) {
+    const entry = formatResult(result);
+    if (estimateTokens(context + entry) > tokenBudget) break;
+    context += entry;
+  }
+  return context;
+}
+```
+
+This runs on relevant dispatches, ensuring agents have cross-project awareness without explicitly requesting it and without blowing up context windows.
 
 ## Implications
 
-- Latency bounded by the slowest responding source (mitigated by `allSettled` — don't wait for failures)
-- Different KBs have different query capabilities (full-text vs. semantic vs. exact match) — no way to normalize ranking across heterogeneous sources
-- Token budget for context injection (default 600) means only top results are included
-- MCP session management adds complexity — sessions can expire, requiring re-initialization
-- Shell script backends are a security surface — arbitrary command execution
-- No deduplication across sources — the same fact stored in two KBs appears twice
+- Latency is bounded by the slowest responding source, but `allSettled` prevents failures from blocking — the trade-off is that slow sources may return results after the budget is already filled by faster sources
+- Different knowledge backends have different query capabilities (full-text vs. semantic vs. exact match) — cross-source ranking is inherently approximate
+- Token budget for context injection (default ~600 tokens) means only top-ranked results are included; important but lower-ranked results may be dropped
+- No deduplication across sources — the same fact stored in two knowledge bases appears twice in results
+- The embedding service is a dependency for semantic search; keyword fallback preserves availability but reduces quality
+- Adding new knowledge sources requires registering them with the search coordinator but does not require changes to the fan-out or ranking logic
 
 ## Code Example
 
 ```javascript
-// MCP search with session management
-async function searchMCP(project, query) {
-  let sessionId = mcpSessions.get(project.mcp.url);
+// Unified search with context injection into agent dispatch
+const searchContext = await getSearchContext(
+  'authentication flow for the billing service',
+  600  // token budget
+);
 
-  if (!sessionId) {
-    sessionId = await initMCPSession(project.mcp.url, project.mcp.headers);
-    mcpSessions.set(project.mcp.url, sessionId);
-  }
+// Inject into agent prompt
+const enrichedPrompt = `
+${userMessage}
 
-  const result = await callMCPTool(sessionId, project.search.tool, {
-    [project.search.query_param]: query
-  });
+--- Relevant context from knowledge bases ---
+${searchContext}
+`;
 
-  // Handle nested result formats
-  const parsed = JSON.parse(result.content[0].text);
-  const items = parsed.results || parsed;
-  return items.map(r => ({ ...r, _source: project.name }));
-}
+// Dispatch agent with cross-project awareness
+await dispatch({ prompt: enrichedPrompt, model: 'sonnet' });
 ```
 
 ## Related Patterns
 
 - [Activity Tracking Architecture](./activity-tracking-architecture.md)
 - [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
+- [Session Consolidation and Memory](./session-consolidation-and-memory.md)

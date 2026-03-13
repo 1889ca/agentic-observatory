@@ -15,7 +15,8 @@
   </header>
 
   <div class="search-bar">
-    <input type="text" id="search" placeholder="Search patterns..." autocomplete="off">
+    <label for="search" class="sr-only">Search patterns</label>
+    <input type="text" id="search" placeholder="Search patterns..." autocomplete="off" role="searchbox" aria-label="Search patterns">
   </div>
 
   <div class="pattern-list" id="pattern-list"></div>

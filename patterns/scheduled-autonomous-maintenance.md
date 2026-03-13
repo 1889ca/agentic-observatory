@@ -1,38 +1,41 @@
 # Scheduled Autonomous Maintenance
 
-> Self-managing projects through cron-scheduled satellite tasks with orchestrator oversight.
+> Cron-based task scheduling for agent-managed projects with concurrent execution guards and centralized result processing.
 
 ## Problem
 
-Software projects need ongoing maintenance — dependency updates, test runs, documentation freshness checks, pattern library curation. Doing this manually is tedious and gets forgotten. But fully autonomous maintenance is risky — an agent making unsupervised changes can introduce bugs or push broken code. You need a middle ground: automated scheduling with appropriate oversight.
+Software projects need ongoing maintenance — dependency audits, test runs, documentation freshness checks, code quality sweeps. Doing this manually is tedious and gets forgotten. But fully autonomous maintenance is risky without structure: an agent needs clear task definitions, execution guardrails, and a way to report results back to the orchestrator. You need a scheduling system that treats maintenance tasks as first-class entities with defined cadences, execution constraints, and result routing.
 
 ## Context
 
-- Multiple projects registered with a central orchestrator
+- Multiple projects managed by a central orchestrator
 - Each project has different maintenance needs and cadences
-- Some maintenance is safe to auto-approve (linting, test runs, doc checks)
-- Some requires human review before acting (dependency upgrades, refactors, deployments)
-- The orchestrator itself needs maintenance (its own patterns, capabilities, health checks)
+- Tasks vary in complexity and model requirements (lightweight checks vs. deep analysis)
+- Some tasks take minutes, others take much longer — overlapping runs must be prevented
+- The orchestrator needs visibility into task results without polling individual projects
+- Tasks should be manageable via API for programmatic creation, updates, and manual triggers
 
 ## Solution
 
-### Cron-Based Task Scheduling
+### Task Storage
 
-Tasks are registered with standard cron expressions and stored in SQLite:
+Tasks are stored in a database (e.g., PostgreSQL) with a consistent schema:
 
 ```javascript
-// Task definition
+// Task record
 {
-  id: 'observatory-maintenance',
-  schedule: '0 2 * * *',        // Daily at 2 AM UTC
-  prompt: 'Review and maintain the agentic-observatory project...',
-  model: 'opus',
-  workdir: '/path/to/project',
-  enabled: true
+  id: 'weekly-dep-audit',       // Unique identifier
+  schedule: '0 9 * * 1',        // Standard cron expression
+  prompt: 'Audit dependencies for security vulnerabilities...',
+  model: 'sonnet',              // Which model to dispatch to
+  workdir: '/path/to/project',  // Execution context
+  enabled: true                 // Can be toggled without deletion
 }
 ```
 
-The scheduler uses `node-cron` with guards against concurrent execution:
+### Cron-Based Scheduling with Concurrent Execution Guards
+
+The scheduler uses `node-cron` to trigger tasks at their defined cadences. A running set prevents overlapping executions of the same task:
 
 ```javascript
 const running = new Set();
@@ -41,7 +44,7 @@ cron.schedule(task.schedule, async () => {
   if (running.has(task.id)) return;  // Skip if already running
   running.add(task.id);
   try {
-    const result = await runTask(task);  // Dispatch to satellite
+    const result = await dispatch(task);
     enqueue({ type: 'task-result', task: task.id, result });
   } finally {
     running.delete(task.id);
@@ -49,90 +52,63 @@ cron.schedule(task.schedule, async () => {
 });
 ```
 
-### Autonomy Gating
+If a task is still running when its next scheduled slot arrives, that slot is silently skipped. No queuing, no retry — the next natural slot will attempt execution again.
 
-Each project declares an autonomy matrix in `.riley/autonomy.yaml`:
+### API-Driven Task Management
 
-```yaml
-decisions:
-  routine-logging:
-    tier: status
-    action: self-approve
-  pattern-update:
-    tier: opportunity
-    action: self-approve
-  deploy:
-    tier: critical
-    action: require_input
+Tasks are managed through the orchestrator's API rather than configuration files:
 
-escalation_timeout: 3600  # seconds before auto-denying
-```
+- **Create/update:** `POST /api/tasks` with the task definition
+- **Manual trigger:** `POST /api/tasks/:id/run` to execute immediately (still subject to the concurrent execution guard)
+- **List:** `GET /api/tasks` to inspect all registered tasks
+- **Toggle:** Update the `enabled` field to pause/resume without deleting the task definition
 
-Tiers control what the satellite can do without human approval:
-- **Status tier:** Logging, reporting, monitoring — always safe
-- **Opportunity tier:** Documentation updates, pattern additions — safe with review
-- **Critical tier:** Deployments, data migrations, dependency changes — require human approval
-
-### Self-Referential Maintenance
-
-The pattern is recursive — the orchestrator schedules maintenance of its own supporting projects, including the pattern library that documents how the orchestrator works:
-
-```
-Orchestrator → schedules → observatory-maintenance task
-  → satellite reviews patterns
-  → satellite identifies gaps
-  → satellite writes new patterns
-  → satellite commits and pushes
-  → (deployment requires human approval per autonomy.yaml)
-```
-
-This creates a self-documenting system where the patterns describing agentic behavior are themselves maintained by agents.
+This keeps task management centralized and auditable — no scattered config files across projects.
 
 ### Result Processing
 
-All task results flow back through the orchestrator's queue:
-- Results are enqueued with priority 1 (above ambient, below urgent)
-- The orchestrator can act on results (relay to user, trigger follow-up flows)
-- Failed tasks log errors but don't block other scheduled work
-- No automatic retry — failed tasks wait for next scheduled run
+All task results flow back through the orchestrator's message queue:
+
+- Results are enqueued with appropriate priority (above ambient activity, below urgent user requests)
+- The orchestrator can act on results: relay to the user, trigger follow-up work, or log and move on
+- Failed tasks log errors but do not block other scheduled work
+- No automatic retry — failed tasks wait for their next scheduled slot
 
 ## Implications
 
-- Cron scheduling is coarse-grained — no event-driven triggers (e.g., "run on PR creation")
-- Concurrent execution guard means long-running tasks can skip their next scheduled slot
-- Autonomy gating relies on the satellite correctly classifying its actions — a satellite that "doesn't know" it's doing something critical can bypass the gate
-- No dependency ordering between tasks — if task A must run before task B, that's the prompt author's problem
-- Scheduled tasks consume satellite slots — heavy scheduling can starve on-demand work
-- Escalation timeout (default 1 hour) means time-sensitive decisions may auto-deny
+- Cron scheduling is time-based only — no event-driven triggers (e.g., "run when a PR is opened")
+- The concurrent execution guard means long-running tasks can miss their next scheduled slot, which is by design but requires tasks to be scoped appropriately
+- No dependency ordering between tasks — if task A must complete before task B, that ordering must be encoded in the prompts or handled at a higher level
+- Heavy scheduling can consume agent dispatch capacity, starving on-demand work
+- The `enabled` toggle provides a safe way to pause maintenance without losing task definitions
+- Task prompts carry the full instruction set — the scheduling system is prompt-agnostic and does not interpret task content
 
 ## Code Example
 
 ```javascript
-// Registering a maintenance task via API
-await fetch('http://localhost:3847/api/tasks', {
+// Register a maintenance task
+await fetch('http://orchestrator/api/tasks', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
-    id: 'weekly-dep-audit',
-    schedule: '0 9 * * 1',  // Monday 9 AM
-    prompt: `Audit dependencies for security vulnerabilities.
-             Check npm audit, review changelogs for major updates.
-             Report findings but do NOT upgrade without approval.`,
+    id: 'nightly-test-suite',
+    schedule: '0 3 * * *',       // Daily at 3 AM
+    prompt: `Run the full test suite. Report any failures with
+             file paths and error messages. Do NOT attempt fixes.`,
     model: 'sonnet',
-    workdir: '/path/to/project',
+    workdir: '/srv/my-project',
     enabled: true
   })
 });
 
-// Task runs automatically, results appear in orchestrator queue:
-// "Found 2 moderate vulnerabilities in lodash and express.
-//  lodash 4.17.21 → 4.17.25 (patch, safe to upgrade)
-//  express 4.18.2 → 5.0.0 (major, breaking changes — needs review)
-//  RECOMMENDATION: Auto-upgrade lodash, flag express for human review."
+// Manually trigger a task outside its schedule
+await fetch('http://orchestrator/api/tasks/nightly-test-suite/run', {
+  method: 'POST'
+});
 ```
 
 ## Related Patterns
 
 - [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
 - [Flow Recovery and Resilience](./flow-recovery-and-resilience.md)
-- [Satellite Permission Escalation](./satellite-permission-escalation.md)
+- [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
