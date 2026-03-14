@@ -13,13 +13,13 @@ Software projects need ongoing maintenance — dependency audits, test runs, doc
 - Tasks vary in complexity and model requirements (lightweight checks vs. deep analysis)
 - Some tasks take minutes, others take much longer — overlapping runs must be prevented
 - The orchestrator needs visibility into task results without polling individual projects
-- Tasks should be manageable via API for programmatic creation, updates, and manual triggers
+- Tasks should be manageable programmatically: created, updated, toggled, listed, and triggered on demand
 
 ## Solution
 
 ### Task Storage
 
-Tasks are stored in a database (e.g., PostgreSQL) with a consistent schema:
+Tasks are stored in PostgreSQL with a consistent schema:
 
 ```javascript
 // Task record
@@ -32,6 +32,8 @@ Tasks are stored in a database (e.g., PostgreSQL) with a consistent schema:
   enabled: true                 // Can be toggled without deletion
 }
 ```
+
+Storing task definitions in PostgreSQL rather than configuration files keeps task management centralized and auditable. Tasks can be created, updated, listed, toggled (enabled/disabled), and manually triggered through the orchestrator's task management layer — the exact API surface varies by implementation, but the lifecycle operations are consistent.
 
 ### Cron-Based Scheduling with Concurrent Execution Guards
 
@@ -54,16 +56,16 @@ cron.schedule(task.schedule, async () => {
 
 If a task is still running when its next scheduled slot arrives, that slot is silently skipped. No queuing, no retry — the next natural slot will attempt execution again.
 
-### API-Driven Task Management
+### Task Lifecycle
 
-Tasks are managed through the orchestrator's API rather than configuration files:
+The orchestrator exposes task management operations that cover the full lifecycle:
 
-- **Create/update:** `POST /api/tasks` with the task definition
-- **Manual trigger:** `POST /api/tasks/:id/run` to execute immediately (still subject to the concurrent execution guard)
-- **List:** `GET /api/tasks` to inspect all registered tasks
-- **Toggle:** Update the `enabled` field to pause/resume without deleting the task definition
+- **Create/update:** Register a new task or modify an existing one (schedule, prompt, model, workdir, enabled status)
+- **List:** Inspect all registered tasks and their current state
+- **Toggle:** Pause or resume a task by flipping its `enabled` field without deleting the definition
+- **Manual trigger:** Execute a task immediately outside its normal schedule (still subject to the concurrent execution guard)
 
-This keeps task management centralized and auditable — no scattered config files across projects.
+These operations are typically exposed via the orchestrator's API, but the key architectural point is that task definitions live in the database and are managed centrally — not scattered across project config files.
 
 ### Result Processing
 
@@ -86,29 +88,28 @@ All task results flow back through the orchestrator's message queue:
 ## Code Example
 
 ```javascript
-// Register a maintenance task
-await fetch('http://orchestrator/api/tasks', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    id: 'nightly-test-suite',
-    schedule: '0 3 * * *',       // Daily at 3 AM
-    prompt: `Run the full test suite. Report any failures with
-             file paths and error messages. Do NOT attempt fixes.`,
-    model: 'sonnet',
-    workdir: '/srv/my-project',
-    enabled: true
-  })
-});
+// Register a maintenance task through the orchestrator's task management
+const task = {
+  id: 'nightly-test-suite',
+  schedule: '0 3 * * *',       // Daily at 3 AM
+  prompt: `Run the full test suite. Report any failures with
+           file paths and error messages. Do NOT attempt fixes.`,
+  model: 'sonnet',
+  workdir: '/srv/my-project',
+  enabled: true
+};
+
+await taskManager.create(task);
 
 // Manually trigger a task outside its schedule
-await fetch('http://orchestrator/api/tasks/nightly-test-suite/run', {
-  method: 'POST'
-});
+await taskManager.trigger('nightly-test-suite');
+
+// Pause a task without deleting it
+await taskManager.update('nightly-test-suite', { enabled: false });
 ```
 
 ## Related Patterns
 
 - [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
-- [Flow Recovery and Resilience](./flow-recovery-and-resilience.md)
+- [Activity Tracking Architecture](./activity-tracking-architecture.md)
 - [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)

@@ -117,6 +117,6 @@ await generateNarrative({
 
 ## Related Patterns
 
-- [Session Consolidation and Memory](./session-consolidation-and-memory.md)
+- [Domain-Aware Memory Scoring](./domain-aware-memory-scoring.md)
 - [Domain-Aware Memory Scoring](./domain-aware-memory-scoring.md)
 - [Activity Tracking Architecture](./activity-tracking-architecture.md)

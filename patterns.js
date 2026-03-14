@@ -6,7 +6,7 @@ const PATTERNS = [
   {
     slug: "orchestrator-satellite-communication",
     title: "Orchestrator-Satellite Communication",
-    summary: "Event-driven worker pool protocol for dispatching and monitoring AI agent jobs across distributed workers.",
+    summary: "HTTP-based task dispatch protocol with PostgreSQL job queue for orchestrator-to-satellite communication.",
     status: "published",
   },
   {
@@ -15,13 +15,7 @@ const PATTERNS = [
     summary: "Detecting and recovering from permission-blocked workers in multi-agent dispatch.",
     status: "published",
   },
-  {
-    slug: "flow-recovery-and-resilience",
-    title: "Flow Recovery and Resilience",
-    summary: "How to restart interrupted flows and maintain state consistency across orchestrator restarts.",
-    status: "published",
-  },
-  {
+{
     slug: "activity-tracking-architecture",
     title: "Activity Tracking Architecture",
     summary: "Multi-layered activity tracking across distributed agent jobs with audit trails and real-time monitoring.",
@@ -45,25 +39,13 @@ const PATTERNS = [
     summary: "Cron-scheduled autonomous tasks with API-driven management and concurrent execution guards.",
     status: "published",
   },
-  {
-    slug: "session-consolidation-and-memory",
-    title: "Session Consolidation and Memory",
-    summary: "Periodic summarization and narrative storage to maintain continuity across AI sessions.",
-    status: "published",
-  },
-  {
+{
     slug: "context-assembly-pipeline",
     title: "Context Assembly Pipeline",
     summary: "Budget-aware assembly of multi-source context for each AI dispatch, tuned by dispatch type.",
     status: "published",
   },
-  {
-    slug: "gateway-brain-split",
-    title: "Gateway-Brain Split",
-    summary: "Process isolation between the web-facing gateway and the AI brain for graceful degradation.",
-    status: "published",
-  },
-  {
+{
     slug: "capability-manifest-registration",
     title: "Capability Manifest Registration",
     summary: "Declarative capability registration for extensible orchestrator tool and workflow discovery.",
@@ -175,6 +157,30 @@ const PATTERNS = [
     slug: "unified-trigger-system",
     title: "Unified Trigger System",
     summary: "Polymorphic trigger registry unifying notifications, tool calls, job dispatch, and approval workflows.",
+    status: "published",
+  },
+  {
+    slug: "channel-adapter-architecture",
+    title: "Channel Adapter Architecture",
+    summary: "Pluggable adapter contract for multi-channel messaging with registry validation and message routing.",
+    status: "published",
+  },
+  {
+    slug: "outbound-queue-with-backoff",
+    title: "Outbound Queue with Backoff",
+    summary: "Async message delivery queue with scheduled delivery, exponential backoff retry, and metadata tracking.",
+    status: "published",
+  },
+  {
+    slug: "connector-registry-and-capability-discovery",
+    title: "Connector Registry and Capability Discovery",
+    summary: "Generic connector pattern for external services with type registry, instance caching, and priority-based capability resolution.",
+    status: "published",
+  },
+  {
+    slug: "confidence-based-autonomy-gating",
+    title: "Confidence-Based Autonomy Gating",
+    summary: "Dynamic autonomy adjustment based on per-operation confidence scores earned through successful execution history.",
     status: "published",
   },
 ];

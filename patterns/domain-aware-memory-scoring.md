@@ -15,61 +15,99 @@ Embedding-based memory retrieval returns results by cosine similarity, but raw s
 
 ## Solution
 
-### Vector Storage with pgvector
+### Bifurcated Vector Storage with pgvector
 
-Memories are stored in PostgreSQL with embeddings generated at write time using pgvector:
+Vectors are stored across two PostgreSQL tables, split by the nature of the content. Documents — which carry rich metadata like project association, type, and structured content — store their embeddings inline:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE TABLE memories (
+-- Documents: rich metadata, embeddings stored inline
+CREATE TABLE documents (
   id SERIAL PRIMARY KEY,
   content TEXT NOT NULL,
   embedding vector(1536),         -- dimensionality matches the embedding model
+  project TEXT,                    -- which project this document belongs to
+  type TEXT,                       -- document type (e.g., 'note', 'report', 'reference')
   access_count INTEGER DEFAULT 0,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   last_accessed_at TIMESTAMPTZ
 );
 
--- Index for fast approximate nearest-neighbor search
-CREATE INDEX ON memories USING ivfflat (embedding vector_cosine_ops)
+CREATE INDEX ON documents USING ivfflat (embedding vector_cosine_ops)
+  WITH (lists = 100);
+
+-- Memory vectors: lightweight, for non-document memories
+CREATE TABLE memory_vectors (
+  id SERIAL PRIMARY KEY,
+  content TEXT NOT NULL,
+  embedding vector(1536),
+  access_count INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  last_accessed_at TIMESTAMPTZ
+);
+
+CREATE INDEX ON memory_vectors USING ivfflat (embedding vector_cosine_ops)
   WITH (lists = 100);
 ```
 
+The bifurcation exists because documents have rich metadata (project, type, etc.) that supports structured queries and filtering, while memory vectors are lightweight entries that only need content and an embedding. Both tables participate in search.
+
 ### Embedding at Write Time
 
-When a memory is stored, the content is embedded immediately so retrieval never waits on embedding generation:
+When a memory is stored, the content is embedded immediately so retrieval never waits on embedding generation. The writer determines which table to target based on the content type:
 
 ```javascript
-async function storeMemory(content) {
+async function storeMemory(content, { project, type } = {}) {
   const embedding = await generateEmbedding(content);
-  await db.query(
-    `INSERT INTO memories (content, embedding) VALUES ($1, $2)`,
-    [content, JSON.stringify(embedding)]
-  );
+
+  if (project || type) {
+    // Document-type memory: rich metadata, stored in documents table
+    await db.query(
+      `INSERT INTO documents (content, embedding, project, type) VALUES ($1, $2, $3, $4)`,
+      [content, JSON.stringify(embedding), project, type]
+    );
+  } else {
+    // Lightweight memory: stored in memory_vectors table
+    await db.query(
+      `INSERT INTO memory_vectors (content, embedding) VALUES ($1, $2)`,
+      [content, JSON.stringify(embedding)]
+    );
+  }
 }
 ```
 
 ### Retrieval with Combined Scoring
 
-Queries are embedded and compared against stored memories using pgvector's cosine distance operator. The database handles the vector math; application code layers on recency and frequency:
+Search queries both tables and merges results. Each table is queried independently using pgvector's cosine distance operator, then the combined results are re-ranked using the three-factor scoring algorithm:
 
 ```javascript
 async function searchMemories(query, limit = 10) {
   const queryEmbedding = await generateEmbedding(query);
+  const overfetch = limit * 3;
 
-  // pgvector cosine distance: 1 - cosine_similarity
-  // So similarity = 1 - distance
-  const results = await db.query(`
-    SELECT
-      id, content, created_at, access_count,
-      1 - (embedding <=> $1::vector) AS similarity
-    FROM memories
-    ORDER BY embedding <=> $1::vector
-    LIMIT $2
-  `, [JSON.stringify(queryEmbedding), limit * 3]); // over-fetch for re-ranking
+  // Query both tables in parallel
+  const [docResults, vecResults] = await Promise.all([
+    db.query(`
+      SELECT id, 'document' AS source, content, created_at, access_count,
+        1 - (embedding <=> $1::vector) AS similarity
+      FROM documents
+      ORDER BY embedding <=> $1::vector
+      LIMIT $2
+    `, [JSON.stringify(queryEmbedding), overfetch]),
 
-  return rerank(results.rows);
+    db.query(`
+      SELECT id, 'memory_vector' AS source, content, created_at, access_count,
+        1 - (embedding <=> $1::vector) AS similarity
+      FROM memory_vectors
+      ORDER BY embedding <=> $1::vector
+      LIMIT $2
+    `, [JSON.stringify(queryEmbedding), overfetch])
+  ]);
+
+  // Merge and re-rank across both sources
+  const combined = [...docResults.rows, ...vecResults.rows];
+  return rerank(combined).slice(0, limit);
 }
 ```
 
@@ -114,15 +152,25 @@ function recencyDecay(createdAt) {
 
 ### Access Tracking
 
-Each retrieval increments the access counter, creating a feedback signal for frequently-needed memories:
+Each retrieval increments the access counter on the appropriate table, creating a feedback signal for frequently-needed memories:
 
 ```javascript
-async function trackAccess(memoryIds) {
-  await db.query(`
-    UPDATE memories
-    SET access_count = access_count + 1, last_accessed_at = NOW()
-    WHERE id = ANY($1)
-  `, [memoryIds]);
+async function trackAccess(results) {
+  const docIds = results.filter(r => r.source === 'document').map(r => r.id);
+  const vecIds = results.filter(r => r.source === 'memory_vector').map(r => r.id);
+
+  await Promise.all([
+    docIds.length && db.query(`
+      UPDATE documents
+      SET access_count = access_count + 1, last_accessed_at = NOW()
+      WHERE id = ANY($1)
+    `, [docIds]),
+    vecIds.length && db.query(`
+      UPDATE memory_vectors
+      SET access_count = access_count + 1, last_accessed_at = NOW()
+      WHERE id = ANY($1)
+    `, [vecIds])
+  ]);
 }
 ```
 
@@ -134,19 +182,28 @@ async function trackAccess(memoryIds) {
 - The combined boost ceiling is +0.2, keeping vector similarity as the primary ranking signal
 - Half-life tuning depends on the agent's domain: a customer support agent might use 7 days, a research agent might use 60 days
 - Embedding dimensionality (1536 in the example) must match the embedding model — switching models requires re-embedding all stored memories
+- Bifurcated storage means search must query both tables and merge — this adds a parallel query but keeps each table's schema clean and purpose-specific
+- Documents can be filtered by project or type before vector search, narrowing the search space for domain-specific queries
 
 ## Code Example
 
 ```javascript
 // Reference implementation: Riley orchestrator (PostgreSQL + pgvector)
 
-// Store a memory after a work session
+// Store a document-type memory with project metadata
 await storeMemory(
   'Deployed billing-api v2.3.1 to production. Migration ran cleanly. ' +
-  'Watch for elevated error rates on the /invoices endpoint for 24 hours.'
+  'Watch for elevated error rates on the /invoices endpoint for 24 hours.',
+  { project: 'billing-api', type: 'deployment-note' }
+);
+
+// Store a lightweight operational memory
+await storeMemory(
+  'User prefers verbose error output when running audits.'
 );
 
 // Later, retrieve relevant memories for a new task
+// (searches both documents and memory_vectors, merges results)
 const memories = await searchMemories(
   'Are there any known issues with the billing API?'
 );
@@ -154,13 +211,13 @@ const memories = await searchMemories(
 // Top result (high similarity + recent + accessed twice before):
 // score: 0.84 (similarity) + 0.09 (2-day recency) + 0.02 (access) = 0.95
 
-// Track that we used these memories
-await trackAccess(memories.slice(0, 5).map(m => m.id));
+// Track that we used these memories (updates correct table per result)
+await trackAccess(memories.slice(0, 5));
 ```
 
 ## Related Patterns
 
 - [Narrative Memory Generation](./narrative-memory-generation.md)
-- [Session Consolidation and Memory](./session-consolidation-and-memory.md)
+- [Knowledge Graph and Relationship Discovery](./knowledge-graph-and-relationship-discovery.md)
 - [Unified Search Across KBs](./unified-search-across-kbs.md)
 - [Context Assembly Pipeline](./context-assembly-pipeline.md)

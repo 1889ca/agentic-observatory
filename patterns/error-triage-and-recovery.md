@@ -149,5 +149,5 @@ async function retryWithBackoff(tool, params, { maxRetries = 3, baseDelay = 1000
 ## Related Patterns
 
 - [Declarative Capability System](./declarative-capability-system.md)
-- [Flow Recovery and Resilience](./flow-recovery-and-resilience.md)
-- [Gateway-Brain Split](./gateway-brain-split.md)
+- [Outbound Queue with Backoff](./outbound-queue-with-backoff.md)
+- [Channel Adapter Architecture](./channel-adapter-architecture.md)

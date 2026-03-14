@@ -116,4 +116,4 @@ await dispatch({ prompt: enrichedPrompt, model: 'sonnet' });
 
 - [Activity Tracking Architecture](./activity-tracking-architecture.md)
 - [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
-- [Session Consolidation and Memory](./session-consolidation-and-memory.md)
+- [Domain-Aware Memory Scoring](./domain-aware-memory-scoring.md)

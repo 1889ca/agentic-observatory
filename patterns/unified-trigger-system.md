@@ -358,5 +358,5 @@ const triggerAPI = {
 
 - [Cognitive Processing Loop](./cognitive-processing-loop.md)
 - [Unified Event System](./unified-event-system.md)
-- [Flow Recovery and Resilience](./flow-recovery-and-resilience.md)
+- [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
 - [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)

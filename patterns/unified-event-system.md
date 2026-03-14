@@ -118,5 +118,5 @@ function flushBatch() {
 ## Related Patterns
 
 - [Activity Tracking Architecture](./activity-tracking-architecture.md)
-- [Gateway-Brain Split](./gateway-brain-split.md)
+- [Channel Adapter Architecture](./channel-adapter-architecture.md)
 - [Declarative Capability System](./declarative-capability-system.md)

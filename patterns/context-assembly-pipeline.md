@@ -109,5 +109,5 @@ async function dispatch(message, source) {
 ## Related Patterns
 
 - [Unified Search Across KBs](./unified-search-across-kbs.md)
-- [Session Consolidation and Memory](./session-consolidation-and-memory.md)
+- [Dynamic System Prompt Composition](./dynamic-system-prompt-composition.md)
 - [Multi-Model Deliberation](./multi-model-deliberation.md)

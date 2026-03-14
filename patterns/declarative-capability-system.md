@@ -122,4 +122,4 @@ async function execute(toolName, params) {
 
 - [Capability Manifest Registration](./capability-manifest-registration.md)
 - [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
-- [Flow Recovery and Resilience](./flow-recovery-and-resilience.md)
+- [Channel Adapter Architecture](./channel-adapter-architecture.md)

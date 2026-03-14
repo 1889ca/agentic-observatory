@@ -124,5 +124,5 @@ if (result.decision === 'surface') {
 ## Related Patterns
 
 - [Intent-Driven Self-Scheduling](./intent-driven-self-scheduling.md)
-- [Session Consolidation and Memory](./session-consolidation-and-memory.md)
+- [Narrative Memory Generation](./narrative-memory-generation.md)
 - [Evolution and Self-Improvement](./evolution-and-self-improvement.md)

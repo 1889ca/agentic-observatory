@@ -158,5 +158,5 @@ async function dispatchWithPermissionHandling(job, maxRetries = 2) {
 
 ## Related Patterns
 
-- [Flow Recovery and Resilience](./flow-recovery-and-resilience.md)
+- [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
 - [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)

@@ -133,4 +133,4 @@ async function evolve() {
 
 - [Declarative Capability System](./declarative-capability-system.md)
 - [Activity Tracking Architecture](./activity-tracking-architecture.md)
-- [Session Consolidation and Memory](./session-consolidation-and-memory.md)
+- [Cognitive Processing Loop](./cognitive-processing-loop.md)

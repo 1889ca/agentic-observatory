@@ -99,5 +99,5 @@ activeRuns.delete(taskId);
 
 ## Related Patterns
 
-- [Flow Recovery and Resilience](./flow-recovery-and-resilience.md)
+- [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
 - [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)

@@ -130,4 +130,4 @@ async function processMessage(message) {
 
 - [Context Assembly Pipeline](./context-assembly-pipeline.md)
 - [Declarative Capability System](./declarative-capability-system.md)
-- [Session Consolidation and Memory](./session-consolidation-and-memory.md)
+- [Channel Adapter Architecture](./channel-adapter-architecture.md)
