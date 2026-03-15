@@ -1,199 +1,162 @@
 # Confidence-Based Autonomy Gating
 
-> Dynamically adjust agent autonomy based on accumulated confidence scores per operation type, earning independence through successful track record.
+> Domain-level confidence tracking with asymmetric scoring and configurable correction multipliers, earning autonomy through successful track record across entire capability domains.
 
 ## Problem
 
-Fixed autonomy levels are too rigid. An agent that always asks for permission is annoying; one that never does is dangerous. The right level of autonomy depends on the agent's track record with a specific type of operation. A fresh deployment should be cautious everywhere, but after dozens of successful git commits, the agent shouldn't still be asking "may I commit?" every time. Conversely, a single bad deployment should immediately tighten the leash on deploy operations, even if the agent has been doing well with everything else.
+Fixed autonomy levels are too rigid. An agent that always asks for permission is annoying; one that never does is dangerous. The right level of autonomy depends on the agent's track record — but tracking at the individual operation level is too granular (hundreds of operation types), while a single global score is too coarse (one bad email shouldn't affect code review confidence). Domain-level tracking strikes the balance.
 
 ## Context
 
-- An autonomous agent making decisions with varying risk levels across different operation categories
-- Complementary to static decision-gating tiers, which control notification routing. This pattern controls whether gating is bypassed entirely.
-- The agent operates over extended periods where its competence at specific tasks can be observed and measured
-- Different operation types carry different risk profiles and should be tracked independently
+- An autonomous agent making decisions with varying risk levels across different capability domains
+- Complementary to static decision-gating tiers (AUTO/NOTIFY/ASK/NEVER), which control notification routing. This pattern controls whether the agent's confidence justifies bypassing approval.
+- Different domains carry different risk profiles and should be tracked independently
+- Confidence should bias toward caution — failures should matter more than successes
 
 ## Solution
 
-### Confidence Tracking
+### Domain-Level Confidence Tracking
 
-Each operation type maintains an independent confidence score between 0.0 and 1.0. Scores start low, reflecting the principle that autonomy must be earned:
+Confidence scores are maintained per domain (e.g., 'code_review', 'email', 'task_management'), not per individual operation. This groups related operations under a single trust metric:
 
 ```javascript
-class ConfidenceTracker {
-  constructor(options = {}) {
-    this.scores = new Map();
-    this.defaults = {
-      initial: options.initial ?? 0.2,
-      successIncrement: options.successIncrement ?? 0.05,
-      failureDecrement: options.failureDecrement ?? 0.15,
-      autonomyThreshold: options.autonomyThreshold ?? 0.7,
-      decayRate: options.decayRate ?? 0.01,
-      decayIntervalMs: options.decayIntervalMs ?? 24 * 60 * 60 * 1000,
-    };
+// vibe/confidence.js
+// Scores stored in domain_confidence table:
+// tenant_id | domain | total_actions | successful_actions | corrections | confidence_score
+```
+
+### Asymmetric Scoring Formula
+
+The scoring formula weights corrections 1.25x heavier than successes, biasing the system toward caution:
+
+```sql
+confidence_score = GREATEST(0, LEAST(1,
+  (successful_actions - corrections * 1.25) / NULLIF(total_actions, 0)
+))
+```
+
+With this formula:
+- 10 successes, 0 corrections → confidence = 1.0
+- 10 successes, 4 corrections → confidence = (10 - 5) / 14 = 0.36
+- 5 corrections cancel ~6 successes worth of confidence
+
+The multiplier (1.25) is configurable per deployment — higher-risk environments can increase it.
+
+### Fire-and-Forget Signal Recording
+
+Confidence signals are recorded asynchronously to avoid blocking the response path:
+
+```javascript
+async function record(tenantId, domain, positive, weight = 1) {
+  const successInc = positive ? weight : 0;
+  const correctionInc = positive ? 0 : weight;
+
+  // Non-blocking upsert with atomic score recalculation
+  await db.query(`
+    INSERT INTO domain_confidence
+      (tenant_id, domain, total_actions, successful_actions, corrections, confidence_score, last_updated)
+    VALUES ($1, $2, $3, $4, $5,
+      GREATEST(0, LEAST(1, ($4::real - $5::real * 1.25) / NULLIF($3::real, 0))),
+      NOW())
+    ON CONFLICT (tenant_id, domain) DO UPDATE SET
+      total_actions = domain_confidence.total_actions + $3,
+      successful_actions = domain_confidence.successful_actions + $4,
+      corrections = domain_confidence.corrections + $5,
+      confidence_score = GREATEST(0, LEAST(1,
+        (domain_confidence.successful_actions + $4
+         - (domain_confidence.corrections + $5) * 1.25)::real
+        / NULLIF((domain_confidence.total_actions + $3)::real, 0)
+      )),
+      last_updated = NOW()
+  `, [tenantId, domain, 1, successInc, correctionInc]);
+}
+
+// Called fire-and-forget from tool execution:
+confidence.record(tenantId, 'code_review', true).catch(() => {});
+```
+
+### Autonomy Integration
+
+Confidence scores feed into the autonomy decision at tool execution time:
+
+```javascript
+// message-processor/autonomy.js
+async function executeToolWithAutonomy(toolName, args, userId, options = {}) {
+  const tool = registry.get(toolName);
+  const domain = tool.domain || 'general';
+  const score = await confidence.getScore(userId, domain);
+
+  // High confidence + AUTO tier → execute without asking
+  if (tool.autonomyTier === 'AUTO' || (tool.autonomyTier === 'NOTIFY' && score > 0.8)) {
+    const result = await tool.execute(args);
+    confidence.record(userId, domain, true).catch(() => {});
+    return result;
   }
 
-  getScore(operationType) {
-    if (!this.scores.has(operationType)) {
-      this.scores.set(operationType, {
-        value: this.defaults.initial,
-        lastUpdated: Date.now(),
-        successes: 0,
-        failures: 0,
-      });
-    }
-    return this.scores.get(operationType);
+  // Low confidence or ASK tier → require approval
+  if (tool.autonomyTier === 'ASK' || score < 0.3) {
+    return await requestApproval(userId, toolName, args);
   }
+
+  // Middle ground: execute and notify
+  const result = await tool.execute(args);
+  await notify(userId, `Executed ${toolName}`, result);
+  confidence.record(userId, domain, true).catch(() => {});
+  return result;
 }
 ```
 
-### Success and Failure Feedback
+### Integration with Outcome Reactor
 
-After each operation, the system records whether it succeeded or failed. The update is asymmetric: failures decrease confidence by a larger amount than successes increase it, biasing the system toward caution:
-
-```javascript
-recordSuccess(operationType) {
-  const score = this.getScore(operationType);
-  score.value = Math.min(1.0, score.value + this.defaults.successIncrement);
-  score.lastUpdated = Date.now();
-  score.successes++;
-}
-
-recordFailure(operationType) {
-  const score = this.getScore(operationType);
-  score.value = Math.max(0.0, score.value - this.defaults.failureDecrement);
-  score.lastUpdated = Date.now();
-  score.failures++;
-}
-```
-
-With the default settings (success +0.05, failure -0.15), a single failure cancels three successes. Starting from 0.2, the agent needs 10 consecutive successes to cross the 0.7 autonomy threshold — but a single failure drops it back below.
-
-### Autonomy Boost
-
-When confidence for an operation type exceeds the threshold, the agent can execute without human approval. Below the threshold, it must request confirmation:
+The vibe subsystem's outcome reactor automatically updates confidence when external events confirm or deny action outcomes:
 
 ```javascript
-canActAutonomously(operationType) {
-  const score = this.getScore(operationType);
-  this.applyDecay(score);
-  return score.value >= this.defaults.autonomyThreshold;
-}
+// PR merged → positive signal for 'code_review' domain
+events.on('github.pr_merged', (event) => {
+  confidence.record(event.tenantId, 'code_review', true);
+});
 
-async executeOrAsk(operationType, action, askHuman) {
-  if (this.canActAutonomously(operationType)) {
-    return action();
+// PR closed without merge → negative signal
+events.on('github.pr_closed', (event) => {
+  if (!event.merged) {
+    confidence.record(event.tenantId, 'code_review', false);
   }
-  return askHuman(operationType, action);
-}
-```
-
-### Score Decay
-
-Confidence decays over time when an operation type isn't exercised. This prevents stale high-confidence scores from granting autonomy on operations the agent hasn't performed recently:
-
-```javascript
-applyDecay(score) {
-  const elapsed = Date.now() - score.lastUpdated;
-  const intervals = Math.floor(elapsed / this.defaults.decayIntervalMs);
-
-  if (intervals > 0) {
-    const decay = intervals * this.defaults.decayRate;
-    score.value = Math.max(this.defaults.initial, score.value - decay);
-    score.lastUpdated = Date.now();
-  }
-}
-```
-
-Decay floors at the initial score, not zero — the agent doesn't regress below its starting point just because time passed.
-
-### Operation Categories
-
-Operations are grouped by type, with each category tracking independently. Categories reflect the risk profile of the operation, not the specific tool used:
-
-```javascript
-const OPERATION_CATEGORIES = {
-  'git-commit':      { initial: 0.3 },   // Low risk, higher starting confidence
-  'file-edit':       { initial: 0.3 },
-  'send-message':    { initial: 0.2 },
-  'create-issue':    { initial: 0.2 },
-  'deploy-staging':  { initial: 0.1 },   // Higher risk, start more cautious
-  'deploy-production': { initial: 0.0 }, // Maximum caution
-  'delete-resource': { initial: 0.0 },
-};
+});
 ```
 
 ## Implications
 
-- Asymmetric update (failures penalized 3x more than successes reward) makes the system conservative by default. This is intentional — the cost of an unauthorized bad action outweighs the convenience of skipping confirmation.
-- Decay prevents overconfidence from historical success. An agent that hasn't deployed in two weeks shouldn't auto-deploy based on a track record from last month.
-- This pattern is complementary to decision gating, not a replacement. Decision gating controls notification tiers (critical, opportunity, status). Confidence gating controls whether the agent bypasses the approval step entirely. Both can coexist: a high-confidence operation might still generate a status notification even though it doesn't require approval.
-- Per-category tracking means a failure in "deploy" doesn't affect confidence in "git-commit." This is appropriate for isolated operation types but doesn't capture correlated failures (e.g., a string of bad commits might predict bad deploys).
-- The threshold, increment, and decrement values need tuning per deployment. The defaults are conservative but may be too restrictive for low-risk environments or too lenient for high-stakes ones.
-- Persistence is critical — if confidence scores are lost on restart, the agent reverts to asking for everything. Scores should be persisted to disk or a database.
+- Domain-level tracking means a bad email experience affects all email operations — this may be too coarse for some use cases, but is simpler to reason about than per-operation tracking
+- The 1.25x correction multiplier is deliberately mild — it takes ~6 corrections to cancel 5 successes, making the system cautious but not punitive
+- Fire-and-forget recording means confidence tracking never adds latency to tool execution
+- Atomic database upsert ensures confidence scores are consistent even under concurrent access
+- No time-based decay — confidence is purely based on cumulative success/correction ratio. Stale confidence from months ago carries equal weight to recent signals
+- This pattern complements static tiers (AUTO/NOTIFY/ASK/NEVER) — tiers set the baseline, confidence fine-tunes within the tier's range
 
 ## Code Example
 
 ```javascript
-// Reference implementation: Riley agent autonomy
+// Complete confidence lifecycle:
+// 1. Agent executes a tool
+const result = await executeToolWithAutonomy('create_pr', prArgs, userId);
 
-const tracker = new ConfidenceTracker();
+// 2. Confidence recorded (fire-and-forget)
+// confidence.record(userId, 'code_review', true)
 
-// Agent wants to commit code
-async function handleGitCommit(changes) {
-  const operation = 'git-commit';
+// 3. Hours later, PR outcome observed via webhook
+// events.emit('github.pr_merged', { tenantId: userId, pr: { ... } })
+// → confidence.record(userId, 'code_review', true)
 
-  return tracker.executeOrAsk(
-    operation,
-    async () => {
-      const result = await git.commit(changes);
-      tracker.recordSuccess(operation);
-      return result;
-    },
-    async (op, action) => {
-      const approved = await requestHumanApproval(op, changes);
-      if (approved) {
-        const result = await action();
-        tracker.recordSuccess(op);
-        return result;
-      }
-      // Rejection isn't a failure — the agent made the right call by asking
-      return null;
-    }
-  );
-}
+// 4. After many successful PRs, confidence for 'code_review' exceeds 0.8
+// → Future PR-related tools auto-execute even if their tier is 'NOTIFY'
 
-// Agent attempts a deploy that fails
-async function handleDeploy(env, config) {
-  const operation = `deploy-${env}`;
-
-  try {
-    const result = await deploy(env, config);
-    tracker.recordSuccess(operation);
-    return result;
-  } catch (err) {
-    tracker.recordFailure(operation);
-    throw err;
-  }
-}
-
-// Dashboard: inspect current confidence levels
-function getConfidenceReport() {
-  return Object.fromEntries(
-    [...tracker.scores.entries()].map(([op, score]) => [
-      op,
-      {
-        confidence: score.value.toFixed(2),
-        autonomous: score.value >= tracker.defaults.autonomyThreshold,
-        history: `${score.successes} successes, ${score.failures} failures`,
-      },
-    ])
-  );
-}
+// 5. A correction occurs (user rejects a PR the agent created)
+// confidence.record(userId, 'code_review', false)
+// → Score drops, future PRs may require notification again
 ```
 
 ## Related Patterns
 
 - [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
-- [Autonomous Agent Cycle](./autonomous-agent-cycle.md)
+- [Anticipation Engine](./anticipation-engine.md)
 - [Error Triage and Recovery](./error-triage-and-recovery.md)

@@ -6,7 +6,7 @@ const PATTERNS = [
   {
     slug: "orchestrator-satellite-communication",
     title: "Orchestrator-Satellite Communication",
-    summary: "HTTP-based task dispatch protocol with PostgreSQL job queue for orchestrator-to-satellite communication.",
+    summary: "Unix socket protocol with JSONL streaming for real-time orchestrator-to-satellite job dispatch and output streaming.",
     status: "published",
   },
   {
@@ -15,10 +15,10 @@ const PATTERNS = [
     summary: "Detecting and recovering from permission-blocked workers in multi-agent dispatch.",
     status: "published",
   },
-{
+  {
     slug: "activity-tracking-architecture",
     title: "Activity Tracking Architecture",
-    summary: "Multi-layered activity tracking across distributed agent jobs with audit trails and real-time monitoring.",
+    summary: "Three-layer tracking combining JSONL job logs, database session metadata, and in-memory rolling windows.",
     status: "published",
   },
   {
@@ -39,28 +39,28 @@ const PATTERNS = [
     summary: "Cron-scheduled autonomous tasks with API-driven management and concurrent execution guards.",
     status: "published",
   },
-{
+  {
     slug: "context-assembly-pipeline",
     title: "Context Assembly Pipeline",
-    summary: "Budget-aware assembly of multi-source context for each AI dispatch, tuned by dispatch type.",
+    summary: "Single-pass parallel context assembly with token budgeting across multiple sources.",
     status: "published",
   },
-{
+  {
     slug: "capability-manifest-registration",
     title: "Capability Manifest Registration",
-    summary: "Declarative capability registration for extensible orchestrator tool and workflow discovery.",
+    summary: "Dual registration system combining Map-based tool registry with entity/widget type resolution and alias support.",
     status: "published",
   },
   {
     slug: "declarative-capability-system",
     title: "Declarative Capability System",
-    summary: "Four-tier capability model (tools, skills, reflexes, workflows) with JSON Schema declarations for LLM-native tool use.",
+    summary: "Four-tier capability model (tools, skills, reflexes, workflows) with string-based autonomy tiers (AUTO/NOTIFY/ASK/NEVER).",
     status: "published",
   },
   {
     slug: "evolution-and-self-improvement",
     title: "Evolution and Self-Improvement",
-    summary: "Observe-analyze-propose-apply cycle for autonomous system improvement from operational data.",
+    summary: "Corrections-driven learning cycle with coactivation tracking, anti-pattern extraction, and preference synthesis.",
     status: "published",
   },
   {
@@ -72,19 +72,19 @@ const PATTERNS = [
   {
     slug: "message-processing-pipeline",
     title: "Message Processing Pipeline",
-    summary: "End-to-end flow from user input through context assembly, LLM dispatch, tool loop, and response delivery.",
+    summary: "Modular seven-stage pipeline with parallel context assembly, planning, deduplicated tool execution, and response verification.",
     status: "published",
   },
   {
     slug: "error-triage-and-recovery",
     title: "Error Triage and Recovery",
-    summary: "Categorize failures into protocol, transient, and runtime classes with distinct recovery strategies.",
+    summary: "Dual-layer error handling with pattern-based retryability classification and three-category learning triage.",
     status: "published",
   },
   {
     slug: "intent-driven-self-scheduling",
     title: "Intent-Driven Self-Scheduling",
-    summary: "Agents dynamically create and manage their own scheduled tasks via API rather than relying on fixed external cron jobs.",
+    summary: "Agents create and manage scheduled tasks via API with cron dispatch through a priority kanban queue.",
     status: "published",
   },
   {
@@ -126,7 +126,7 @@ const PATTERNS = [
   {
     slug: "autonomous-agent-cycle",
     title: "Autonomous Agent Cycle",
-    summary: "Priority-driven action cycle with working hours, autonomy tiers, and batch approval for self-directed agent behavior.",
+    summary: "Event-driven cognitive tick system with adaptive backpressure, priority-based event processing, and DB-backed outbound queue.",
     status: "published",
   },
   {
@@ -144,7 +144,7 @@ const PATTERNS = [
   {
     slug: "anticipation-engine",
     title: "Anticipation Engine",
-    summary: "Temporal and sequential pattern prediction for proactive agent behavior before explicit requests.",
+    summary: "Reactive vibe subsystem that tracks action outcomes, auto-resolves follow-ups, and adjusts domain confidence.",
     status: "published",
   },
   {
@@ -180,7 +180,31 @@ const PATTERNS = [
   {
     slug: "confidence-based-autonomy-gating",
     title: "Confidence-Based Autonomy Gating",
-    summary: "Dynamic autonomy adjustment based on per-operation confidence scores earned through successful execution history.",
+    summary: "Domain-level confidence tracking with asymmetric scoring and configurable correction multipliers for earned autonomy.",
+    status: "published",
+  },
+  {
+    slug: "distributed-job-locking",
+    title: "Distributed Job Locking",
+    summary: "Redis-backed mutex with in-memory fallback, per-job timeout configs, and token-based ownership for preventing concurrent job execution.",
+    status: "published",
+  },
+  {
+    slug: "worker-dispatcher-and-priority-queue",
+    title: "Worker Dispatcher and Priority Queue",
+    summary: "Weighted work source prioritization with repo-level locking and budget tracking for satellite worker dispatch.",
+    status: "published",
+  },
+  {
+    slug: "anti-pattern-learning-loop",
+    title: "Anti-Pattern Learning Loop",
+    summary: "Frequency tracking of recurring protocol errors with automatic injection into the system prompt after configurable occurrence threshold.",
+    status: "published",
+  },
+  {
+    slug: "graceful-degradation-and-optional-init",
+    title: "Graceful Degradation and Optional Init",
+    summary: "Non-blocking startup with Promise.allSettled(), multi-provider LLM fallback chains, and optional service initialization.",
     status: "published",
   },
 ];

@@ -1,6 +1,6 @@
 # Declarative Capability System
 
-> Four-tier capability model (tools, skills, reflexes, workflows) with JSON Schema declarations for LLM-native tool use.
+> Four-tier capability model (tools, skills, reflexes, workflows) with JSON Schema declarations and string-based autonomy tiers for LLM-native tool use.
 
 ## Problem
 
@@ -32,9 +32,9 @@ Capabilities are organized into four tiers with increasing complexity:
     properties: {
       action: { type: 'string', enum: ['create', 'read', 'update', 'delete'] },
       entityType: { type: 'string' },
-      data: { type: 'object' }
-    }
-  }
+      data: { type: 'object' },
+    },
+  },
 }
 ```
 
@@ -44,6 +44,40 @@ Capabilities are organized into four tiers with increasing complexity:
 
 **Workflows** — Multi-step orchestrations with error handling and branching. Workflows define a DAG of steps, each producing output that feeds the next. Failed steps trigger recovery logic rather than aborting the entire flow.
 
+### String-Based Autonomy Tiers
+
+Each capability declares an autonomy tier using string constants rather than numeric levels. This makes the semantics explicit:
+
+```javascript
+const AUTONOMY_TIERS = {
+  AUTO: 'AUTO',      // Execute automatically, no notification
+  NOTIFY: 'NOTIFY',  // Execute and notify the user afterward
+  ASK: 'ASK',        // Ask for approval before executing
+  NEVER: 'NEVER',    // Never auto-execute, always require explicit invocation
+};
+```
+
+Before execution, the system checks the capability's tier:
+
+```javascript
+async function executeTool(name, params, userId) {
+  const tool = registry.get(name);
+
+  switch (tool.autonomyTier) {
+    case 'AUTO':
+      return await tool.execute(params);
+    case 'NOTIFY':
+      const result = await tool.execute(params);
+      await notify(userId, `Executed ${name}`, result);
+      return result;
+    case 'ASK':
+      return await requestApproval(userId, name, params);
+    case 'NEVER':
+      throw new Error(`${name} requires explicit invocation`);
+  }
+}
+```
+
 ### Lazy Initialization
 
 Capabilities are not loaded at startup. On the first incoming message, the registry initializes:
@@ -51,29 +85,13 @@ Capabilities are not loaded at startup. On the first incoming message, the regis
 ```javascript
 async function ensureCapabilities() {
   if (initialized) return;
-  await capabilities.init();          // Load tools, skills, reflexes, workflows
-  declarations = capabilities.getDeclarations(); // 225+ tool declarations
+  await capabilities.init();
+  declarations = capabilities.getDeclarations();
   initialized = true;
 }
 ```
 
 This avoids wasting startup time on capabilities that may never be used in a short-lived session, and ensures plugins are fully loaded before declarations are built.
-
-### Autonomy Gating
-
-Each tool can declare an autonomy tier (1–4). Before execution, the system checks whether the current autonomy level permits the action:
-
-```javascript
-async function executeTool(name, params) {
-  const tool = registry.get(name);
-  if (tool.tier > currentAutonomyLevel) {
-    return await requestApproval(name, params);
-  }
-  return await tool.execute(params);
-}
-```
-
-Tier 1 actions (read-only, status checks) always run. Tier 4 actions (destructive, external-facing) require explicit human approval.
 
 ### Tool Aliases
 
@@ -90,30 +108,36 @@ This prevents breaking existing skills and reflexes that reference old tool name
 
 - Adding a capability requires only a declaration file — no changes to the message loop
 - The LLM sees all available actions as a flat tool list, regardless of whether they're tools, skills, or reflexes under the hood
+- String-based tiers (`AUTO`/`NOTIFY`/`ASK`/`NEVER`) are more readable and less error-prone than numeric levels (1-4)
 - Lazy loading means first-message latency includes capability init
 - Autonomy gating adds a decision point to every tool execution
-- The declaration count (225+) approaches LLM context limits for tool-heavy dispatches
 - Aliases accumulate technical debt if old names are never fully migrated
 
 ## Code Example
 
 ```javascript
-// Capability execution with error triage
-async function execute(toolName, params) {
+// Capability execution with autonomy gating and error recovery
+async function execute(toolName, params, userId) {
   await ensureCapabilities();
   const tool = registry.resolve(toolName); // Handles aliases
 
+  // Autonomy check
+  if (tool.autonomyTier === 'ASK') {
+    const approved = await requestApproval(userId, toolName, params);
+    if (!approved) return { status: 'denied' };
+  }
+
   try {
-    return await tool.execute(params);
+    const result = await tool.execute(params);
+    if (tool.autonomyTier === 'NOTIFY') {
+      notify(userId, toolName, result).catch(() => {});
+    }
+    return result;
   } catch (err) {
-    const category = triageError(err); // protocol | transient | runtime
-    if (category === 'transient') {
+    if (isRetryable(err)) {
       return await retryWithBackoff(tool, params);
     }
-    if (category === 'runtime') {
-      return await attemptRecovery(tool, params, err);
-    }
-    throw err; // Protocol errors are unrecoverable
+    throw err;
   }
 }
 ```
@@ -121,5 +145,5 @@ async function execute(toolName, params) {
 ## Related Patterns
 
 - [Capability Manifest Registration](./capability-manifest-registration.md)
-- [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
+- [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)
 - [Channel Adapter Architecture](./channel-adapter-architecture.md)

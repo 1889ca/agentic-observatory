@@ -1,10 +1,10 @@
 # Error Triage and Recovery
 
-> Categorize failures into protocol, transient, and runtime classes with distinct recovery strategies for each.
+> Dual-layer error handling combining pattern-based retryability classification with three-category learning triage for distinct recovery strategies.
 
 ## Problem
 
-Not all errors are equal. A malformed API request (protocol error) can't be fixed by retrying. A network timeout (transient error) usually resolves on its own. A null reference in business logic (runtime error) needs investigation. Treating all errors the same — either retrying everything or failing on everything — wastes resources and frustrates users.
+Not all errors are equal. A malformed API request can't be fixed by retrying. A network timeout usually resolves on its own. An LLM misusing a tool is a learning opportunity. Treating all errors the same — either retrying everything or failing on everything — wastes resources and misses chances to improve.
 
 ## Context
 
@@ -12,36 +12,99 @@ Not all errors are equal. A malformed API request (protocol error) can't be fixe
 - Errors originate from multiple layers: network, external APIs, internal logic, LLM responses
 - Some operations are idempotent (safe to retry), others are not
 - User experience depends on quick recovery from recoverable failures
-- Audit trail needed for post-mortem analysis
+- Error patterns that recur should feed back into the system's learned behaviors
 
 ## Solution
 
-### Three Error Categories
+### Layer 1: Pattern-Based Retryability
 
-Every caught error is classified before any recovery attempt:
-
-**Protocol Errors** — The request itself is invalid. Wrong parameters, missing required fields, unsupported operations. These are bugs, not temporary conditions. Recovery: fail immediately, log for developer review.
-
-**Transient Errors** — The infrastructure is temporarily unavailable. Network timeouts, rate limits, service restarts, database connection pool exhaustion. Recovery: retry with exponential backoff.
-
-**Runtime Errors** — The logic hit an unexpected state. Null references, type mismatches, assertion failures in business logic. Recovery: attempt an alternative approach, then fail gracefully if the alternative also fails.
+The first layer uses pattern arrays for fast binary classification — is this error retryable or not?
 
 ```javascript
-function triageError(err) {
-  // Protocol: bad input, invalid schema, unknown tool
-  if (err.code === 'INVALID_PARAMS' || err.status === 400) return 'protocol';
-  if (err.code === 'UNKNOWN_TOOL') return 'protocol';
+// error-classifier.js
+const AUTO_RETRY_PATTERNS = [
+  /ECONNREFUSED/,
+  /ETIMEDOUT/,
+  /ECONNRESET/,
+  /socket hang up/,
+  /rate limit/i,
+  /503 Service/,
+  /429 Too Many/,
+  /RESOURCE_EXHAUSTED/,
+  /overloaded/i,
+];
 
-  // Transient: network, rate limit, temporary unavailability
-  if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT') return 'transient';
-  if (err.status === 429 || err.status === 503) return 'transient';
+const NON_RETRYABLE_PATTERNS = [
+  /INVALID_ARGUMENT/,
+  /PERMISSION_DENIED/,
+  /NOT_FOUND/,
+  /ALREADY_EXISTS/,
+  /FAILED_PRECONDITION/,
+  /UNAUTHENTICATED/,
+  /invalid.*schema/i,
+];
 
-  // Everything else is runtime
-  return 'runtime';
+function classify(error) {
+  const message = error.message || String(error);
+
+  for (const pattern of NON_RETRYABLE_PATTERNS) {
+    if (pattern.test(message)) {
+      return { isRetryable: false, errorType: 'non_retryable' };
+    }
+  }
+
+  for (const pattern of AUTO_RETRY_PATTERNS) {
+    if (pattern.test(message)) {
+      return { isRetryable: true, errorType: 'transient' };
+    }
+  }
+
+  // Unknown errors default to non-retryable (safe default)
+  return { isRetryable: false, errorType: 'unknown' };
 }
 ```
 
-### Recovery Strategies
+### Layer 2: Three-Category Learning Triage
+
+The second layer provides deeper classification for the learning system, distinguishing errors that represent improvement opportunities:
+
+```javascript
+// learning/error-triage.js
+const ERROR_CATEGORIES = {
+  PROTOCOL: 'protocol',    // LLM misused a tool — learning opportunity
+  RUNTIME: 'runtime',      // Code bug or unexpected state
+  TRANSIENT: 'transient',  // Network/temporary — retry
+  UNKNOWN: 'unknown',
+};
+
+function triage(error, toolName, args) {
+  // Protocol: LLM called a tool wrong (hallucinated params, wrong tool for task)
+  if (error.code === 'INVALID_PARAMS' || error.message?.includes('not a function')) {
+    return {
+      category: ERROR_CATEGORIES.PROTOCOL,
+      toolName,
+      subtype: detectProtocolSubtype(error, args),
+      learnable: true,  // Feed to anti-pattern system
+    };
+  }
+
+  // Transient: infrastructure issues
+  if (classify(error).isRetryable) {
+    return {
+      category: ERROR_CATEGORIES.TRANSIENT,
+      learnable: false,
+    };
+  }
+
+  // Runtime: everything else
+  return {
+    category: ERROR_CATEGORIES.RUNTIME,
+    learnable: false,
+  };
+}
+```
+
+### Recovery Strategies Per Category
 
 Each category triggers a different recovery path:
 
@@ -50,94 +113,81 @@ async function executeWithRecovery(tool, params) {
   try {
     return await tool.execute(params);
   } catch (err) {
-    const category = triageError(err);
+    const { isRetryable } = classify(err);
+    const triageResult = triage(err, tool.name, params);
 
-    switch (category) {
-      case 'protocol':
-        // Unrecoverable — log and surface to caller
-        log.error(`Protocol error in ${tool.name}:`, err);
-        throw err;
-
-      case 'transient':
-        // Retry with backoff: 1s, 2s, 4s
-        return await retryWithBackoff(tool, params, {
-          maxRetries: 3,
-          baseDelay: 1000
-        });
-
-      case 'runtime':
-        // Try recovery: alternative params, fallback tool, or graceful degradation
-        const recovery = getRecoveryStrategy(tool, err);
-        if (recovery) return await recovery.execute(params);
-        throw err;
+    if (isRetryable) {
+      // Transient: retry with exponential backoff
+      return await retryWithBackoff(tool, params, {
+        maxRetries: 3,
+        baseDelay: 1000,
+      });
     }
+
+    if (triageResult.category === 'protocol' && triageResult.learnable) {
+      // Protocol: feed to anti-pattern learning system
+      await antiPatterns.recordProtocolError(err, triageResult);
+      // Generate recovery hint for LLM self-correction
+      return { error: err.message, _retryHint: generateRecoveryHint(tool.name, params, err) };
+    }
+
+    // Runtime or unknown: fail with context
+    throw err;
   }
 }
 ```
 
-### Model Fallback
+### Model Fallback Chain
 
-A specific case of transient recovery: when the primary LLM (Claude) is unavailable, the system falls back to an alternative (Gemini):
+A specific recovery strategy for LLM provider failures:
 
 ```javascript
 async function dispatchToModel(context) {
   try {
     return await claude.generate(context);
   } catch (err) {
-    if (triageError(err) === 'transient') {
-      log.warn('Claude unavailable, falling back to Gemini');
-      return await gemini.generate(context);
+    if (classify(err).isRetryable) {
+      try {
+        return await gemini.generate(context);
+      } catch (geminiErr) {
+        return await openai.generate(context); // Final fallback
+      }
     }
     throw err;
   }
 }
 ```
 
-### Worker Dispatch Fallback
-
-Similarly, when no local workers are available for a satellite job, the system falls back to GitHub-hosted Claude Code actions:
-
-```javascript
-async function dispatchTask(task) {
-  const worker = findAvailableWorker(task.requiredCapabilities);
-  if (worker) return await assignToWorker(worker, task);
-
-  // No local workers — fall back to GitHub CC action
-  log.info(`No workers for task ${task.id}, dispatching to GitHub`);
-  return await dispatchToGitHubAction(task);
-}
-```
-
 ### Fire-and-Forget Stats
 
-Error statistics are recorded asynchronously so that error handling never adds latency to the response path:
+Error statistics are recorded asynchronously so that error handling never adds latency:
 
 ```javascript
 // Non-blocking — errors in recording don't affect the operation
-recordErrorStats(tool.name, category, err).catch(() => {});
+recordErrorStats(tool.name, triageResult).catch(() => {});
 ```
 
 ## Implications
 
-- Triage classification adds a decision point to every error path — must be fast
-- Retry on transient errors can mask persistent failures if the retry count is too high
-- Runtime recovery strategies must be registered per-tool — adds maintenance burden
-- Model fallback changes response quality (Gemini vs. Claude) — users may notice
-- Fire-and-forget stats can lose data under high error rates
-- Classification heuristics can miscategorize — a 503 from an overloaded service looks transient but may be permanent
+- The two-layer system separates concerns: Layer 1 is fast and operational (should I retry?), Layer 2 is analytical (can I learn from this?)
+- Pattern arrays are fast to evaluate but can miscategorize novel errors — the unknown-defaults-to-non-retryable policy is deliberately conservative
+- Protocol errors feeding into anti-pattern learning creates a self-improving error loop: recurring tool misuse gets automatically corrected
+- Recovery hints give the LLM a chance to self-correct within the same conversation, reducing the need for user intervention
+- The model fallback chain changes response quality (Claude → Gemini → OpenAI) — users may notice quality differences
+- Fire-and-forget stats can lose data under high error rates, but this is acceptable since the learning system operates on aggregates
 
 ## Code Example
 
 ```javascript
 // Retry with exponential backoff
-async function retryWithBackoff(tool, params, { maxRetries = 3, baseDelay = 1000 }) {
+async function retryWithBackoff(tool, params, { maxRetries = 3, baseDelay = 1000 } = {}) {
   let lastError;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       return await tool.execute(params);
     } catch (err) {
       lastError = err;
-      if (triageError(err) !== 'transient') throw err; // Don't retry non-transient
+      if (!classify(err).isRetryable) throw err;
       const delay = baseDelay * Math.pow(2, attempt);
       await sleep(delay);
     }
@@ -148,6 +198,6 @@ async function retryWithBackoff(tool, params, { maxRetries = 3, baseDelay = 1000
 
 ## Related Patterns
 
+- [Anti-Pattern Learning Loop](./anti-pattern-learning-loop.md)
 - [Declarative Capability System](./declarative-capability-system.md)
 - [Outbound Queue with Backoff](./outbound-queue-with-backoff.md)
-- [Channel Adapter Architecture](./channel-adapter-architecture.md)

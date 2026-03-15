@@ -1,243 +1,219 @@
 # Autonomous Agent Cycle
 
-> Priority-driven action cycle with working hours, autonomy tiers, and batch approval for self-directed agent behavior.
+> Event-driven cognitive tick system with adaptive backpressure, priority-based event processing, and DB-backed outbound queue for autonomous agent behavior.
 
 ## Problem
 
-An AI orchestrator that only responds to user messages is reactive — it waits idle between interactions. But a capable system should proactively maintain projects, triage incoming work, and execute scheduled improvements without being asked. The challenge is doing this safely: autonomous actions need priority ordering, working-hours awareness, undo capability, and human oversight gates that scale from "approve everything" to "fully autonomous."
+An AI orchestrator that only responds to user messages is reactive — it waits idle between interactions. But a capable system should proactively process events, triage incoming work, and maintain situational awareness. A continuous scan-strategy-execute loop wastes compute when idle and can't adapt to load. What's needed is an event-driven system with backpressure that processes autonomously while staying responsive.
 
 ## Context
 
-- An orchestrator with access to project state, task queues, and external services
-- Need for proactive behavior (maintenance, monitoring, follow-ups) beyond reactive chat
-- Human oversight requirements that vary by action risk level
-- Time-of-day awareness to avoid disruptive actions during off-hours
-- Multiple concurrent projects with competing priorities
+- An orchestrator with access to project state, event queues, and external services
+- Events arrive at variable rates — bursty during work hours, quiet overnight
+- Processing must respect per-tenant fairness and avoid starvation
+- Autonomous processing must not interfere with interactive user requests
+- Need for notification-mode awareness (silent mode should only process critical items)
 
 ## Solution
 
-### The Agent Cycle
+### Event-Driven Tick System
 
-The autonomous cycle runs continuously during working hours, evaluating and executing actions:
-
-```
-┌──────────────────────────────────────────┐
-│              AGENT CYCLE                  │
-│                                          │
-│  Priority Scan → Strategy → Action →     │
-│  Execution → Observe → (loop)            │
-│                                          │
-│  ┌─ Working hours gate                   │
-│  ├─ Autonomy tier check                  │
-│  └─ Approval queue for gated actions     │
-└──────────────────────────────────────────┘
-```
-
-### Priority Scan
-
-Each cycle begins by scanning all registered projects and queues for actionable items:
+Instead of continuously scanning for work, the cognitive processor runs on a configurable tick interval (default 5 seconds). Each tick processes a batch of pending events from a database-backed queue:
 
 ```javascript
-async function scanPriorities() {
-  const items = [];
+// cognitive/processor.js
+let isProcessing = false;
 
-  // Check all registered project queues
-  for (const project of projects.getAll()) {
-    const tasks = await project.getPendingTasks();
-    items.push(...tasks.map(t => ({ ...t, source: project.name })));
+async function tick(options = {}) {
+  if (isProcessing) {
+    // Backpressure: skip this tick if previous is still running
+    return;
   }
 
-  // Add system-level items
-  items.push(...await getSystemMaintenanceTasks());
-  items.push(...await getStaleFlowRecoveries());
+  isProcessing = true;
+  const tickStart = Date.now();
 
-  // Score and sort
-  return items
-    .map(item => ({ ...item, priority: scorePriority(item) }))
-    .sort((a, b) => b.priority - a.priority);
-}
-```
+  try {
+    const mode = await contextBehaviors.getNotificationMode();
 
-### Strategy Selection
-
-For the highest-priority item, the system selects an execution strategy:
-
-```javascript
-async function selectStrategy(item) {
-  // Check if a reflex or known skill handles this
-  const fastPath = await matchSkill(item);
-  if (fastPath) return { type: 'skill', skill: fastPath };
-
-  // Otherwise, plan with the LLM
-  const plan = await deliberate(item, {
-    context: await assembleContext(item, 'autonomous'),
-    constraint: 'Produce a concrete action plan with at most 3 steps'
-  });
-
-  return { type: 'plan', steps: plan.steps };
-}
-```
-
-### Working Hours Gate
-
-Autonomous actions respect configurable working hours:
-
-```javascript
-function isWithinWorkingHours() {
-  const now = new Date();
-  const hour = now.getHours();
-  const day = now.getDay();
-
-  // Weekend: only critical actions
-  if (day === 0 || day === 6) return 'critical-only';
-
-  // Weekday working hours
-  if (hour >= 9 && hour < 18) return 'full';
-
-  // Off-hours: monitoring and non-disruptive only
-  return 'monitoring-only';
-}
-```
-
-### Autonomy Tiers and Approval Queue
-
-Actions are classified into autonomy tiers that determine whether they execute immediately or queue for approval:
-
-```javascript
-const AUTONOMY_TIERS = {
-  1: { label: 'observe',  auto: true  },  // Read-only: status checks, monitoring
-  2: { label: 'suggest',  auto: true  },  // Internal: memory writes, notes
-  3: { label: 'act',      auto: false },  // External: commits, messages, deploys
-  4: { label: 'critical', auto: false },  // Destructive: deletes, force operations
-};
-
-async function executeAction(action) {
-  const tier = AUTONOMY_TIERS[action.tier];
-
-  if (!tier.auto) {
-    // Queue for human approval
-    await approvalQueue.add({
-      action,
-      reason: action.rationale,
-      groupKey: action.batchGroup  // Group related approvals
-    });
-    return { status: 'queued', queueId: action.id };
-  }
-
-  return await action.execute();
-}
-```
-
-### Batch Approval
-
-Related actions are grouped so the user can approve them in bulk:
-
-```javascript
-async function processApprovalQueue() {
-  const groups = approvalQueue.getGrouped();
-
-  for (const [groupKey, actions] of groups) {
-    // Present as a batch: "3 code-review actions pending for project X"
-    await notify({
-      type: 'approval-batch',
-      group: groupKey,
-      count: actions.length,
-      summary: summarizeActions(actions),
-      actions: ['approve-all', 'review-each', 'deny-all']
-    });
+    if (mode === 'silent') {
+      // Silent mode: only process high-priority events (priority >= 8)
+      await processEvents({ ...options, minPriority: 8 });
+    } else {
+      await processEvents(options);
+    }
+  } finally {
+    isProcessing = false;
+    const tickDuration = Date.now() - tickStart;
+    if (tickDuration > 1000) {
+      logger.debug({ tickDurationMs: tickDuration }, 'Tick slow');
+    }
   }
 }
 ```
 
-### Action Buffer and Undo
+### Adaptive Backpressure
 
-Recent autonomous actions are buffered to support undo:
+When ticks consistently exceed their time budget, the system reduces batch size to maintain throughput:
 
 ```javascript
-const actionBuffer = new RingBuffer(50);  // Last 50 actions
+let batchSize = 20;
+let consecutiveSlowTicks = 0;
 
-async function executeWithUndo(action) {
-  const result = await action.execute();
-
-  actionBuffer.push({
-    action,
-    result,
-    timestamp: Date.now(),
-    undo: action.buildUndo?.(result)  // Optional undo function
-  });
-
-  return result;
-}
-
-async function undoLast() {
-  const last = actionBuffer.peek();
-  if (last?.undo) {
-    await last.undo();
-    actionBuffer.pop();
+function adjustBackpressure(tickDuration) {
+  if (tickDuration > 1000) {
+    consecutiveSlowTicks++;
+    if (consecutiveSlowTicks >= 3) {
+      // Reduce batch size by half, minimum 5
+      batchSize = Math.max(5, Math.floor(batchSize * 0.5));
+      consecutiveSlowTicks = 0;
+    }
+  } else {
+    consecutiveSlowTicks = 0;
+    // Gradually recover batch size
+    batchSize = Math.min(20, batchSize + 1);
   }
 }
 ```
 
-### Autonomy Promotion and Demotion
+### DB-Backed Event Queue with Atomic Claiming
 
-The system's autonomy level adjusts based on trust signals:
+Events are stored in a database table. Processing uses `FOR UPDATE SKIP LOCKED` to prevent duplicate processing across instances:
 
 ```javascript
-function adjustAutonomy(feedback) {
-  if (feedback.type === 'user-approved' && feedback.consecutive >= 10) {
-    // Promote: user has approved 10 consecutive tier-3 actions
-    promoteToAuto(feedback.actionType);
-  }
+async function processEvents(options = {}) {
+  const { minPriority = 0 } = options;
 
-  if (feedback.type === 'user-denied' || feedback.type === 'undo-requested') {
-    // Demote: require approval for this action type again
-    demoteToQueued(feedback.actionType);
+  // Atomic claim: lock rows to prevent duplicate processing
+  const events = await db.query(`
+    SELECT * FROM cognitive_events
+    WHERE status = 'pending'
+      AND priority >= $1
+    ORDER BY priority DESC
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+  `, [minPriority, batchSize]);
+
+  for (const event of events) {
+    await processEvent(event);
+    await db.query(
+      `UPDATE cognitive_events SET status = 'processed' WHERE id = $1`,
+      [event.id]
+    );
   }
+}
+```
+
+### Per-Tenant Fairness
+
+A per-tenant limit prevents one noisy tenant from starving others in multi-tenant deployments:
+
+```javascript
+const perTenantLimit = Math.max(3, Math.floor(batchSize / tenantCount));
+
+// Group events by tenant, cap each tenant's batch
+const byTenant = groupBy(events, 'tenant_id');
+const fairBatch = Object.values(byTenant)
+  .flatMap(tenantEvents => tenantEvents.slice(0, perTenantLimit));
+```
+
+### DB-Backed Outbound Queue
+
+Autonomous actions that produce messages (notifications, alerts, follow-ups) go through a persistent outbound queue rather than sending directly:
+
+```javascript
+// outbound-queue.js
+async function enqueue(channel, content, options = {}) {
+  await db.query(`
+    INSERT INTO outbound_queue (channel, content, status, priority, deliver_at)
+    VALUES ($1, $2, 'pending', $3, $4)
+  `, [channel, content, options.priority || 5, options.deliverAt || new Date()]);
+}
+
+async function process() {
+  const pending = await db.query(`
+    SELECT * FROM outbound_queue
+    WHERE status = 'pending' AND deliver_at <= NOW()
+    FOR UPDATE SKIP LOCKED
+    LIMIT 10
+  `);
+
+  for (const item of pending) {
+    if (!isChannelConnected(item.channel)) {
+      // Channel offline — restore to pending, don't lose the message
+      continue;
+    }
+    await sendViaChannel(item.channel, item.content);
+    await markSent(item.id);
+  }
+}
+```
+
+### Startup Sequence
+
+The cognitive system starts in a specific order — producers seed initial events, then the processor begins ticking:
+
+```javascript
+// Contract: startAll() seeds rules, starts processor, then producers
+async function startAll({ tickInterval = 5000, timezone }) {
+  await seedRules();                    // Load cognitive rules
+  startProcessor(tickInterval);         // Begin tick loop
+  await startProducers();               // Begin event generation
+}
+
+// Shutdown reverses the order
+async function stopAll() {
+  stopProcessor();                      // Stop consuming first
+  await stopProducers();                // Then stop producing
 }
 ```
 
 ## Implications
 
-- The cycle introduces continuous compute cost even when idle — rate limiting is essential
-- Working hours are timezone-dependent and need configuration per user/team
-- Batch approval UX is critical — too many approval requests train users to auto-approve, defeating the purpose
-- The undo buffer has limited depth — destructive actions beyond buffer size are unrecoverable
-- Autonomy promotion is a ratchet that can grant too much trust if error detection is weak
-- Priority scoring determines what the agent focuses on — poor scoring means important work gets delayed
-- Concurrent autonomous actions across projects need coordination to avoid resource contention
+- The tick-based model has bounded latency (worst case = tick interval) unlike continuous loops that can spin
+- `FOR UPDATE SKIP LOCKED` enables horizontal scaling — multiple processor instances can safely share the queue
+- Backpressure prevents cascading slowdowns — the system gracefully degrades under load instead of falling behind
+- Silent mode filtering means the user can mute non-critical autonomous behavior without stopping the system
+- Per-tenant fairness adds slight overhead but prevents pathological starvation in multi-tenant scenarios
+- The outbound queue decouples message generation from delivery, surviving channel disconnections
 
 ## Code Example
 
 ```javascript
-// Main autonomous agent loop
-async function agentLoop() {
-  while (running) {
-    const mode = isWithinWorkingHours();
-    if (mode === 'none') {
-      await sleep(60_000);
-      continue;
-    }
+// Complete cognitive system lifecycle
+const cognitive = {
+  async startAll({ tickInterval = 5000 }) {
+    // 1. Seed cognitive rules from config
+    await seedRules();
 
-    const priorities = await scanPriorities();
-    const filtered = priorities.filter(p =>
-      mode === 'full' || (mode === 'critical-only' && p.priority > 90)
-        || (mode === 'monitoring-only' && p.tier <= 1)
+    // 2. Start the processor tick loop
+    this.timer = setInterval(() => tick(), tickInterval);
+
+    // 3. Start producers (event generators)
+    await Promise.allSettled(
+      producers.map(p => p.start())
     );
+  },
 
-    for (const item of filtered.slice(0, 5)) {  // Max 5 actions per cycle
-      const strategy = await selectStrategy(item);
-      const action = buildAction(strategy, item);
-      await executeAction(action);
-    }
+  async stopAll() {
+    clearInterval(this.timer);
+    await Promise.allSettled(
+      producers.map(p => p.stop())
+    );
+  },
+};
 
-    await sleep(30_000);  // 30s between cycles
-  }
+// Usage in main application startup
+if (RUN_COGNITIVE) {
+  await cognitive.startAll({
+    tickInterval: parseInt(process.env.COGNITIVE_TICK_INTERVAL || '5000'),
+  });
 }
 ```
 
 ## Related Patterns
 
+- [Cognitive Processing Loop](./cognitive-processing-loop.md)
+- [Outbound Queue with Backoff](./outbound-queue-with-backoff.md)
 - [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
-- [Declarative Capability System](./declarative-capability-system.md)
-- [Error Triage and Recovery](./error-triage-and-recovery.md)
-- [Skill Extraction and Fast-Path Routing](./skill-extraction-and-fast-path-routing.md)
+- [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)

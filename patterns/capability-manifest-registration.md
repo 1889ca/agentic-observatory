@@ -1,160 +1,185 @@
 # Capability Manifest Registration
 
-> Declarative capability registration so an orchestrator can discover and dispatch tools, skills, and workflows without hardcoding.
+> Dual registration system combining a generic Map-based tool registry with entity/widget type resolution using canonical names, aliases, and type-specific metadata.
 
 ## Problem
 
-An orchestrator managing multiple tools and workflows needs to know what's available — which actions it can take, what parameters they require, and how to invoke them. Hardcoding capabilities in the orchestrator creates tight coupling: adding a new capability means editing core orchestrator code. As the system grows, the mapping between "what the user wants" and "what the system can do" becomes a sprawling switch statement that's impossible to maintain.
+An orchestrator managing multiple tools, entity types, and widgets needs to know what's available — which actions it can take, what entity types exist, and how to resolve user references to canonical names. A single flat registry doesn't capture the semantic differences between tools (stateless operations), entity types (data models with CRUD), and widgets (UI components). But maintaining entirely separate systems creates fragmentation.
 
 ## Context
 
-- An orchestrator that dispatches work across multiple tools, skills, or workflows
-- Capabilities evolve over time — new ones are added, old ones are deprecated
-- Each capability has different parameter requirements, invocation methods, and output formats
-- Need for the orchestrator to reason about available capabilities at runtime (e.g., for AI-driven tool selection)
-- Implementation can be internal (programmatic registration at startup) or external (config files discovered from project directories) — the pattern applies to both
+- An orchestrator with both programmatic tools and data-model-aware entity operations
+- Entity types have aliases (user says "todo", system calls it "task")
+- Widgets render entity-specific UI components
+- Need for both generic capability lookup and type-aware resolution
+- Implementation uses internal registration at startup, not external config files
 
 ## Solution
 
-### Capability Registry
+### Generic Tool Registry
 
-A central registry where capabilities are declared with structured metadata. Each capability entry describes what it does, what inputs it accepts (via JSON Schema), and how to invoke it:
+Tools are registered in a simple `Map` with name-based lookup:
 
 ```javascript
-const registry = new Map();
+// capabilities/registry/queries.js
+const capabilities = new Map();
 
-function registerCapability(capability) {
-  const { name, tier, description, schema, handler } = capability;
-  registry.set(name, { name, tier, description, schema, handler });
+function register(name, capability) {
+  capabilities.set(name, capability);
 }
 
-// Registration at startup
-registerCapability({
-  name: 'search-docs',
-  tier: 'tool',          // direct invocation
-  description: 'Search documentation across all knowledge bases',
-  schema: {
-    type: 'object',
-    properties: {
-      query: { type: 'string', description: 'Search query' },
-      scope: { type: 'string', enum: ['all', 'project', 'global'] }
-    },
-    required: ['query']
-  },
-  handler: async (params) => searchDocs(params.query, params.scope)
-});
-```
+function get(name) {
+  return capabilities.get(name) || null;
+}
 
-### Tiered Capability Model
-
-Capabilities are organized into tiers based on their complexity and invocation pattern:
-
-- **Tools**: Direct, stateless operations (search, lookup, calculate). Invoked synchronously, return a result.
-- **Skills**: Multi-step operations with internal logic (code review, deployment). May invoke multiple tools.
-- **Reflexes**: Automatic triggers fired by events (new commit, error detected). No explicit invocation.
-- **Workflows**: Orchestrated multi-step pipelines with human checkpoints, branching, and state persistence.
-
-```javascript
-function getCapabilitiesByTier(tier) {
-  return [...registry.values()].filter(cap => cap.tier === tier);
+function getAll() {
+  return [...capabilities.values()];
 }
 
 // AI model can reason about available tools
-function getToolDescriptions() {
-  return getCapabilitiesByTier('tool').map(t => ({
-    name: t.name,
-    description: t.description,
-    parameters: t.schema
+function getDeclarations() {
+  return getAll().map(cap => ({
+    name: cap.name,
+    description: cap.description,
+    parameters: cap.schema,
   }));
 }
 ```
 
-### Discovery and Dispatch
+### Entity Type Resolution
 
-The orchestrator queries the registry to find matching capabilities and dispatches to the appropriate handler:
+Entity types use a separate system with canonical names, aliases, and type-specific metadata. The `resolveEntityType()` function handles user-facing name variations:
 
 ```javascript
-async function dispatch(capabilityName, params) {
-  const cap = registry.get(capabilityName);
-  if (!cap) throw new Error(`Unknown capability: ${capabilityName}`);
+// capability-manifest.js
+const ENTITY_TYPES = {
+  task: {
+    aliases: ['todo', 'item', 'ticket'],
+    fields: ['title', 'status', 'priority', 'assignee'],
+    defaultSort: 'priority',
+  },
+  note: {
+    aliases: ['memo', 'doc', 'document'],
+    fields: ['title', 'content', 'tags'],
+    defaultSort: 'updated_at',
+  },
+  event: {
+    aliases: ['meeting', 'appointment', 'calendar_event'],
+    fields: ['title', 'start', 'end', 'attendees'],
+    defaultSort: 'start',
+  },
+};
 
-  // Validate params against JSON Schema
-  const valid = validate(params, cap.schema);
-  if (!valid) throw new Error(`Invalid params: ${validate.errors}`);
+function getEntityType(type) {
+  return ENTITY_TYPES[type] || null;
+}
 
-  return await cap.handler(params);
+function resolveEntityType(type) {
+  // Direct match
+  if (ENTITY_TYPES[type]) return type;
+
+  // Alias resolution
+  for (const [canonical, meta] of Object.entries(ENTITY_TYPES)) {
+    if (meta.aliases.includes(type)) return canonical;
+  }
+
+  // Unknown type — return as-is for dynamic entity support
+  return type;
 }
 ```
 
-### External Registration (Alternative)
+### Widget Type Maps
 
-For systems where capabilities are declared in external config files rather than programmatically:
+Widgets map entity types to UI components. This allows the system to render entity-specific cards, forms, and views:
 
-```yaml
-# capabilities.yaml — declarative capability manifest
-capabilities:
-  - name: deploy
-    tier: workflow
-    description: Build and deploy the project
-    schema:
-      type: object
-      properties:
-        environment: { type: string, enum: [staging, production] }
-      required: [environment]
-    steps:
-      - build: Run build and verify output
-      - deploy: Push to target environment
+```javascript
+const WIDGET_TYPES = {
+  task: {
+    card: 'TaskCard',
+    form: 'TaskForm',
+    list: 'TaskList',
+    inline: true,  // Can render inline in chat
+  },
+  note: {
+    card: 'NoteCard',
+    form: 'NoteEditor',
+    list: 'NoteList',
+    inline: true,
+  },
+};
+
+function getWidgetForEntity(entityType) {
+  const resolved = resolveEntityType(entityType);
+  return WIDGET_TYPES[resolved] || null;
+}
 ```
 
-The orchestrator discovers these at startup by scanning known directories or receiving registration calls from plugins.
+### Combined Resolution Flow
+
+When the LLM invokes an entity operation, the system resolves through both registries:
+
+```javascript
+async function handleEntityOperation(action, typeName, data) {
+  // 1. Resolve the entity type (handles aliases)
+  const resolvedType = resolveEntityType(typeName);
+  const typeMeta = getEntityType(resolvedType);
+
+  // 2. Get the generic 'entity' tool from the registry
+  const entityTool = get('entity');
+
+  // 3. Execute with resolved type
+  const result = await entityTool.execute({
+    action,
+    entityType: resolvedType,
+    data,
+  });
+
+  // 4. Determine widget for response rendering
+  const widget = getWidgetForEntity(resolvedType);
+  if (widget?.inline) {
+    return { result, render: widget.card };
+  }
+
+  return { result };
+}
+```
 
 ## Implications
 
-- JSON Schema declarations add upfront authoring cost but enable validation, documentation generation, and AI-driven tool selection
-- Programmatic (internal) registration is simpler to debug — all capabilities are visible in one codebase
-- External (file-based) registration decouples capability authoring from orchestrator code but introduces config parsing, schema drift, and discovery timing issues
-- The tiered model helps the orchestrator reason about complexity — a "tool" call is cheap, a "workflow" may take hours
-- Hot-reloading capabilities at runtime adds complexity (stale references, in-flight dispatches to removed capabilities)
-- No schema validation on registration means malformed capability definitions fail at dispatch time, not load time
+- The dual system (Map registry + entity type maps) means two places to look when debugging capability issues
+- Alias resolution is linear scan — fine for dozens of entity types, would need indexing for hundreds
+- Unknown entity types pass through (`return type`) rather than throwing, enabling dynamic entity support without pre-registration
+- Widget maps create coupling between entity types and UI components — adding an entity type requires a corresponding widget entry for full functionality
+- No schema validation on registration — malformed definitions fail at execution time, not load time
+- Entity type metadata (fields, defaultSort) enables the LLM to make informed decisions about queries without additional tool calls
 
 ## Code Example
 
 ```javascript
-// Full lifecycle: register, discover, dispatch
-class CapabilityRegistry {
-  constructor() {
-    this.capabilities = new Map();
-  }
+// Registration at startup
+register('entity', {
+  name: 'entity',
+  description: 'Create, read, update, or delete entities',
+  schema: {
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: ['create', 'read', 'update', 'delete', 'list'] },
+      entityType: { type: 'string' },
+      data: { type: 'object' },
+    },
+    required: ['action', 'entityType'],
+  },
+  handler: handleEntityOperation,
+});
 
-  register(cap) {
-    this.capabilities.set(cap.name, cap);
-  }
-
-  find(query) {
-    // Simple keyword match — could be upgraded to semantic search
-    return [...this.capabilities.values()].filter(cap =>
-      cap.description.toLowerCase().includes(query.toLowerCase())
-    );
-  }
-
-  async dispatch(name, params) {
-    const cap = this.capabilities.get(name);
-    if (!cap) throw new Error(`Unknown: ${name}`);
-    return await cap.handler(params);
-  }
-
-  // Expose to AI model for tool-use decisions
-  toToolDefinitions() {
-    return [...this.capabilities.values()]
-      .filter(c => c.tier === 'tool')
-      .map(c => ({ name: c.name, description: c.description, input_schema: c.schema }));
-  }
-}
+// LLM calls: entity({ action: 'create', entityType: 'todo', data: { title: 'Fix bug' } })
+// → resolveEntityType('todo') → 'task'
+// → handleEntityOperation('create', 'task', { title: 'Fix bug' })
+// → returns { result: { id: '...', type: 'task' }, render: 'TaskCard' }
 ```
 
 ## Related Patterns
 
 - [Declarative Capability System](./declarative-capability-system.md)
-- [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
+- [Connector Registry and Capability Discovery](./connector-registry-and-capability-discovery.md)
 - [Unified Search Across KBs](./unified-search-across-kbs.md)
-- [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)

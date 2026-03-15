@@ -1,277 +1,186 @@
 # Anticipation Engine
 
-> Predict likely upcoming needs from temporal and sequential patterns, enabling proactive agent behavior instead of purely reactive responses.
+> Reactive vibe subsystem that tracks action outcomes, auto-resolves follow-ups from observed events, and adjusts domain confidence — replacing speculative prediction with evidence-based reactivity.
 
 ## Problem
 
-Reactive agents sit idle until a user makes a request, then scramble to gather context and produce a response. This misses opportunities to prepare in advance — pre-fetching relevant context before a meeting, drafting a summary before it's asked for, or surfacing a reminder before a deadline passes. The agent has access to historical patterns and calendar data that could predict what's coming next, but without a prediction system, this information goes unused.
+A purely reactive agent forgets what it did the moment a conversation ends. It can't verify whether an action it took actually succeeded — did that PR get merged? Did the email get a reply? Did the scheduled task complete? Without outcome tracking, the agent has no feedback loop: it can't learn which actions succeed, adjust its confidence, or proactively surface stalled work.
 
 ## Context
 
-- An agent with access to temporal data: calendars, schedules, historical usage patterns
-- Recurring user behaviors that follow predictable sequences (e.g., standup notes every morning, weekly report every Friday)
-- External signals like calendar events that imply upcoming needs (meeting in 30 minutes means meeting notes are needed soon)
-- The agent can take low-cost preparatory actions (pre-fetching, drafting, caching) without user intervention
-- A threshold system is needed to avoid annoying or incorrect proactive behavior
+- An agent that takes actions with delayed outcomes (PRs, emails, deployments, scheduled tasks)
+- Outcomes arrive asynchronously through external events (GitHub webhooks, task completions)
+- Need to close the loop between "action taken" and "outcome observed"
+- Confidence in specific domains should adjust based on actual success/failure rates
+- The system should be reactive (respond to observed events) rather than speculative (predict based on temporal patterns)
 
 ## Solution
 
-### Pattern Tracking
+### Follow-Up Scheduling
 
-Track two types of patterns: sequential (what follows what) and temporal (what happens when). Each observation reinforces the pattern's strength.
+When the agent takes a significant action, it schedules a follow-up check — a record of what was done, what outcome is expected, and when to verify:
 
 ```javascript
-// Sequential patterns: action A is frequently followed by action B
-const sequentialPatterns = {
-  store: new Map(), // key: actionA -> value: { actionB: count, actionC: count }
+// vibe/follow-ups.js
+async function schedule({ action, expectedOutcome, checkAfter, context }) {
+  await db.query(`
+    INSERT INTO follow_ups (action, expected_outcome, check_after, context, status)
+    VALUES ($1, $2, $3, $4, 'pending')
+  `, [action, expectedOutcome, checkAfter, JSON.stringify(context)]);
+}
 
-  observe(previousAction, currentAction) {
-    if (!previousAction) return;
-    const followers = this.store.get(previousAction) || {};
-    followers[currentAction] = (followers[currentAction] || 0) + 1;
-    this.store.set(previousAction, followers);
-  },
+// Retrieve follow-ups that are past their check time
+async function getDue() {
+  return db.query(`
+    SELECT * FROM follow_ups
+    WHERE status = 'pending' AND check_after <= NOW()
+    ORDER BY check_after ASC
+  `);
+}
+```
 
-  predict(currentAction) {
-    const followers = this.store.get(currentAction);
-    if (!followers) return [];
+Follow-up delays are configured per action type:
 
-    const total = Object.values(followers).reduce((a, b) => a + b, 0);
-    return Object.entries(followers)
-      .map(([action, count]) => ({ action, confidence: count / total }))
-      .sort((a, b) => b.confidence - a.confidence);
-  }
-};
-
-// Temporal patterns: actions that recur at specific times/days
-const temporalPatterns = {
-  store: new Map(), // key: action -> value: [{ dayOfWeek, hour, count }]
-
-  observe(action, timestamp) {
-    const key = action;
-    const slots = this.store.get(key) || [];
-    const day = timestamp.getDay();
-    const hour = timestamp.getHours();
-
-    const existing = slots.find(s => s.dayOfWeek === day && s.hour === hour);
-    if (existing) {
-      existing.count++;
-    } else {
-      slots.push({ dayOfWeek: day, hour, count: 1 });
-    }
-    this.store.set(key, slots);
-  },
-
-  predictForTime(timestamp) {
-    const day = timestamp.getDay();
-    const hour = timestamp.getHours();
-    const predictions = [];
-
-    for (const [action, slots] of this.store) {
-      const match = slots.find(s => s.dayOfWeek === day && s.hour === hour);
-      if (match && match.count >= 3) { // minimum observation threshold
-        predictions.push({
-          action,
-          confidence: Math.min(match.count / 10, 0.95), // cap at 95%
-          basis: `observed ${match.count} times on ${dayName(day)} at ${hour}:00`
-        });
-      }
-    }
-
-    return predictions.sort((a, b) => b.confidence - a.confidence);
-  }
+```javascript
+const FOLLOW_UP_DELAYS = {
+  entity: 60 * 60 * 1000,        // 1 hour
+  send_email: 24 * 60 * 60 * 1000, // 24 hours
+  create_event: 2 * 60 * 60 * 1000, // 2 hours
+  create_pr: 4 * 60 * 60 * 1000,   // 4 hours
 };
 ```
 
-### Calendar Integration
+### Outcome Reactor
 
-Calendar events provide high-confidence signals about upcoming needs. A meeting in 30 minutes strongly predicts the need for meeting-related context.
-
-```javascript
-async function getCalendarSignals(lookaheadMinutes = 60) {
-  const upcoming = await calendar.getEvents({
-    start: new Date(),
-    end: new Date(Date.now() + lookaheadMinutes * 60 * 1000)
-  });
-
-  return upcoming.map(event => ({
-    type: 'calendar',
-    event: event.summary,
-    startsIn: Math.round((event.start - Date.now()) / 60000),
-    participants: event.attendees || [],
-    anticipatedNeeds: inferNeeds(event)
-  }));
-}
-
-function inferNeeds(event) {
-  const needs = [];
-  const title = event.summary.toLowerCase();
-
-  if (title.includes('standup') || title.includes('sync')) {
-    needs.push({ action: 'prepare-status-summary', confidence: 0.85 });
-  }
-  if (title.includes('review') || title.includes('retro')) {
-    needs.push({ action: 'gather-recent-activity', confidence: 0.80 });
-  }
-  if (event.attendees?.length > 0) {
-    needs.push({ action: 'fetch-participant-context', confidence: 0.70 });
-  }
-
-  return needs;
-}
-```
-
-### Prediction Scoring and Threshold
-
-All prediction sources feed into a unified scorer. Only predictions above a confidence threshold trigger proactive actions. The threshold is tunable — higher means fewer false positives but more missed opportunities.
+Instead of polling for outcomes, the system subscribes to events and auto-resolves matching follow-ups when outcomes are observed:
 
 ```javascript
-const CONFIDENCE_THRESHOLD = 0.6;
+// vibe/outcome-reactor.js
+function init() {
+  events.on('github.pr_merged', onPrMerged);
+  events.on('github.pr_closed', onPrClosed);
+  events.on('task.completed', onTaskCompleted);
+  events.on('worker_task.completed', onWorkerTaskCompleted);
+}
 
-async function evaluatePredictions() {
-  const now = new Date();
-  const predictions = [];
-
-  // Temporal patterns — what usually happens at this time?
-  predictions.push(...temporalPatterns.predictForTime(now));
-
-  // Sequential patterns — what usually follows the last action?
-  const lastAction = await getLastUserAction();
-  if (lastAction) {
-    predictions.push(...sequentialPatterns.predict(lastAction.type));
+async function onPrMerged(event) {
+  // Find follow-ups related to this PR
+  const related = await findRelatedFollowUps('create_pr', event.pr);
+  for (const followUp of related) {
+    await resolve(followUp.id, {
+      outcome: 'success',
+      event: 'pr_merged',
+      details: event,
+    });
+    // Positive signal → increase domain confidence
+    confidence.record(followUp.context.tenantId, 'code_review', true);
   }
+}
 
-  // Calendar signals — what's coming up?
-  const calendarSignals = await getCalendarSignals(60);
-  for (const signal of calendarSignals) {
-    for (const need of signal.anticipatedNeeds) {
-      predictions.push({
-        action: need.action,
-        confidence: need.confidence,
-        basis: `${signal.event} starts in ${signal.startsIn} minutes`,
-        context: signal
-      });
-    }
+async function onPrClosed(event) {
+  const related = await findRelatedFollowUps('create_pr', event.pr);
+  for (const followUp of related) {
+    await resolve(followUp.id, {
+      outcome: 'closed_without_merge',
+      event: 'pr_closed',
+    });
+    // Negative signal → decrease domain confidence
+    confidence.record(followUp.context.tenantId, 'code_review', false);
   }
-
-  // Filter to actionable predictions
-  return predictions
-    .filter(p => p.confidence >= CONFIDENCE_THRESHOLD)
-    .sort((a, b) => b.confidence - a.confidence);
 }
 ```
 
-### Proactive Action Execution
+### Domain Confidence Tracking
 
-Predicted needs map to preparatory actions. These are low-cost, non-intrusive operations — fetching context, caching results, drafting content — that make the agent faster when the predicted need materializes.
+Confidence scores are maintained per domain (not per operation type), using an asymmetric formula where corrections weigh 1.25x more than successes:
 
 ```javascript
-const PROACTIVE_ACTIONS = {
-  'prepare-status-summary': async (context) => {
-    const recentActivity = await getActivitySince(yesterday());
-    return cache.set('status-summary', summarize(recentActivity), { ttl: 3600 });
-  },
-  'gather-recent-activity': async (context) => {
-    const activity = await searchMemory('recent work completed');
-    return cache.set('recent-activity', activity, { ttl: 3600 });
-  },
-  'fetch-participant-context': async (context) => {
-    const participants = context.participants || [];
-    const profiles = await Promise.all(
-      participants.map(p => knowledgeGraph.expandGraph(p.name, 1))
-    );
-    return cache.set('participant-context', profiles, { ttl: 1800 });
-  }
+// vibe/confidence.js
+async function record(tenantId, domain, positive, weight = 1) {
+  const successInc = positive ? weight : 0;
+  const correctionInc = positive ? 0 : weight;
+
+  await db.query(`
+    INSERT INTO domain_confidence (tenant_id, domain, total_actions, successful_actions, corrections, confidence_score)
+    VALUES ($1, $2, $3, $4, $5,
+      GREATEST(0, LEAST(1, ($4::real - $5::real * 1.25) / NULLIF($3::real, 0)))
+    )
+    ON CONFLICT (tenant_id, domain) DO UPDATE SET
+      total_actions = domain_confidence.total_actions + $3,
+      successful_actions = domain_confidence.successful_actions + $4,
+      corrections = domain_confidence.corrections + $5,
+      confidence_score = GREATEST(0, LEAST(1,
+        (domain_confidence.successful_actions + $4 - (domain_confidence.corrections + $5) * 1.25)::real
+        / NULLIF((domain_confidence.total_actions + $3)::real, 0)
+      ))
+  `, [tenantId, domain, 1, successInc, correctionInc]);
+}
+```
+
+The 1.25x correction weight means 5 corrections cancel ~6 successes — biasing the system toward caution without being overly punitive.
+
+### Vibe Subsystem Coordination
+
+The vibe engine coordinates five subsystems, each handling a different aspect of the feedback loop:
+
+```javascript
+// vibe/index.js
+const subsystems = {
+  followUps,        // Schedule and track action outcome checks
+  outcomeReactor,   // Auto-resolve follow-ups from events
+  knowledgeGaps,    // Detect missing knowledge, generate questions
+  synthesizer,      // Infer preferences from behavior patterns
+  confidence,       // Domain-level confidence tracking
 };
 
-async function executeProactiveActions() {
-  const predictions = await evaluatePredictions();
-
-  for (const prediction of predictions) {
-    const handler = PROACTIVE_ACTIONS[prediction.action];
-    if (handler) {
-      try {
-        await handler(prediction.context);
-        log.info(`Proactive: ${prediction.action} (${prediction.confidence}) — ${prediction.basis}`);
-      } catch (err) {
-        log.warn(`Proactive action failed: ${prediction.action}`, err);
-        // Failures are non-critical — the user can still request manually
-      }
-    }
-  }
+function init() {
+  // Only outcome reactor needs explicit init (event subscriptions)
+  outcomeReactor.init();
 }
 ```
 
-### Anticipation Loop
-
-The engine runs on an interval, continuously evaluating predictions and executing preparatory actions.
+The synthesizer mines corrections and tool parameter patterns to infer user preferences:
 
 ```javascript
-function startAnticipationLoop(intervalMs = 5 * 60 * 1000) {
-  setInterval(async () => {
-    await executeProactiveActions();
-  }, intervalMs);
-}
+// Correction mining: "user corrected date format 4 times → learn preference"
+// Tool param analysis: "user always passes format='iso' → default to iso"
+// Response pattern mining: "user prefers bullet points over prose"
 ```
 
 ## Implications
 
-- False positives are annoying — if the engine acts on bad predictions, it wastes resources or surfaces irrelevant content. The confidence threshold must be tuned carefully
-- Proactive actions must be cheap and reversible. Never take destructive or user-visible actions based on predictions alone
-- Sequential patterns need a cold-start period — the engine is useless until it has observed enough repetitions
-- Calendar integration requires API access and permissions, adding an external dependency
-- The anticipation loop adds background load; interval and action cost should be monitored
-- Users may find proactive behavior unsettling if it's too accurate or too visible — consider making it a "preparation" layer that speeds up responses rather than pushing unprompted notifications
-- Pattern storage grows over time; periodic pruning of low-confidence, low-count patterns keeps the system focused
+- Reactive outcome tracking is more reliable than temporal prediction — it responds to what actually happened, not what might happen
+- The 1.25x correction multiplier is configurable, allowing tuning per deployment risk tolerance
+- Fire-and-forget confidence recording (`record().catch(() => {})`) means tracking never blocks the response path
+- Follow-up delays are deliberately generous — checking too early wastes effort on in-progress work
+- Event subscriptions create coupling to specific event sources — adding a new event type requires an outcome reactor handler
+- Domain-level confidence (not per-operation) means a bad email experience affects all email operations, which may be too coarse for some use cases
 
 ## Code Example
 
 ```javascript
-// Complete anticipation cycle: observe, predict, prepare
-class AnticipationEngine {
-  constructor(config = {}) {
-    this.threshold = config.confidenceThreshold || 0.6;
-    this.lookaheadMinutes = config.lookaheadMinutes || 60;
-    this.intervalMs = config.intervalMs || 5 * 60 * 1000;
-  }
+// Complete feedback loop: action → follow-up → event → confidence update
+// 1. Agent creates a PR
+const pr = await tools.execute('create_pr', { repo, title, branch });
 
-  // Called on every user action to build pattern history
-  observe(action, previousAction) {
-    const now = new Date();
-    temporalPatterns.observe(action, now);
-    sequentialPatterns.observe(previousAction, action);
-  }
+// 2. Schedule follow-up to verify outcome
+await followUps.schedule({
+  action: 'create_pr',
+  expectedOutcome: 'merged',
+  checkAfter: new Date(Date.now() + 4 * 60 * 60 * 1000), // 4 hours
+  context: { tenantId, repo, prNumber: pr.number },
+});
 
-  // Evaluate all prediction sources
-  async predict() {
-    const predictions = await evaluatePredictions();
-    return predictions.filter(p => p.confidence >= this.threshold);
-  }
+// 3. Hours later, GitHub webhook fires → outcome reactor resolves
+// events.emit('github.pr_merged', { pr: { number: pr.number, repo } })
+// → onPrMerged() → resolve follow-up → confidence.record(tenantId, 'code_review', true)
 
-  // Run preparatory actions for high-confidence predictions
-  async prepare() {
-    const predictions = await this.predict();
-    const results = [];
-
-    for (const p of predictions) {
-      const handler = PROACTIVE_ACTIONS[p.action];
-      if (handler) {
-        await handler(p.context);
-        results.push({ action: p.action, confidence: p.confidence });
-      }
-    }
-
-    return results;
-  }
-
-  start() {
-    setInterval(() => this.prepare(), this.intervalMs);
-  }
-}
+// 4. Confidence score for 'code_review' domain increases
+// Future PR actions may auto-execute without approval if confidence > threshold
 ```
 
 ## Related Patterns
 
-- [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
-- [Context Assembly Pipeline](./context-assembly-pipeline.md)
-- [Autonomous Agent Cycle](./autonomous-agent-cycle.md)
+- [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)
+- [Evolution and Self-Improvement](./evolution-and-self-improvement.md)
+- [Unified Event System](./unified-event-system.md)
