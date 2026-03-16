@@ -1,6 +1,6 @@
 # Scheduled Autonomous Maintenance
 
-> Cron-based task scheduling for agent-managed projects with concurrent execution guards and centralized result processing.
+> Kanban-style task queue for agent-managed projects with claim-based locking and centralized result processing.
 
 ## Problem
 
@@ -35,26 +35,38 @@ Tasks are stored in PostgreSQL with a consistent schema:
 
 Storing task definitions in PostgreSQL rather than configuration files keeps task management centralized and auditable. Tasks can be created, updated, listed, toggled (enabled/disabled), and manually triggered through the orchestrator's task management layer — the exact API surface varies by implementation, but the lifecycle operations are consistent.
 
-### Cron-Based Scheduling with Concurrent Execution Guards
+### Kanban Queue with Claim-Based Locking
 
-The scheduler uses `node-cron` to trigger tasks at their defined cadences. A running set prevents overlapping executions of the same task:
+Rather than dispatching tasks directly via `node-cron`, the scheduler uses a kanban dequeue/claim model. Tasks whose schedule has elapsed are enqueued into a priority queue in `task-queue.js`. A processor loop calls `dequeueNext()` to claim the highest-priority ready task. Claiming a task locks it, preventing duplicate execution:
 
 ```javascript
-const running = new Set();
+// task-queue.js
+async function enqueueReady() {
+  const tasks = await getEnabledTasks();
+  for (const task of tasks) {
+    if (isDue(task) && !isClaimed(task)) {
+      await enqueue(task);
+    }
+  }
+}
 
-cron.schedule(task.schedule, async () => {
-  if (running.has(task.id)) return;  // Skip if already running
-  running.add(task.id);
+async function dequeueNext() {
+  // Atomically claim the highest-priority unclaimed task
+  const task = await claimNext();
+  if (!task) return null;
+
   try {
     const result = await dispatch(task);
-    enqueue({ type: 'task-result', task: task.id, result });
+    await recordResult({ type: 'task-result', task: task.id, result });
   } finally {
-    running.delete(task.id);
+    await releaseClaim(task.id);
   }
-});
+
+  return task;
+}
 ```
 
-If a task is still running when its next scheduled slot arrives, that slot is silently skipped. No queuing, no retry — the next natural slot will attempt execution again.
+If a task is already claimed when its next scheduled slot arrives, it is not re-enqueued. No queuing of duplicates, no retry — the next evaluation cycle will enqueue it again once the claim is released.
 
 ### Task Lifecycle
 
@@ -63,7 +75,7 @@ The orchestrator exposes task management operations that cover the full lifecycl
 - **Create/update:** Register a new task or modify an existing one (schedule, prompt, model, workdir, enabled status)
 - **List:** Inspect all registered tasks and their current state
 - **Toggle:** Pause or resume a task by flipping its `enabled` field without deleting the definition
-- **Manual trigger:** Execute a task immediately outside its normal schedule (still subject to the concurrent execution guard)
+- **Manual trigger:** Execute a task immediately outside its normal schedule (still subject to claim-based locking)
 
 These operations are typically exposed via the orchestrator's API, but the key architectural point is that task definitions live in the database and are managed centrally — not scattered across project config files.
 
@@ -78,8 +90,8 @@ All task results flow back through the orchestrator's message queue:
 
 ## Implications
 
-- Cron scheduling is time-based only — no event-driven triggers (e.g., "run when a PR is opened")
-- The concurrent execution guard means long-running tasks can miss their next scheduled slot, which is by design but requires tasks to be scoped appropriately
+- The schedule check is time-based only — no event-driven triggers (e.g., "run when a PR is opened")
+- Claim-based locking means long-running tasks will not be re-enqueued until their claim is released, which is by design but requires tasks to be scoped appropriately
 - No dependency ordering between tasks — if task A must complete before task B, that ordering must be encoded in the prompts or handled at a higher level
 - Heavy scheduling can consume agent dispatch capacity, starving on-demand work
 - The `enabled` toggle provides a safe way to pause maintenance without losing task definitions
@@ -91,7 +103,7 @@ All task results flow back through the orchestrator's message queue:
 // Register a maintenance task through the orchestrator's task management
 const task = {
   id: 'nightly-test-suite',
-  schedule: '0 3 * * *',       // Daily at 3 AM
+  schedule: '0 3 * * *',       // Cron expression defines when the task becomes due
   prompt: `Run the full test suite. Report any failures with
            file paths and error messages. Do NOT attempt fixes.`,
   model: 'sonnet',
@@ -101,7 +113,11 @@ const task = {
 
 await taskManager.create(task);
 
-// Manually trigger a task outside its schedule
+// The queue processor claims and executes due tasks
+const claimed = await dequeueNext();
+// → { id: 'nightly-test-suite', ... } if due and unclaimed
+
+// Manually trigger a task outside its schedule (enqueues immediately)
 await taskManager.trigger('nightly-test-suite');
 
 // Pause a task without deleting it

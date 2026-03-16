@@ -12,7 +12,7 @@ const PATTERNS = [
   {
     slug: "satellite-permission-escalation",
     title: "Satellite Permission Escalation",
-    summary: "Detecting and recovering from permission-blocked workers in multi-agent dispatch.",
+    summary: "Integrated permission checking in the dispatch cycle with autonomy-tier-gated escalation and structured failure reporting.",
     status: "published",
   },
   {
@@ -36,7 +36,7 @@ const PATTERNS = [
   {
     slug: "scheduled-autonomous-maintenance",
     title: "Scheduled Autonomous Maintenance",
-    summary: "Cron-scheduled autonomous tasks with API-driven management and concurrent execution guards.",
+    summary: "Kanban-style task queue for agent-managed projects with claim-based locking and centralized result processing.",
     status: "published",
   },
   {
@@ -84,7 +84,7 @@ const PATTERNS = [
   {
     slug: "intent-driven-self-scheduling",
     title: "Intent-Driven Self-Scheduling",
-    summary: "Agents create and manage scheduled tasks via API with cron dispatch through a priority kanban queue.",
+    summary: "Agents create and manage scheduled tasks via REST API with cron dispatch through a priority kanban queue.",
     status: "published",
   },
   {
@@ -96,7 +96,7 @@ const PATTERNS = [
   {
     slug: "decision-gating-and-autonomy-tiers",
     title: "Decision Gating and Autonomy Tiers",
-    summary: "Route autonomous agent decisions through notification tiers to prevent alert fatigue while ensuring critical actions reach humans.",
+    summary: "Numeric autonomy tiers (1=AUTO, 2=NOTIFY, 3=ASK) routing agent decisions with notification batching and audit trails.",
     status: "published",
   },
   {
@@ -113,14 +113,14 @@ const PATTERNS = [
   },
   {
     slug: "plugin-system-and-hot-reload",
-    title: "Plugin System and Hot-Reload",
-    summary: "Extensible plugin architecture with file watching, context building, and graceful lifecycle management.",
+    title: "Plugin System and Startup Loading",
+    summary: "Extensible plugin architecture with directory scanning, contribution registration, and context building at startup.",
     status: "published",
   },
   {
     slug: "skill-extraction-and-fast-path-routing",
     title: "Skill Extraction and Fast-Path Routing",
-    summary: "Embeddings-based semantic skill matching with learned reflex promotion for progressively faster dispatch.",
+    summary: "Embeddings-based semantic skill matching with designed (not yet operational) reflex promotion for progressively faster dispatch.",
     status: "published",
   },
   {
@@ -162,7 +162,7 @@ const PATTERNS = [
   {
     slug: "channel-adapter-architecture",
     title: "Channel Adapter Architecture",
-    summary: "Pluggable adapter contract for multi-channel messaging with registry validation and message routing.",
+    summary: "Six-method adapter contract for multi-channel messaging with registry validation and message routing.",
     status: "published",
   },
   {
@@ -192,7 +192,7 @@ const PATTERNS = [
   {
     slug: "worker-dispatcher-and-priority-queue",
     title: "Worker Dispatcher and Priority Queue",
-    summary: "Weighted work source prioritization with repo-level locking and budget tracking for satellite worker dispatch.",
+    summary: "Weighted event prioritization with resource-level locking and budget tracking for general-purpose cognitive dispatch.",
     status: "published",
   },
   {
@@ -205,6 +205,30 @@ const PATTERNS = [
     slug: "graceful-degradation-and-optional-init",
     title: "Graceful Degradation and Optional Init",
     summary: "Non-blocking startup with Promise.allSettled(), multi-provider LLM fallback chains, and optional service initialization.",
+    status: "published",
+  },
+  {
+    slug: "planning-and-verification-layer",
+    title: "Planning and Verification Layer",
+    summary: "Pre-execution plan generation with post-execution verification, novel composition detection, and automatic skill generation.",
+    status: "published",
+  },
+  {
+    slug: "deliberative-alignment",
+    title: "Deliberative Alignment",
+    summary: "Value-action comparison ensuring agent behavior aligns with stated preferences through pre-execution conflict detection.",
+    status: "published",
+  },
+  {
+    slug: "agent-recovery-and-escalation",
+    title: "Agent Recovery and Escalation",
+    summary: "Strategy-based recovery from tool failures with clarification workflows, batch approval grouping, and action buffering.",
+    status: "published",
+  },
+  {
+    slug: "tenant-context-and-multi-tenancy",
+    title: "Tenant Context and Multi-Tenancy",
+    summary: "Request-scoped tenant isolation via async local storage with automatic database scoping and configuration partitioning.",
     status: "published",
   },
 ];

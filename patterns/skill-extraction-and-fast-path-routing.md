@@ -8,6 +8,8 @@ An LLM orchestrator processes every incoming message through the same pipeline: 
 
 ## Context
 
+> **Implementation status:** Semantic skill matching is operational. Reflex promotion, demotion, and LLM-free execution are designed but not yet implemented in Riley.
+
 - An orchestrator handling a mix of novel and repetitive user requests
 - Embeddings infrastructure already in place for semantic search
 - Historical conversation data showing frequently recurring patterns
@@ -62,6 +64,8 @@ function computePipelineSignature(executionHistory) {
 ```
 
 ### Reflex Promotion via Coactivation
+
+> **Aspirational:** Reflex promotion is designed but not yet implemented. The mechanism below describes the intended behavior.
 
 When the same skill-to-tool-sequence pattern fires repeatedly with consistent results, the system promotes it to a **reflex** — a direct mapping that bypasses the LLM entirely:
 
@@ -119,6 +123,8 @@ async function dispatch(message) {
 
 ### Demotion Safety
 
+> **Aspirational:** Demotion safety is designed but not yet implemented. It depends on the reflex promotion system above.
+
 Reflexes are not permanent. If a reflex produces errors or user corrections, it's demoted back to a skill:
 
 ```javascript
@@ -133,9 +139,9 @@ function onReflexFailure(reflex, error) {
 
 ## Implications
 
-- The embedding search adds ~50ms overhead to every message — acceptable given potential savings of seconds
+- The embedding search adds ~50ms overhead to every message — acceptable given potential savings of seconds. Semantic skill matching is operational; reflex promotion and three-speed dispatch are planned but not yet active
 - False skill matches can cause incorrect fast-path routing — the 0.85 threshold is tunable
-- Reflex promotion creates behavior that's invisible to the LLM — debugging requires checking the reflex registry
+- Reflex promotion (when implemented) would create behavior that's invisible to the LLM — debugging would require checking the reflex registry
 - Pipeline signatures are brittle to tool renames — aliases help but don't fully solve this
 - The system gets faster over time but also more opaque — observability is critical
 - Promoted reflexes execute without LLM judgment, so they must be restricted to low-risk operations

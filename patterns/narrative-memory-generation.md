@@ -118,5 +118,4 @@ await generateNarrative({
 ## Related Patterns
 
 - [Domain-Aware Memory Scoring](./domain-aware-memory-scoring.md)
-- [Domain-Aware Memory Scoring](./domain-aware-memory-scoring.md)
 - [Activity Tracking Architecture](./activity-tracking-architecture.md)

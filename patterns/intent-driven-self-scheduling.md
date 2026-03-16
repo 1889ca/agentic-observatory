@@ -87,47 +87,28 @@ Cron fires → dispatch({ lane: 'task' }) → kanban queue → satellite worker
 
 The `result_handler: 'task'` field routes completion results back to the task system for logging and error handling.
 
-### Sandboxed Self-Scheduling
-
-Agents can create tasks during their own execution through a sandboxed code execution environment. The sandbox provides a `riley` API object with task management methods but no direct file or network access:
-
-```javascript
-// riley-tasks.js — sandboxed execution environment
-const api = {
-  createTask: ({ id, schedule, prompt, model, workdir, enabled }) => {
-    return createTask(id, schedule, prompt, { model, workdir, enabled });
-  },
-  listTasks: () => listTasks(),
-  runTask: ({ id }) => runTaskNow(id),
-  deleteTask: ({ id }) => deleteTask(id),
-  enqueueTask: ({ description, prompt, workdir, model, urgency, project }) => {
-    return dispatch({ lane: 'task', description, prompt, workdir, model, urgency, project });
-  },
-  peekKanban: ({ project, status, limit }) => {
-    return kanban.peek({ project, status, limit });
-  },
-};
-
-// Runs in VM context with 30s timeout
-const result = vm.runInNewContext(code, { riley: api }, { timeout: 30_000 });
-```
-
 ### Dynamic Self-Scheduling During Execution
 
-A morning review task might discover a failing build and schedule a follow-up check:
+Agents can create follow-up tasks during their own execution via HTTP API calls to the orchestrator. A morning review task might discover a failing build and schedule a follow-up check:
 
 ```javascript
-// Agent code running inside sandboxed execution:
-riley.createTask({
-  id: 'followup-build-check',
-  schedule: '30 10 * * *',  // check at 10:30am
-  prompt: 'The billing-api build failed at 9am. Check if the fix PR was merged.',
-  model: 'haiku',
-  workdir: '/projects/billing-api',
+// Agent creates a follow-up task via REST API
+await fetch('http://localhost:3847/api/tasks', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    id: 'followup-build-check',
+    schedule: '30 10 * * *',  // check at 10:30am
+    prompt: 'The billing-api build failed at 9am. Check if the fix PR was merged.',
+    model: 'haiku',
+    workdir: '/projects/billing-api',
+  }),
 });
 
-// Once the follow-up is resolved, clean up:
-riley.deleteTask({ id: 'followup-build-check' });
+// Once the follow-up is resolved, the agent deletes the task
+await fetch('http://localhost:3847/api/tasks/followup-build-check', {
+  method: 'DELETE',
+});
 ```
 
 ### Model Selection for Cost Control
@@ -143,10 +124,8 @@ Different tasks warrant different model capabilities:
 - Tasks enqueue to kanban rather than dispatching directly, so they respect the same concurrency limits and priority ordering as all other work
 - Cron expressions provide minute-level granularity but not sub-minute precision
 - Tasks persist in the database, surviving orchestrator restarts. The cron scheduler re-registers all enabled tasks on startup
-- The sandboxed execution environment prevents agents from accessing the filesystem or network directly — they can only interact through the `riley` API
-- Self-scheduled tasks are indistinguishable from human-created ones — the same API serves both
-- One-shot tasks require the agent to clean up after itself via `deleteTask()`
-- VM timeout of 30 seconds prevents runaway code execution in the sandbox
+- Self-scheduled tasks are indistinguishable from human-created ones — the same REST API serves both
+- One-shot tasks require the agent to clean up after itself by calling `DELETE /api/tasks/:id`
 
 ## Code Example
 
@@ -175,11 +154,15 @@ await fetch('http://localhost:3847/api/tasks', {
 // Task system logs completion, tracks success/failure
 
 // 5. If the agent discovers a one-time follow-up during execution:
-riley.createTask({
-  id: `followup-${Date.now()}`,
-  schedule: '*/30 * * * *',
-  prompt: 'Check if PR #142 was reviewed. If approved, merge and delete this task.',
-  model: 'haiku',
+await fetch('http://localhost:3847/api/tasks', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    id: `followup-${Date.now()}`,
+    schedule: '*/30 * * * *',
+    prompt: 'Check if PR #142 was reviewed. If approved, merge and delete this task.',
+    model: 'haiku',
+  }),
 });
 ```
 

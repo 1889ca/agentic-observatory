@@ -1,6 +1,6 @@
 # Channel Adapter Architecture
 
-> Pluggable adapter contract for multi-channel messaging. Each adapter implements init/disconnect/sendMessage/getStatus. Registry validates contracts, router dispatches.
+> Pluggable adapter contract for multi-channel messaging. Each adapter implements init/disconnect/sendMessage/getStatus/hasCredentials/isConnected. Registry validates contracts, router dispatches.
 
 ## Problem
 
@@ -18,7 +18,7 @@ An orchestrator needs to communicate across multiple channels — Slack, Telegra
 
 ### Adapter Contract
 
-Every channel adapter implements a standard four-method interface. A base class defines the contract and provides shared utilities:
+Every channel adapter implements a standard six-method interface. A base class defines the contract and provides shared utilities:
 
 ```javascript
 // lib/channels/adapter.js
@@ -41,13 +41,21 @@ class ChannelAdapter {
     throw new Error(`${this.name} must implement sendMessage()`);
   }
 
+  hasCredentials() {
+    throw new Error(`${this.name} must implement hasCredentials()`);
+  }
+
+  isConnected() {
+    throw new Error(`${this.name} must implement isConnected()`);
+  }
+
   getStatus() {
     return { channel: this.name, status: this.status };
   }
 }
 ```
 
-The contract is intentionally small. Four methods are enough to cover the lifecycle (init/disconnect) and the core operations (send/status). Channel-specific features like reactions, threads, or read receipts live in the adapter subclass, not the contract.
+The contract is intentionally small. Six methods cover the lifecycle (init/disconnect), core operations (sendMessage), credential validation (hasCredentials), connection state (isConnected), and full status reporting (getStatus). `hasCredentials()` returns a boolean indicating whether the adapter has valid credentials configured — useful for skipping unconfigured channels at startup. `isConnected()` returns a boolean for the current connection state, distinct from `getStatus()` which returns a full status object with metadata. Channel-specific features like reactions, threads, or read receipts live in the adapter subclass, not the contract.
 
 ### Channel Registry
 
@@ -55,7 +63,7 @@ The registry validates that every adapter implements the full contract before al
 
 ```javascript
 // lib/channels/registry.js
-const REQUIRED_METHODS = ['init', 'disconnect', 'sendMessage', 'getStatus'];
+const REQUIRED_METHODS = ['init', 'disconnect', 'sendMessage', 'getStatus', 'hasCredentials', 'isConnected'];
 
 class ChannelRegistry {
   constructor() {
@@ -163,6 +171,14 @@ class TelegramAdapter extends ChannelAdapter {
       ...options,
     });
   }
+
+  hasCredentials() {
+    return Boolean(this.config.token);
+  }
+
+  isConnected() {
+    return this.status === 'connected';
+  }
 }
 ```
 
@@ -170,12 +186,13 @@ Each adapter owns its SDK, auth, and message formatting. The Slack adapter deals
 
 ## Implications
 
-- Adding a new channel means implementing one adapter file with four methods — no changes to the router, registry, or orchestrator
+- Adding a new channel means implementing one adapter file with six methods — no changes to the router, registry, or orchestrator
 - Registry validation catches incomplete adapters at startup, producing a clear error before any messages are attempted
 - The router is the single dispatch point, making it easy to add cross-cutting concerns like logging, rate limiting, or delivery tracking
 - Format conversion in the router means the orchestrator always works with a single content format — adapters never need to understand each other's formats
 - Channel failures are isolated — a Telegram outage doesn't affect Slack delivery
-- The base adapter's `getStatus()` provides a uniform health check surface for monitoring
+- `hasCredentials()` allows the startup sequence to skip unconfigured channels gracefully instead of failing on init
+- `isConnected()` provides a quick boolean check for routing decisions, while `getStatus()` provides a full status object for monitoring dashboards
 
 ## Code Example
 

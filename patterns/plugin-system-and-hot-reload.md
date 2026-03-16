@@ -1,6 +1,6 @@
-# Plugin System and Hot-Reload
+# Plugin System and Startup Loading
 
-> Extensible plugin architecture with file watching, context building, and graceful lifecycle management.
+> Extensible plugin architecture with directory scanning, contribution registration, and context building at startup.
 
 ## Problem
 
@@ -9,10 +9,9 @@ An AI orchestrator needs to grow its capabilities without modifying core code. H
 ## Context
 
 - An orchestrator that needs to support many independent capability modules
-- Desire to add, update, or remove capabilities without restarting the system
 - Each plugin may contribute tools, events, scheduled jobs, and HTTP routes
 - Plugins may depend on shared services (database, event bus, model dispatch)
-- Development workflow benefits from live-reload during iteration
+- New capabilities are added by dropping a plugin directory and restarting
 
 ## Solution
 
@@ -94,52 +93,16 @@ function buildToolContext() {
 }
 ```
 
-### File Watching and Hot-Reload
+### Startup-Only Loading
 
-A file watcher monitors the plugin directory for changes:
-
-```javascript
-const watcher = fs.watch(pluginDir, { recursive: true }, async (event, filename) => {
-  const pluginName = filename.split(path.sep)[0];
-  if (!loaded.has(pluginName)) return;
-
-  // Graceful unload
-  await unloadPlugin(pluginName);
-
-  // Clear require cache
-  delete require.cache[require.resolve(path.join(pluginDir, pluginName))];
-
-  // Reload
-  await loadPlugin(pluginName);
-  log.info(`Hot-reloaded plugin: ${pluginName}`);
-});
-```
-
-### Graceful Shutdown
-
-When a plugin is unloaded (for reload or removal), its contributions are cleanly removed:
-
-```javascript
-async function unloadPlugin(name) {
-  const plugin = loaded.get(name);
-  if (!plugin) return;
-
-  plugin.tools?.forEach(t => toolRegistry.unregister(t.name));
-  plugin.events?.forEach(e => eventBus.off(e.event, e.handler));
-  plugin.jobs?.forEach(j => scheduler.unregister(j.id));
-
-  // Route cleanup handled by removing the mounted router
-  loaded.delete(name);
-}
-```
+Plugins are loaded once at startup. There is no file watcher or hot-reload mechanism — adding or modifying a plugin requires a restart. This keeps the plugin lifecycle simple and avoids the complexity of clearing `require.cache`, managing stateful teardown, or handling partial reloads of plugins that hold connections.
 
 ## Implications
 
 - Plugins can introduce bugs that affect the whole system — sandboxing is limited to process-level isolation
-- Hot-reload clears the require cache, which can cause issues with stateful plugins that hold connections
+- Adding or updating a plugin requires a restart, which is acceptable for an orchestrator that starts up quickly
 - Route mounting at `/api/plugins/{name}/*` creates a clean namespace but limits URL flexibility
 - The registry pattern means all plugins must conform to a fixed interface — ad-hoc extensions are not supported
-- File watching adds filesystem overhead proportional to the number of watched files
 - Plugin load order may matter if plugins depend on each other — no dependency resolution is built in
 
 ## Code Example
@@ -149,7 +112,6 @@ async function unloadPlugin(name) {
 const pluginManager = {
   async init(pluginDir) {
     await loadPlugins(pluginDir);
-    startFileWatcher(pluginDir);
     log.info(`Loaded ${loaded.size} plugins with ${toolRegistry.size} tools`);
   },
 
@@ -157,16 +119,8 @@ const pluginManager = {
     return buildToolContext();
   },
 
-  async reload(pluginName) {
-    await unloadPlugin(pluginName);
-    await loadPlugin(pluginName);
-  },
-
-  async shutdown() {
-    for (const [name] of loaded) {
-      await unloadPlugin(name);
-    }
-    watcher.close();
+  getPlugins() {
+    return Array.from(loaded.keys());
   }
 };
 ```

@@ -16,55 +16,42 @@ When an orchestrator dispatches work to AI agent workers (e.g., Claude Code inst
 
 ## Solution
 
-### Structured Failure Reporting
+### Integrated Permission Checking in the Dispatch Cycle
 
-The key insight: workers must communicate **why** they're blocked, not just that they're blocked. Define a failure taxonomy that distinguishes permission blocks from other failure modes:
-
-```javascript
-// Worker reports structured failure, not just exit code
-function reportFailure(jobId, failure) {
-  return {
-    jobId,
-    status: 'blocked',
-    reason: failure.type,     // 'permission_denied' | 'timeout' | 'crash' | 'resource_limit'
-    detail: failure.message,  // 'Write access to /etc/nginx required'
-    toolCategory: failure.tool, // 'bash' | 'edit' | 'write' | 'network'
-    recoverable: failure.recoverable // Can this be retried with different config?
-  };
-}
-```
-
-### Stall Detection
-
-Workers that hit permission prompts don't crash — they hang waiting for input. The orchestrator must detect this via activity monitoring, not just exit codes:
+Permission escalation is part of the orchestrator's dispatch cycle, not an isolated flow. Before dispatching work, the orchestrator evaluates required permissions and uses the autonomy tier system (1=AUTO, 2=NOTIFY, 3=ASK) to gate escalation decisions:
 
 ```javascript
-function detectStalls(activeJobs) {
-  const now = Date.now();
-  for (const job of activeJobs) {
-    const silentDuration = now - job.lastActivityAt;
+// Permission check integrated into dispatch planning
+// Autonomy tiers: 1=AUTO, 2=NOTIFY, 3=ASK
+async function planDispatch(job) {
+  const requiredPerms = job.requiredPermissions ?? ['read'];
+  const worker = findCompatibleWorker(job);
 
-    if (silentDuration > STALL_THRESHOLD_MS) {
-      // Worker has been silent too long — likely permission-blocked
-      job.status = 'suspected_permission_block';
-      emitAlert(job);
+  if (worker) {
+    // Worker has all required permissions — dispatch based on autonomy tier
+    const tier = getAutonomyTier(job.decisionType);
+    if (tier === 3) {
+      await requestApproval({ job, reason: 'Tier 3 action requires approval' });
     }
+    return { action: 'dispatch', worker, tier };
   }
-}
 
-// Run detection periodically
-setInterval(() => detectStalls(getActiveJobs()), 60000);
+  // No compatible worker — escalate permission request
+  const missing = getMissingPermissions(job);
+  return { action: 'escalate', missing, job };
+}
 ```
 
 ### Permission Requirement Declaration
 
-Task definitions can declare expected permission categories upfront. The orchestrator validates compatibility before dispatch, avoiding predictable failures:
+Task definitions declare expected permission categories upfront. The orchestrator validates compatibility before dispatch, bundling permission requests with approval workflows:
 
 ```javascript
 const task = {
   id: 'apply-fixes',
   prompt: 'Apply the suggested code fixes',
   requiredPermissions: ['read', 'edit', 'write', 'bash'],
+  decisionType: 'code-change',  // maps to autonomy tier
 };
 
 function canWorkerHandle(worker, task) {
@@ -79,31 +66,72 @@ function canWorkerHandle(worker, task) {
 }
 ```
 
-### Fallback Strategies
+### Stall Detection
 
-When a permission block is detected, the orchestrator has several options depending on the failure context:
+Workers that hit permission prompts don't crash — they hang waiting for input. The orchestrator detects this via activity monitoring, not just exit codes:
 
-1. **Retry with elevated config**: Redispatch the job to a worker with broader permissions
-2. **Decompose the task**: Break the blocked step into smaller sub-steps that require fewer permissions (e.g., separate "analyze" from "apply")
-3. **Escalate to human**: Route the blocked task to a human-in-the-loop queue with the specific permission context
-4. **Skip and continue**: If the blocked step is optional, mark it as skipped and proceed with the flow
+```javascript
+function detectStalls(activeJobs) {
+  const now = Date.now();
+  for (const job of activeJobs) {
+    const silentDuration = now - job.lastActivityAt;
+
+    if (silentDuration > STALL_THRESHOLD_MS) {
+      job.status = 'suspected_permission_block';
+      emitAlert(job);
+    }
+  }
+}
+
+setInterval(() => detectStalls(getActiveJobs()), 60000);
+```
+
+### Structured Failure Reporting
+
+Workers communicate **why** they're blocked, not just that they're blocked. A failure taxonomy distinguishes permission blocks from other failure modes:
+
+```javascript
+function reportFailure(jobId, failure) {
+  return {
+    jobId,
+    status: 'blocked',
+    reason: failure.type,     // 'permission_denied' | 'timeout' | 'crash' | 'resource_limit'
+    detail: failure.message,  // 'Write access to /etc/nginx required'
+    toolCategory: failure.tool, // 'bash' | 'edit' | 'write' | 'network'
+    recoverable: failure.recoverable,
+  };
+}
+```
+
+### Autonomy-Gated Fallback Strategies
+
+When a permission block is detected, the fallback strategy is gated by the autonomy tier of the original decision:
+
+1. **Tier 1 (AUTO)**: Silently retry with an elevated worker or decompose the task into safer sub-steps
+2. **Tier 2 (NOTIFY)**: Execute fallback and notify human after the fact
+3. **Tier 3 (ASK)**: Block and request human approval before attempting recovery
 
 ```javascript
 async function handlePermissionBlock(job, failure) {
-  switch (failure.toolCategory) {
-    case 'bash':
-      // Shell access often blocked — try decomposing into safer operations
-      return await decomposeTask(job, { avoid: ['bash'] });
-    case 'write':
-      // File write blocked — escalate with context
-      return await escalateToHuman(job, {
-        reason: `Worker needs write access to ${failure.detail}`,
-        suggestion: 'Approve write permissions or apply changes manually'
-      });
-    default:
-      // Unknown block — retry with elevated worker
-      return await redispatch(job, { permissionLevel: 'elevated' });
+  const tier = getAutonomyTier(job.decisionType);
+
+  if (tier === 3) {
+    // ASK — always escalate to human for approval
+    return await escalateToHuman(job, {
+      reason: `Worker needs ${failure.toolCategory} access: ${failure.detail}`,
+      suggestion: 'Approve elevated permissions or apply changes manually',
+    });
   }
+
+  // Tier 1 or 2 — attempt automatic recovery
+  const result = await decomposeOrRedispatch(job, failure);
+
+  if (tier === 2) {
+    // NOTIFY — inform human about the recovery action
+    await sendNotification({ job, failure, recovery: result });
+  }
+
+  return result;
 }
 ```
 
@@ -119,18 +147,22 @@ async function handlePermissionBlock(job, failure) {
 ## Code Example
 
 ```javascript
-// Complete permission-aware dispatch cycle
+// Permission-aware dispatch cycle with autonomy tier integration
 async function dispatchWithPermissionHandling(job, maxRetries = 2) {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const worker = findCompatibleWorker(job);
-    if (!worker) {
-      // No worker has sufficient permissions
-      return await escalateToHuman(job, {
-        reason: `No worker available with permissions: ${job.requiredPermissions}`
-      });
-    }
+  const plan = await planDispatch(job);
 
-    const result = await dispatchAndMonitor(worker, job);
+  if (plan.action === 'escalate') {
+    // No compatible worker — escalate based on autonomy tier
+    return await handlePermissionBlock(job, {
+      type: 'permission_denied',
+      toolCategory: plan.missing[0],
+      message: `No worker with permissions: ${plan.missing.join(', ')}`,
+      recoverable: false,
+    });
+  }
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const result = await dispatchAndMonitor(plan.worker, job);
 
     if (result.status === 'complete') {
       return result;
@@ -140,12 +172,11 @@ async function dispatchWithPermissionHandling(job, maxRetries = 2) {
       log(`Job ${job.id} blocked on ${result.toolCategory} — attempt ${attempt + 1}`);
 
       if (result.recoverable) {
-        // Elevate permissions and retry
         job.requiredPermissions.push(result.toolCategory);
         continue;
-      } else {
-        return await handlePermissionBlock(job, result);
       }
+
+      return await handlePermissionBlock(job, result);
     }
 
     // Non-permission failure — don't retry
@@ -159,4 +190,4 @@ async function dispatchWithPermissionHandling(job, maxRetries = 2) {
 ## Related Patterns
 
 - [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
-- [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
+- [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
