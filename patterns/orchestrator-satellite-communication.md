@@ -1,216 +1,246 @@
 # Orchestrator-Satellite Communication
 
-> Unix socket protocol with JSONL streaming for real-time orchestrator-to-satellite job dispatch and output streaming.
+> DB-backed task queue with subprocess spawning for orchestrator-to-satellite job dispatch, status tracking, and result collection.
 
 ## Problem
 
-An orchestrator needs to dispatch work to multiple AI agent instances, stream their output in real-time, detect failures, and collect results. HTTP polling introduces latency and complexity. Full RPC frameworks are overkill. What's needed is a lightweight protocol that supports streaming output, concurrent job limits, and crash recovery without the connection management overhead of WebSockets.
+An orchestrator needs to dispatch work to AI agent instances, track their progress, detect failures, and collect results. Direct inter-process communication (sockets, pipes) couples the orchestrator tightly to worker lifecycle — if a worker crashes mid-stream, the connection is lost and so is any partial output. What's needed is a durable dispatch mechanism where work survives process restarts, results persist regardless of worker fate, and concurrency is controlled without custom protocol logic.
 
 ## Context
 
 - One orchestrator process managing N satellite workers on the same machine
-- Jobs run as Claude Code subprocesses and can produce large streaming output
-- Need for concurrent job limits (global and per-project), cancellation, and crash recovery
-- Orchestrator and satellites may restart independently
-- Real-time output streaming is essential for long-running jobs (minutes to hours)
+- Jobs run as Claude Code CLI subprocesses that produce text output
+- Need for concurrent job limits, cancellation, and crash recovery
+- Workers may crash or be killed without warning
+- Job state must survive orchestrator restarts — no in-memory-only queues
+- Multiple components (API, scheduler, kanban worker) submit jobs to the same pipeline
 
 ## Solution
 
-### Unix Socket Protocol
+### DB-Backed Task Queue
 
-The satellite runs as a daemon listening on a Unix socket. Communication uses newline-delimited JSON (NDJSON) — each message is a single JSON object followed by a newline. This is simpler than HTTP, has zero serialization overhead, and supports bidirectional streaming natively:
+Instead of dispatching jobs directly to workers over a socket or RPC channel, the orchestrator writes task records to a database table. Workers poll this table for pending work. This decouples submission from execution entirely — the API, scheduler, and manual triggers all write to the same table, and the kanban worker picks them up uniformly:
 
 ```javascript
-// satellite-protocol.js
-function sendRun(msg, callbacks) {
-  const client = createConnection(SOCKET_PATH);
+// db/tasks.js
+async function enqueueTask({ prompt, workdir, model, priority, source }) {
+  return db('tasks').insert({
+    id: generateId(),
+    prompt,
+    workdir,
+    model: model || 'sonnet',
+    priority: priority || 'normal',
+    source,
+    status: 'pending',
+    created_at: new Date(),
+  }).returning('*');
+}
 
-  client.on('connect', () => callbacks.onConnect?.());
+async function claimNextTask() {
+  // Atomic claim: update the first pending task to 'running' and return it
+  // DB-level locking prevents two workers from claiming the same task
+  return db('tasks')
+    .where({ status: 'pending' })
+    .orderByRaw("CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'operational' THEN 3 END")
+    .orderBy('created_at', 'asc')
+    .first()
+    .update({ status: 'running', started_at: new Date() })
+    .returning('*');
+}
+```
 
-  client.write(JSON.stringify({ type: 'run', ...msg }) + '\n');
+### Task State Machine
 
-  // Parse newline-delimited JSON responses
-  let buffer = '';
-  client.on('data', (data) => {
-    buffer += data.toString();
-    const lines = buffer.split('\n');
-    buffer = lines.pop(); // Keep incomplete line in buffer
+Every task moves through a fixed set of states. The state column in the database is the single source of truth — no in-memory state needs to agree with it:
 
-    for (const line of lines) {
-      const parsed = JSON.parse(line);
-      if (parsed.done) callbacks.onDone(parsed);
-      else if (parsed.chunk) callbacks.onChunk(parsed);
-      else if (parsed.error) callbacks.onError(parsed);
-    }
+```
+pending → running → completed
+                  → failed
+```
+
+```javascript
+// db/tasks.js
+async function completeTask(taskId, output, exitCode) {
+  return db('tasks')
+    .where({ id: taskId })
+    .update({
+      status: exitCode === 0 ? 'completed' : 'failed',
+      output,
+      exit_code: exitCode,
+      completed_at: new Date(),
+    });
+}
+```
+
+### Kanban Worker
+
+The kanban worker is a polling loop that claims pending tasks from the DB and spawns Claude Code subprocesses to execute them. It ticks on a short interval, checking for available work and available capacity:
+
+```javascript
+// kanban-worker.js
+const MAX_CONCURRENT = parseInt(process.env.MAX_WORKERS || '4');
+const activeJobs = new Map();
+
+async function tick() {
+  if (activeJobs.size >= MAX_CONCURRENT) return;
+
+  const task = await claimNextTask();
+  if (!task) return;
+
+  const proc = spawnSatellite(task);
+  activeJobs.set(task.id, { proc, task, startedAt: Date.now() });
+
+  proc.on('exit', async (code) => {
+    activeJobs.delete(task.id);
+    await completeTask(task.id, proc.collectedOutput, code);
+  });
+}
+
+setInterval(tick, TICK_INTERVAL_MS);
+```
+
+### Subprocess Spawning
+
+Each task is executed by spawning the Claude Code CLI as a child process. The orchestrator captures stdout for the result and monitors the exit code for success or failure:
+
+```javascript
+// kanban-worker.js
+function spawnSatellite(task) {
+  const args = [
+    '--print', task.prompt,
+    '--model', task.model,
+    '--output-format', 'text',
+  ];
+
+  const proc = spawn('claude', args, {
+    cwd: task.workdir,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, CLAUDE_CODE_HEADLESS: '1' },
   });
 
-  return { client };
-}
-```
-
-### Socket Server Message Types
-
-The satellite socket server handles four message types:
-
-- **`run`** — Spawn a new Claude Code subprocess with prompt, cwd, and model
-- **`cancel`** — Kill a running job by ID
-- **`subscribe`** — Attach to an existing job's output stream (for late-joining observers)
-- **`status`** — Query active job count and details
-
-```javascript
-// satellite/socket-server.js
-function handleMessage(client, msg) {
-  switch (msg.type) {
-    case 'run':
-      if (activeJobs.size >= MAX_JOBS) {
-        send(client, { id: msg.id, error: 'max_jobs_exceeded', done: true });
-        return;
-      }
-      spawnJob(client, msg);
-      break;
-    case 'cancel':
-      cancelJob(msg.id);
-      break;
-    case 'subscribe':
-      subscribeToJob(client, msg.id);
-      break;
-    case 'status':
-      send(client, { jobs: getActiveJobDetails(), max: MAX_JOBS });
-      break;
-  }
-}
-```
-
-### Concurrency Limits
-
-Two levels of concurrency control prevent resource exhaustion:
-
-```javascript
-const MAX_JOBS = parseInt(process.env.MAX_JOBS || '8');
-const MAX_JOBS_PER_PROJECT = parseInt(process.env.MAX_JOBS_PER_PROJECT || '3');
-```
-
-Global limits prevent machine overload. Per-project limits prevent one project from starving others. Both are checked before spawning.
-
-### Streaming Output
-
-Job output streams in real-time over the socket connection. Each chunk is sent as it arrives from the subprocess:
-
-```javascript
-// satellite/spawner.js
-function spawnJob(client, msg) {
-  const proc = spawn(CLAUDE_BIN, [...args], { cwd: msg.cwd, detached: true });
-
+  // Collect output from stdout
+  let output = '';
   proc.stdout.on('data', (data) => {
-    const text = data.toString();
-    send(client, { id: msg.id, chunk: text });
-    appendToLog(msg.id, { type: 'chunk', ts: Date.now(), text });
+    output += data.toString();
   });
 
-  proc.on('exit', (code) => {
-    send(client, { id: msg.id, output: collectedOutput, exit_code: code, done: true });
-    appendToLog(msg.id, { type: 'finish', ts: Date.now(), exit_code: code });
+  proc.stderr.on('data', (data) => {
+    logger.warn({ taskId: task.id }, data.toString());
   });
+
+  proc.collectedOutput = '';
+  Object.defineProperty(proc, 'collectedOutput', {
+    get: () => output,
+  });
+
+  return proc;
 }
 ```
 
-### Job Monitoring and Stall Detection
+### Exit Code Monitoring
 
-A periodic monitor (every 5 minutes) detects stuck jobs:
+The orchestrator determines task success or failure purely from the subprocess exit code. This keeps the protocol dead simple — no custom status messages, no heartbeat protocol, no acknowledgement frames:
 
 ```javascript
-// satellite/job-monitor.js — checks every 5 minutes
-function checkJobs() {
-  for (const job of activeJobs.values()) {
-    const logInactive = Date.now() - job.lastLogTime > 10 * 60 * 1000;
-    const cpuIdle = job.cpuUsage < 0.1;
+proc.on('exit', async (code) => {
+  const duration = (Date.now() - startedAt) / 1000;
 
-    if (logInactive && cpuIdle) {
-      // Stalled: no output for 10min AND CPU idle — kill it
-      job.process.kill('SIGTERM');
+  if (code === 0) {
+    logger.info({ taskId: task.id, duration }, 'Task completed');
+    await completeTask(task.id, proc.collectedOutput, 0);
+  } else {
+    logger.error({ taskId: task.id, exitCode: code, duration }, 'Task failed');
+    await completeTask(task.id, proc.collectedOutput, code);
+
+    // Retry logic for transient failures
+    if (task.retries < MAX_RETRIES) {
+      await requeueTask(task.id, task.retries + 1);
     }
   }
 
-  // Clean up orphaned dev servers (vite, webpack, next) reparented to init
-  cleanupOrphanedProcesses();
-}
+  activeJobs.delete(task.id);
+});
 ```
 
-### Kanban Queue Integration
+### Stale Task Recovery
 
-Jobs don't go directly from the API to the satellite. Instead, they pass through a priority-based kanban queue that ticks every 100ms:
+If the orchestrator crashes while tasks are in the `running` state, those tasks are orphaned. On startup, a sweep marks any `running` tasks that have no live subprocess as `pending` again:
 
 ```javascript
-// kanban-worker.js — polls every 100ms
-function tick() {
-  const pending = queue.getByPriority(); // critical > high > normal > operational
+// startup.js
+async function recoverStaleTasks() {
+  const stale = await db('tasks')
+    .where({ status: 'running' })
+    .where('started_at', '<', new Date(Date.now() - STALE_THRESHOLD_MS));
 
-  for (const task of pending) {
-    if (canLaunch(task)) {
-      sendRun({
-        id: `kanban-${task.id}`,
-        prompt: task.prompt,
-        cwd: task.workdir,
-        model: task.model || 'sonnet',
-      }, {
-        onDone: (result) => markDone(task.id, result.output, result.exit_code),
-        onError: () => retryWithBackoff(task), // 5s, 15s, 30s
-      });
-    }
+  for (const task of stale) {
+    logger.warn({ taskId: task.id }, 'Recovering stale task — requeueing');
+    await db('tasks')
+      .where({ id: task.id })
+      .update({ status: 'pending', started_at: null });
   }
 }
 ```
 
 ## Implications
 
-- Unix sockets are local-only — satellites must run on the same machine as the orchestrator
-- NDJSON protocol is simple to debug (just pipe the socket and read JSON lines)
-- Streaming output means the orchestrator can show progress in real time, unlike poll-based systems
-- Per-project concurrency limits prevent a single noisy project from monopolizing all workers
-- Stall detection uses a two-check confirmation (idle CPU + no output) to avoid false positives
-- The kanban queue decouples job submission from execution, enabling priority-based scheduling
-- Output is capped at 10MB in memory with full logs written to disk, preventing OOM on verbose jobs
+- The DB is the single source of truth for task state — no reconciliation needed between in-memory and persistent state
+- Subprocess spawning is simpler than maintaining a socket protocol — the OS handles process lifecycle, signal delivery, and resource cleanup
+- Exit codes are a universal success/failure signal — no custom error encoding required
+- DB-level atomic claims (update-returning) prevent two workers from grabbing the same task, replacing the need for a custom locking protocol
+- Task records survive orchestrator restarts, unlike in-memory queues or socket connections
+- Output is only captured at completion, not streamed — this trades real-time visibility for implementation simplicity
+- Polling introduces latency (up to one tick interval) between task submission and pickup, which is acceptable for jobs measured in minutes
+- The stale task recovery sweep means no task is silently lost, even after an unclean shutdown
+- Concurrency control lives in the kanban worker's `MAX_CONCURRENT` check — the DB doesn't enforce it, so running multiple kanban workers requires the distributed job locking pattern
 
 ## Code Example
 
 ```javascript
-// Complete dispatch cycle: API → kanban → satellite → streaming result
-async function runTask(task) {
-  return new Promise((resolve) => {
-    const startTime = Date.now();
-
-    const { client } = sendRun({
-      id: task.id,
-      prompt: task.prompt,
-      cwd: task.workdir,
-      model: task.model || 'sonnet',
-    }, {
-      onConnect() {
-        trackJob(task.id, task.jobId, startTime);
-      },
-      onChunk(msg) {
-        agentEvents.emit('chunk', { id: task.id, text: msg.chunk });
-      },
-      onDone(msg) {
-        const duration = (Date.now() - startTime) / 1000;
-        resolve({
-          success: msg.exit_code === 0,
-          duration,
-          output: msg.output,
-          exit_code: msg.exit_code,
-        });
-      },
-      onError(err) {
-        resolve({ success: false, error: err.message });
-      },
-    });
+// Complete dispatch cycle: submit task → DB queue → kanban pickup → subprocess → result
+async function dispatchAndWait(prompt, workdir, model) {
+  // 1. Enqueue to DB
+  const [task] = await enqueueTask({
+    prompt,
+    workdir,
+    model: model || 'sonnet',
+    priority: 'normal',
+    source: 'api',
   });
+
+  // 2. Poll for completion (kanban worker picks it up independently)
+  const result = await pollForCompletion(task.id, {
+    interval: 5000,
+    timeout: 30 * 60 * 1000,
+  });
+
+  return {
+    success: result.status === 'completed',
+    output: result.output,
+    exit_code: result.exit_code,
+    duration: (result.completed_at - result.started_at) / 1000,
+  };
+}
+
+async function pollForCompletion(taskId, { interval, timeout }) {
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    const task = await db('tasks').where({ id: taskId }).first();
+
+    if (task.status === 'completed' || task.status === 'failed') {
+      return task;
+    }
+
+    await sleep(interval);
+  }
+
+  throw new Error(`Task ${taskId} timed out after ${timeout}ms`);
 }
 ```
 
 ## Related Patterns
 
-- [Satellite Permission Escalation](./satellite-permission-escalation.md)
-- [Activity Tracking Architecture](./activity-tracking-architecture.md)
 - [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
 - [Worker Dispatcher and Priority Queue](./worker-dispatcher-and-priority-queue.md)
+- [Distributed Job Locking](./distributed-job-locking.md)

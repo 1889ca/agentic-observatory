@@ -18,7 +18,7 @@ Traditional scheduling for AI agents uses fixed cron jobs defined by humans. The
 
 ### API-Based Task Management
 
-The orchestrator exposes REST endpoints for creating, listing, triggering, and deleting scheduled tasks:
+The orchestrator exposes REST endpoints as part of its own HTTP API for creating, listing, triggering, and deleting scheduled tasks. These endpoints are called by agents running within the orchestrator context (e.g., satellites executing tasks), not as a standalone external service:
 
 ```javascript
 // routes.js
@@ -89,7 +89,7 @@ The `result_handler: 'task'` field routes completion results back to the task sy
 
 ### Dynamic Self-Scheduling During Execution
 
-Agents can create follow-up tasks during their own execution via HTTP API calls to the orchestrator. A morning review task might discover a failing build and schedule a follow-up check:
+Agents running as orchestrator satellites can create follow-up tasks during their own execution by calling back to the orchestrator's API. A morning review task might discover a failing build and schedule a follow-up check:
 
 ```javascript
 // Agent creates a follow-up task via REST API
@@ -124,7 +124,7 @@ Different tasks warrant different model capabilities:
 - Tasks enqueue to kanban rather than dispatching directly, so they respect the same concurrency limits and priority ordering as all other work
 - Cron expressions provide minute-level granularity but not sub-minute precision
 - Tasks persist in the database, surviving orchestrator restarts. The cron scheduler re-registers all enabled tasks on startup
-- Self-scheduled tasks are indistinguishable from human-created ones — the same REST API serves both
+- Self-scheduled tasks are indistinguishable from human-created ones — the same orchestrator API serves both
 - One-shot tasks require the agent to clean up after itself by calling `DELETE /api/tasks/:id`
 
 ## Code Example
@@ -132,7 +132,7 @@ Different tasks warrant different model capabilities:
 ```javascript
 // Complete lifecycle: create, fire, execute, clean up
 
-// 1. Human or agent creates a recurring task via API
+// 1. Human or agent creates a recurring task via the orchestrator's API
 await fetch('http://localhost:3847/api/tasks', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
@@ -169,5 +169,5 @@ await fetch('http://localhost:3847/api/tasks', {
 ## Related Patterns
 
 - [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
-- [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
+- [Distributed Job Locking](./distributed-job-locking.md)
 - [Worker Dispatcher and Priority Queue](./worker-dispatcher-and-priority-queue.md)

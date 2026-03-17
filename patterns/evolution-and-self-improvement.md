@@ -117,6 +117,7 @@ async function learn() {
   await patternDetector.scan();
 
   // 4. Check for skill promotion candidates
+  // NOTE: Designed but not yet operational — reflex promotion is not implemented in Riley
   await skillMatcher.evaluate();
 }
 ```
@@ -162,6 +163,7 @@ async function scheduledLearningCycle() {
   const candidates = await coactivation.analyzeCoactivation();
   for (const candidate of candidates) {
     if (candidate.frequency > SKILL_PROMOTION_THRESHOLD) {
+      // Aspirational: skill promotion from coactivation is designed but not yet implemented
       await proposeSKill(candidate);
     }
   }

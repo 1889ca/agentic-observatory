@@ -18,22 +18,27 @@ When an orchestrator dispatches work to AI agent workers (e.g., Claude Code inst
 
 ### Integrated Permission Checking in the Dispatch Cycle
 
-Permission escalation is part of the orchestrator's dispatch cycle, not an isolated flow. Before dispatching work, the orchestrator evaluates required permissions and uses the autonomy tier system (1=AUTO, 2=NOTIFY, 3=ASK) to gate escalation decisions:
+Permission escalation is part of the orchestrator's dispatch cycle, not an isolated flow. Before dispatching work, the orchestrator evaluates required permissions and uses confidence score thresholds (via `deliberative-alignment.js`) to gate escalation decisions:
+
+- Score >= 0.85: Auto-execute (high confidence)
+- Score >= 0.60: Execute with notification
+- Score >= 0.40: Execute with caution, log for review
+- Score < 0.40: Escalate to human
 
 ```javascript
 // Permission check integrated into dispatch planning
-// Autonomy tiers: 1=AUTO, 2=NOTIFY, 3=ASK
+// Confidence thresholds via deliberative-alignment.js
 async function planDispatch(job) {
   const requiredPerms = job.requiredPermissions ?? ['read'];
   const worker = findCompatibleWorker(job);
 
   if (worker) {
-    // Worker has all required permissions — dispatch based on autonomy tier
-    const tier = getAutonomyTier(job.decisionType);
-    if (tier === 3) {
-      await requestApproval({ job, reason: 'Tier 3 action requires approval' });
+    // Worker has all required permissions — dispatch based on confidence score
+    const confidence = await assessConfidence(job);
+    if (confidence < 0.40) {
+      await requestApproval({ job, reason: `Low confidence (${confidence}) — requires human approval` });
     }
-    return { action: 'dispatch', worker, tier };
+    return { action: 'dispatch', worker, confidence };
   }
 
   // No compatible worker — escalate permission request
@@ -51,7 +56,6 @@ const task = {
   id: 'apply-fixes',
   prompt: 'Apply the suggested code fixes',
   requiredPermissions: ['read', 'edit', 'write', 'bash'],
-  decisionType: 'code-change',  // maps to autonomy tier
 };
 
 function canWorkerHandle(worker, task) {
@@ -103,32 +107,34 @@ function reportFailure(jobId, failure) {
 }
 ```
 
-### Autonomy-Gated Fallback Strategies
+### Confidence-Gated Fallback Strategies
 
-When a permission block is detected, the fallback strategy is gated by the autonomy tier of the original decision:
+When a permission block is detected, the fallback strategy is gated by the confidence score from `deliberative-alignment.js`:
 
-1. **Tier 1 (AUTO)**: Silently retry with an elevated worker or decompose the task into safer sub-steps
-2. **Tier 2 (NOTIFY)**: Execute fallback and notify human after the fact
-3. **Tier 3 (ASK)**: Block and request human approval before attempting recovery
+- **>= 0.85 (high confidence)**: Silently retry with an elevated worker or decompose the task into safer sub-steps
+- **>= 0.60 (moderate confidence)**: Execute fallback and notify human after the fact
+- **>= 0.40 (low confidence)**: Execute with caution, log the recovery action for review
+- **< 0.40 (very low confidence)**: Block and request human approval before attempting recovery
 
 ```javascript
 async function handlePermissionBlock(job, failure) {
-  const tier = getAutonomyTier(job.decisionType);
+  const confidence = await assessConfidence(job);
 
-  if (tier === 3) {
-    // ASK — always escalate to human for approval
+  if (confidence < 0.40) {
+    // Very low confidence — always escalate to human for approval
     return await escalateToHuman(job, {
       reason: `Worker needs ${failure.toolCategory} access: ${failure.detail}`,
+      confidence,
       suggestion: 'Approve elevated permissions or apply changes manually',
     });
   }
 
-  // Tier 1 or 2 — attempt automatic recovery
+  // Confidence >= 0.40 — attempt automatic recovery
   const result = await decomposeOrRedispatch(job, failure);
 
-  if (tier === 2) {
-    // NOTIFY — inform human about the recovery action
-    await sendNotification({ job, failure, recovery: result });
+  if (confidence < 0.85) {
+    // Moderate/low confidence — notify human about the recovery action
+    await sendNotification({ job, failure, recovery: result, confidence });
   }
 
   return result;
@@ -147,12 +153,12 @@ async function handlePermissionBlock(job, failure) {
 ## Code Example
 
 ```javascript
-// Permission-aware dispatch cycle with autonomy tier integration
+// Permission-aware dispatch cycle with confidence-based gating
 async function dispatchWithPermissionHandling(job, maxRetries = 2) {
   const plan = await planDispatch(job);
 
   if (plan.action === 'escalate') {
-    // No compatible worker — escalate based on autonomy tier
+    // No compatible worker — escalate based on confidence score
     return await handlePermissionBlock(job, {
       type: 'permission_denied',
       toolCategory: plan.missing[0],
@@ -169,7 +175,7 @@ async function dispatchWithPermissionHandling(job, maxRetries = 2) {
     }
 
     if (result.status === 'blocked' && result.reason === 'permission_denied') {
-      log(`Job ${job.id} blocked on ${result.toolCategory} — attempt ${attempt + 1}`);
+      log(`Job ${job.id} blocked on ${result.toolCategory} (confidence: ${plan.confidence}) — attempt ${attempt + 1}`);
 
       if (result.recoverable) {
         job.requiredPermissions.push(result.toolCategory);
@@ -190,4 +196,4 @@ async function dispatchWithPermissionHandling(job, maxRetries = 2) {
 ## Related Patterns
 
 - [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
-- [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
+- [Deliberative Alignment](./deliberative-alignment.md)

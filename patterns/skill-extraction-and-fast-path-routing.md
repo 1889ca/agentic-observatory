@@ -104,19 +104,19 @@ Incoming Message
 
 ```javascript
 async function dispatch(message) {
-  // Speed 1: Reflex — deterministic, no LLM
+  // Speed 1: Reflex — deterministic, no LLM (ASPIRATIONAL: not yet implemented)
   const reflex = reflexRegistry.match(message);
   if (reflex) {
     return await executeReflex(reflex, message);
   }
 
-  // Speed 2: Skill — matched, LLM confirms and fills gaps
+  // Speed 2: Skill — matched, LLM confirms and fills gaps (operational)
   const skill = await matchSkill(message);
   if (skill && skill.confidence > 0.85) {
     return await executeWithSkillHint(skill, message);
   }
 
-  // Speed 3: Full pipeline — novel request
+  // Speed 3: Full pipeline — novel request (operational)
   return await fullPipeline(message);
 }
 ```
@@ -139,12 +139,12 @@ function onReflexFailure(reflex, error) {
 
 ## Implications
 
-- The embedding search adds ~50ms overhead to every message — acceptable given potential savings of seconds. Semantic skill matching is operational; reflex promotion and three-speed dispatch are planned but not yet active
+- The embedding search adds ~50ms overhead to every message — acceptable given potential savings of seconds. Semantic skill matching (Speed 2) is the only operational speed tier; reflex promotion (Speed 1) and LLM-free execution are designed but not yet implemented
 - False skill matches can cause incorrect fast-path routing — the 0.85 threshold is tunable
-- Reflex promotion (when implemented) would create behavior that's invisible to the LLM — debugging would require checking the reflex registry
+- Reflex promotion, if implemented, would create behavior invisible to the LLM — debugging would require checking the reflex registry
 - Pipeline signatures are brittle to tool renames — aliases help but don't fully solve this
-- The system gets faster over time but also more opaque — observability is critical
-- Promoted reflexes execute without LLM judgment, so they must be restricted to low-risk operations
+- Currently the system improves through better skill matching, not through reflex promotion — observability remains straightforward
+- Promoted reflexes, once implemented, would execute without LLM judgment and must be restricted to low-risk operations
 
 ## Code Example
 

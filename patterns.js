@@ -6,13 +6,13 @@ const PATTERNS = [
   {
     slug: "orchestrator-satellite-communication",
     title: "Orchestrator-Satellite Communication",
-    summary: "Unix socket protocol with JSONL streaming for real-time orchestrator-to-satellite job dispatch and output streaming.",
+    summary: "DB-backed task queue with subprocess spawning for orchestrator-to-satellite job dispatch and result collection.",
     status: "published",
   },
   {
     slug: "satellite-permission-escalation",
     title: "Satellite Permission Escalation",
-    summary: "Integrated permission checking in the dispatch cycle with autonomy-tier-gated escalation and structured failure reporting.",
+    summary: "Integrated permission checking in the dispatch cycle with confidence-score-gated escalation and structured failure reporting.",
     status: "published",
   },
   {
@@ -88,21 +88,9 @@ const PATTERNS = [
     status: "published",
   },
   {
-    slug: "inner-monologue-and-reflection",
-    title: "Inner Monologue and Reflection",
-    summary: "Private reflection cycle where an agent thinks without broadcasting, deciding what to surface and what to resolve internally.",
-    status: "published",
-  },
-  {
     slug: "decision-gating-and-autonomy-tiers",
     title: "Decision Gating and Autonomy Tiers",
     summary: "Numeric autonomy tiers (1=AUTO, 2=NOTIFY, 3=ASK) routing agent decisions with notification batching and audit trails.",
-    status: "published",
-  },
-  {
-    slug: "narrative-memory-generation",
-    title: "Narrative Memory Generation",
-    summary: "Convert structured operational data into story-form memories with semantic valence for richer retrieval and learning.",
     status: "published",
   },
   {
@@ -113,8 +101,8 @@ const PATTERNS = [
   },
   {
     slug: "plugin-system-and-hot-reload",
-    title: "Plugin System and Startup Loading",
-    summary: "Extensible plugin architecture with directory scanning, contribution registration, and context building at startup.",
+    title: "Plugin System and Hot-Reload",
+    summary: "Extensible plugin architecture with directory scanning, contribution registration, and file-watched hot-reload for dynamic capability updates.",
     status: "published",
   },
   {
@@ -229,6 +217,30 @@ const PATTERNS = [
     slug: "tenant-context-and-multi-tenancy",
     title: "Tenant Context and Multi-Tenancy",
     summary: "Request-scoped tenant isolation via async local storage with automatic database scoping and configuration partitioning.",
+    status: "published",
+  },
+  {
+    slug: "tool-interceptor-and-pre-execution-correction",
+    title: "Tool Interceptor and Pre-Execution Correction",
+    summary: "Shape-based type inference, parameter validation, and entity normalization applied before tool calls execute for proactive error prevention.",
+    status: "published",
+  },
+  {
+    slug: "pipeline-executor-and-workflow-composition",
+    title: "Pipeline Executor and Workflow Composition",
+    summary: "Operations-based pipeline composition (map, filter, transform, parse, split) with named pipeline storage and sequential execution.",
+    status: "published",
+  },
+  {
+    slug: "situation-detection-and-context-awareness",
+    title: "Situation Detection and Context Awareness",
+    summary: "Runtime situation tracking with detection rules, behavioral modifications, situation stacking, and TTL-based expiry.",
+    status: "published",
+  },
+  {
+    slug: "implicit-approval-parsing",
+    title: "Implicit Approval Parsing",
+    summary: "Natural language approval and denial detection with batch approval handling, qualified approval parsing, and context-gated activation.",
     status: "published",
   },
 ];

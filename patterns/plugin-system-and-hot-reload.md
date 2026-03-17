@@ -1,6 +1,6 @@
-# Plugin System and Startup Loading
+# Plugin System and Hot-Reload
 
-> Extensible plugin architecture with directory scanning, contribution registration, and context building at startup.
+> Extensible plugin architecture with directory scanning, contribution registration, hot-reload via file watching, and dynamic re-registration of capabilities.
 
 ## Problem
 
@@ -11,7 +11,7 @@ An AI orchestrator needs to grow its capabilities without modifying core code. H
 - An orchestrator that needs to support many independent capability modules
 - Each plugin may contribute tools, events, scheduled jobs, and HTTP routes
 - Plugins may depend on shared services (database, event bus, model dispatch)
-- New capabilities are added by dropping a plugin directory and restarting
+- New capabilities are added by dropping a plugin directory — no restart required
 
 ## Solution
 
@@ -93,14 +93,65 @@ function buildToolContext() {
 }
 ```
 
-### Startup-Only Loading
+### Hot-Reload via File Watching
 
-Plugins are loaded once at startup. There is no file watcher or hot-reload mechanism — adding or modifying a plugin requires a restart. This keeps the plugin lifecycle simple and avoids the complexity of clearing `require.cache`, managing stateful teardown, or handling partial reloads of plugins that hold connections.
+The plugin loader watches the plugins directory for changes. When a plugin file is added or modified, the loader clears `require.cache` for the changed module, re-requires it, and dynamically re-registers its tools, events, jobs, and routes:
+
+```javascript
+const chokidar = require('chokidar');
+
+function watchPlugins(pluginDir) {
+  const watcher = chokidar.watch(pluginDir, { ignoreInitial: true });
+
+  watcher.on('change', async (filePath) => {
+    const pluginName = path.basename(path.dirname(filePath));
+    log.info(`Plugin changed: ${pluginName}, reloading...`);
+
+    // Clear cached module so require() picks up the new version
+    const modulePath = require.resolve(path.join(pluginDir, pluginName));
+    delete require.cache[modulePath];
+
+    // Unregister old contributions
+    const old = loaded.get(pluginName);
+    if (old) {
+      old.tools?.forEach(t => toolRegistry.unregister(t.name));
+      old.events?.forEach(e => eventBus.off(e.event, e.handler));
+      old.jobs?.forEach(j => scheduler.unregister(j.id));
+      if (old.routes) routeManager.unmount(`/api/plugins/${pluginName}`);
+    }
+
+    // Re-require and re-register
+    const manifest = require(modulePath);
+    manifest.tools?.forEach(t => toolRegistry.register(t));
+    manifest.events?.forEach(e => eventBus.on(e.event, e.handler));
+    manifest.jobs?.forEach(j => scheduler.register(j));
+
+    if (manifest.routes) {
+      const router = express.Router();
+      manifest.routes(router);
+      routeManager.mount(`/api/plugins/${manifest.name}`, router);
+    }
+
+    loaded.set(manifest.name, manifest);
+    log.info(`Plugin reloaded: ${pluginName}`);
+  });
+
+  watcher.on('add', async (filePath) => {
+    // New plugin directory detected — load it
+    const pluginName = path.basename(path.dirname(filePath));
+    if (!loaded.has(pluginName)) {
+      await loadPlugin(pluginDir, pluginName);
+    }
+  });
+}
+```
+
+The route-manager handles dynamic mount/unmount of plugin routes so Express does not accumulate stale route handlers on reload.
 
 ## Implications
 
 - Plugins can introduce bugs that affect the whole system — sandboxing is limited to process-level isolation
-- Adding or updating a plugin requires a restart, which is acceptable for an orchestrator that starts up quickly
+- Hot-reload means a malformed plugin can take down registered tools mid-session — error handling during reload is critical
 - Route mounting at `/api/plugins/{name}/*` creates a clean namespace but limits URL flexibility
 - The registry pattern means all plugins must conform to a fixed interface — ad-hoc extensions are not supported
 - Plugin load order may matter if plugins depend on each other — no dependency resolution is built in
@@ -108,11 +159,12 @@ Plugins are loaded once at startup. There is no file watcher or hot-reload mecha
 ## Code Example
 
 ```javascript
-// Full plugin lifecycle
+// Full plugin lifecycle with hot-reload
 const pluginManager = {
   async init(pluginDir) {
     await loadPlugins(pluginDir);
-    log.info(`Loaded ${loaded.size} plugins with ${toolRegistry.size} tools`);
+    watchPlugins(pluginDir);
+    log.info(`Loaded ${loaded.size} plugins with ${toolRegistry.size} tools (watching for changes)`);
   },
 
   getTools() {
