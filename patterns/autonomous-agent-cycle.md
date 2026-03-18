@@ -57,7 +57,7 @@ async function tick(options = {}) {
 When ticks consistently exceed their time budget, the system reduces batch size to maintain throughput:
 
 ```javascript
-let batchSize = 20;
+let batchSize = 10;
 let consecutiveSlowTicks = 0;
 
 function adjustBackpressure(tickDuration) {
@@ -71,7 +71,7 @@ function adjustBackpressure(tickDuration) {
   } else {
     consecutiveSlowTicks = 0;
     // Gradually recover batch size
-    batchSize = Math.min(20, batchSize + 1);
+    batchSize = Math.min(10, batchSize + 1);
   }
 }
 ```

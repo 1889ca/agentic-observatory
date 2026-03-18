@@ -1,177 +1,229 @@
 # Activity Tracking Architecture
 
-> Three-layer tracking combining JSONL job logs, database session metadata, and in-memory rolling windows for real-time and historical activity visibility.
+> Session-based activity tracking using hierarchical agent sessions with inter-session messaging, tool permissions, and structured message history for real-time and historical visibility into agent execution.
 
 ## Problem
 
-With multiple satellite workers running concurrently, there's no unified view of what's happening. Activity data is scattered across individual process outputs, making it impossible to answer "what are my agents doing right now?" or "what happened in the last hour?" Different query patterns need different storage: real-time dashboards need in-memory speed, post-mortems need persistent logs, and aggregate views need structured metadata.
+With multiple agent workers running concurrently across different task types, there's no unified view of what's happening. Without structured session tracking, it's impossible to answer "what are my agents doing right now?", "what tools is this agent allowed to use?", or "what messages were exchanged between agents during this task?" Activity data needs to support both real-time monitoring and historical queries, with clear boundaries between concurrent execution contexts.
 
 ## Context
 
-- An orchestrator managing multiple concurrent satellite worker instances
-- Need for real-time dashboard showing agent activity
-- Historical queries for post-mortem debugging
-- Full replay capability for individual jobs
-- Memory-bounded constraints — can't store unbounded data in memory
+- An orchestrator managing multiple concurrent agent workers
+- Need for isolated execution contexts that prevent cross-task contamination
+- Parent-child relationships between sessions (an orchestrator session spawning worker sessions)
+- Per-session tool permissions — some agents should only access specific tools
+- Inter-session communication where agents can message each other
+- Real-time visibility into active sessions and historical queries for post-mortems
+- Sessions that can be paused, resumed, or terminated
 
 ## Solution
 
-The system uses a **three-layer tracking architecture**, each optimized for different query patterns:
+### Database Schema: agent_sessions and agent_session_messages
 
-### Layer 1: JSONL Job Logs (Full Replay)
-
-Each satellite job produces a JSONL log file organized by date:
-
-```
-data/satellite-logs/
-  2026-03-09/
-    job-abc123.jsonl
-    job-def456.jsonl
-```
-
-Each line is a structured event covering the full job lifecycle:
-
-```javascript
-// satellite/logging.js
-function appendToLog(jobId, event) {
-  const logDir = `data/satellite-logs/${formatDate(new Date())}`;
-  mkdirSync(logDir, { recursive: true });
-  const logPath = `${logDir}/${jobId}.jsonl`;
-  appendFileSync(logPath, JSON.stringify(event) + '\n');
-}
-
-// Three event types per job:
-{ type: 'meta', jobId, cwd, prompt, startedAt }    // Job start
-{ type: 'chunk', ts, text, stderr: false }           // Output stream
-{ type: 'finish', ts, exit_code, byteCount }         // Job end
-```
-
-This provides full replay capability for any individual job — every byte of output is preserved.
-
-### Layer 2: Database Session Metadata (Structured Queries)
-
-The orchestrator tracks structured metadata about each satellite session in a database table:
+Two tables provide the tracking backbone. `agent_sessions` tracks execution contexts with their permissions and hierarchy. `agent_session_messages` stores all communication within and between sessions:
 
 ```sql
-CREATE TABLE satellite_sessions (
-  job_id TEXT PRIMARY KEY,
-  task_id TEXT,
-  cwd TEXT,
-  project TEXT,
-  prompt TEXT,
-  status TEXT DEFAULT 'running',
-  exit_code INTEGER,
-  log_path TEXT,
-  byte_count INTEGER,
-  result_summary TEXT,
-  started_at TEXT,
-  ended_at TEXT,
-  duration REAL
+CREATE TABLE agent_sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID REFERENCES tenants(id),
+  name VARCHAR(100) NOT NULL,
+  parent_session_id UUID REFERENCES agent_sessions(id),  -- hierarchical
+  status VARCHAR(20) DEFAULT 'active',  -- active, terminated, paused
+  allowed_tools JSONB,   -- whitelist: ["tool_a", "tool_b"]
+  denied_tools JSONB,    -- blacklist: ["dangerous_tool"]
+  context JSONB,         -- arbitrary session metadata
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(tenant_id, name)
+);
+
+CREATE TABLE agent_session_messages (
+  id SERIAL PRIMARY KEY,
+  session_id UUID REFERENCES agent_sessions(id) ON DELETE CASCADE,
+  from_session_id UUID REFERENCES agent_sessions(id),  -- nullable for external input
+  role VARCHAR(20) NOT NULL,  -- user, assistant, system
+  content TEXT NOT NULL,
+  tool_calls JSONB,    -- structured record of tool invocations
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 ```
 
-This enables structured queries without parsing raw logs:
+### Session Lifecycle: spawn, execute, terminate
+
+Sessions are created with explicit tool permissions and optional parent linkage:
 
 ```javascript
-// "Show me all jobs for project X that failed in the last 24 hours"
-const failures = await db.query(`
-  SELECT * FROM satellite_sessions
-  WHERE project = $1 AND exit_code != 0
-    AND started_at > datetime('now', '-1 day')
-  ORDER BY started_at DESC
-`, [projectName]);
-```
+// lib/agent-sessions/index.js
 
-### Layer 3: In-Memory Rolling Window (Real-Time)
-
-An in-memory activity tracker provides instant snapshots with bounded memory usage:
-
-```javascript
-// activity-tracker.js
-const activityBuffers = new Map();
-const WINDOW_MS = 10 * 60 * 1000; // 10 minutes
-
-function recordActivity(key) {
-  if (!activityBuffers.has(key)) activityBuffers.set(key, []);
-  const buf = activityBuffers.get(key);
-  buf.push(Date.now());
-  // Prune entries outside the window
-  while (buf.length > 0 && buf[0] < Date.now() - WINDOW_MS) {
-    buf.shift();
-  }
+async function spawn(name, allowedTools, deniedTools, context) {
+  const session = await store.create({
+    name,
+    allowed_tools: allowedTools || [],
+    denied_tools: deniedTools || [],
+    context: context || {},
+    status: 'active',
+  });
+  return session;
 }
 
-// Heartbeat every 10s for active jobs
-setInterval(() => {
-  for (const run of getActiveRuns()) {
-    recordActivity(run.taskId);
-    if (run.satId) recordActivity(`sat:${run.satId}`);
-  }
-}, 10_000);
+async function terminate(sessionName) {
+  await store.updateByName(sessionName, {
+    status: 'terminated',
+    updated_at: new Date(),
+  });
+}
 ```
 
-### Real-Time Event Emission
+### Execution Within Session Context
 
-Active jobs emit events through the task runner for live UI updates:
+`runWithSession` scopes a function's execution to a specific session, making tool permission checks automatic:
 
 ```javascript
-// task-runner.js
-agentEvents.emit('start', { id: taskId, jobId, satId });
-agentEvents.emit('chunk', { id: taskId, text: chunk });
-agentEvents.emit('done', { id: taskId, output, exitCode, duration });
+// lib/agent-sessions/index.js
+
+async function runWithSession(sessionId, fn) {
+  const session = await store.getById(sessionId);
+  if (!session || session.status !== 'active') {
+    throw new Error(`Session ${sessionId} is not active`);
+  }
+
+  // Execute within session context — tool calls are gated
+  return fn({
+    sessionId,
+    isToolAllowed: (toolName) => isToolAllowedInContext(session, toolName),
+    send: (to, message, awaitReply) => send(to, message, awaitReply),
+    reply: (threadId, message) => reply(threadId, message),
+  });
+}
+
+function isToolAllowedInContext(session, toolName) {
+  if (session.denied_tools?.includes(toolName)) return false;
+  if (session.allowed_tools?.length > 0) {
+    return session.allowed_tools.includes(toolName);
+  }
+  return true;  // no whitelist = all allowed (minus blacklist)
+}
 ```
 
-### Correlation
+### Inter-Session Messaging
 
-All three layers share `jobId` as a correlation key, enabling drill-down:
+Agents communicate through structured messages stored in `agent_session_messages`. The `from_session_id` field tracks which session originated each message, enabling conversation reconstruction:
 
+```javascript
+// lib/agent-sessions/index.js
+
+async function send(toSessionName, message, awaitReply = false) {
+  const target = await store.getByName(toSessionName);
+  if (!target) throw new Error(`Session '${toSessionName}' not found`);
+
+  const msg = await store.insertMessage({
+    session_id: target.id,
+    from_session_id: currentSessionId(),
+    role: 'user',
+    content: message,
+  });
+
+  if (awaitReply) {
+    return pollForReply(target.id, msg.id);
+  }
+
+  return msg;
+}
+
+async function reply(threadId, message) {
+  const original = await store.getMessageById(threadId);
+  return store.insertMessage({
+    session_id: original.from_session_id,  // reply goes back to sender
+    from_session_id: currentSessionId(),
+    role: 'assistant',
+    content: message,
+  });
+}
 ```
-Dashboard (Layer 3: in-memory)
-  → Session record (Layer 2: database)
-    → Full JSONL log (Layer 1: file)
+
+### Message History and Querying
+
+Session history supports pagination for both real-time tailing and historical review:
+
+```javascript
+// lib/agent-sessions/index.js
+
+async function getHistory(sessionName, limit = 50, offset = 0) {
+  const session = await store.getByName(sessionName);
+  return store.getMessages(session.id, { limit, offset });
+}
 ```
+
+### Parent-Child Session Hierarchy
+
+Sessions can spawn child sessions, creating a tree that mirrors task decomposition:
+
+```javascript
+// Orchestrator spawns a scoped worker session
+const parentSession = await spawn('orchestrator-main', null, null, {
+  role: 'orchestrator',
+});
+
+const workerSession = await spawn('worker-issue-42', ['git', 'file_read', 'file_write'], ['deploy'], {
+  role: 'worker',
+  parent_session_id: parentSession.id,
+  task: 'Resolve issue #42',
+});
+```
+
+This hierarchy enables queries like "show me all sessions spawned by the orchestrator" or "what tool calls did the child sessions make?"
 
 ## Implications
 
-- JSONL logs grow per day — needs periodic cleanup or archival (log rotation not yet automated)
-- Database session metadata enables fast aggregate queries (by project, by status, by date range) without scanning log files
-- In-memory rolling window provides instant response for "what's active now?" but loses data on restart
-- The 10-minute window is a trade-off: long enough to detect stalls, short enough to bound memory
-- Byte count is a rough proxy for "how much work happened" — not all bytes represent equal effort
-- No cross-day aggregation without explicit queries — each day's logs are isolated files
+- Session-based tracking replaces file-based JSONL logs — all activity is queryable via SQL, no log parsing required
+- The `allowed_tools` / `denied_tools` JSONB fields provide per-session sandboxing without a separate permissions system
+- Parent-child relationships enable hierarchical queries (all activity under a given orchestrator run) and scoped cleanup (terminating a parent can cascade to children)
+- Inter-session messaging creates a structured audit trail of agent-to-agent communication, unlike fire-and-forget event emission
+- The `awaitReply` flag on `send` enables both synchronous request-response and asynchronous fire-and-forget patterns between sessions
+- `tool_calls` JSONB on messages captures structured tool invocation data alongside natural language content, supporting both human review and programmatic analysis
+- The UNIQUE constraint on `(tenant_id, name)` prevents duplicate session names within a tenant, avoiding confusion in multi-session environments
+- Session status (active/terminated/paused) enables graceful lifecycle management — paused sessions can be resumed without losing their message history or permissions
 
 ## Code Example
 
 ```javascript
-// Three layers working together for a single job lifecycle:
+// Full session lifecycle: spawn → execute with tool gating → communicate → query → terminate
 
-// 1. Job starts — all three layers record it
-activeRuns.set(taskId, { jobId, startTime: Date.now() });
-agentEvents.emit('start', { id: taskId, jobId });
-await db.query(
-  `INSERT INTO satellite_sessions (job_id, task_id, cwd, project, prompt, status, started_at)
-   VALUES ($1, $2, $3, $4, $5, 'running', $6)`,
-  [jobId, taskId, cwd, project, prompt, new Date().toISOString()]
-);
-appendToLog(jobId, { type: 'meta', jobId, cwd, prompt, startedAt: new Date() });
+async function runIsolatedWorker(taskName, allowedTools, task) {
+  // 1. Spawn isolated session with tool permissions
+  const session = await spawn(taskName, allowedTools, ['deploy', 'db_migrate'], {
+    task_type: task.type,
+    document_id: task.documentId,
+  });
 
-// 2. Output streams — Layer 1 (file) and Layer 3 (events)
-appendToLog(jobId, { type: 'chunk', ts: Date.now(), text: chunk });
-agentEvents.emit('chunk', { id: taskId, text: chunk });
-recordActivity(taskId);
+  // 2. Execute within session context
+  const result = await runWithSession(session.id, async (ctx) => {
+    // Tool calls are gated by session permissions
+    if (!ctx.isToolAllowed('git')) {
+      throw new Error('git not permitted in this session');
+    }
 
-// 3. Job completes — all three layers close out
-appendToLog(jobId, { type: 'finish', ts: Date.now(), exit_code: exitCode, byteCount });
-await db.query(
-  `UPDATE satellite_sessions SET status = $1, exit_code = $2, byte_count = $3,
-   ended_at = $4, duration = $5 WHERE job_id = $6`,
-  [exitCode === 0 ? 'completed' : 'failed', exitCode, byteCount, new Date().toISOString(), duration, jobId]
-);
-agentEvents.emit('done', { id: taskId, output, exitCode, duration });
-activeRuns.delete(taskId);
+    // Inter-session messaging
+    await ctx.send('orchestrator-main', `Starting work on ${taskName}`);
+
+    const output = await executeTask(task, ctx);
+
+    await ctx.send('orchestrator-main', `Completed ${taskName}: ${output.summary}`);
+    return output;
+  });
+
+  // 3. Query session history for audit
+  const history = await getHistory(taskName, 100);
+  console.log(`Session had ${history.length} messages`);
+
+  // 4. Terminate session
+  await terminate(taskName);
+
+  return result;
+}
 ```
 
 ## Related Patterns
 
-- [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
+- [Orchestrator-Worker Communication](./orchestrator-satellite-communication.md)
 - [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)

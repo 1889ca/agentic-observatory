@@ -1,266 +1,192 @@
 # Deliberative Alignment
 
-> Value-action comparison ensuring agent behavior aligns with stated preferences through pre-execution conflict detection.
+> Multi-model voting system for borderline autonomy decisions, dispatching to multiple agents for EXECUTE/QUEUE consensus in the notify band.
 
 ## Problem
 
-An autonomous agent that acts on user intent without checking against user preferences will eventually violate boundaries the user assumed were obvious. A scheduling agent sends a notification at 3am. A coding agent force-pushes to main. A messaging agent shares a private draft with a public channel. These aren't capability failures — the agent has the skill to do what was asked. They're alignment failures — the agent didn't check whether the action conflicted with the user's values, preferences, or rules. The more autonomous an agent becomes, the more critical this pre-flight check is.
+An autonomous agent with confidence-based autonomy gating has three clear zones: high confidence (auto-execute), low confidence (queue for human), and a messy middle. The "notify" band (0.60-0.85) is where the hardest decisions live — the agent is somewhat confident but not enough to act unilaterally. A single model's judgment in this band is unreliable. Defaulting to queue wastes human attention on actions the agent could handle. Defaulting to execute risks overstepping. The system needs a tiebreaker that's better than a coin flip but cheaper than a human.
 
 ## Context
 
-- An agent that takes real-world actions (sends messages, modifies files, makes API calls)
-- A user or organization with stated preferences, rules, or constraints
-- Preferences that may be implicit, contextual, or time-dependent
-- Actions that vary in reversibility and impact severity
-- A need for the agent to flag conflicts rather than silently comply or silently refuse
+- An agent with numeric confidence scoring for tool decisions
+- Three decision bands: execute (>= 0.85), notify (0.60-0.85), queue (< 0.60)
+- Multiple AI models available as voting agents
+- Actions in the notify band that are neither clearly safe nor clearly dangerous
+- A need to reduce false escalations without increasing unauthorized actions
+- Privacy constraints — tool arguments may contain PII or secrets
 
 ## Solution
 
-### Preference Store
+### Trigger Condition
 
-Preferences are stored as structured rules with conditions, not just flat text. Each preference has a scope, priority, and optional temporal constraint:
+Deliberative alignment only activates for decisions in the notify band. High-confidence and low-confidence decisions bypass it entirely:
 
 ```javascript
-const preferenceStore = {
-  async load(tenantId) {
-    const prefs = await db.preferences.findMany({
-      where: { tenantId, enabled: true },
-      orderBy: { priority: 'desc' }
-    });
-
-    return prefs.map(p => ({
-      id: p.id,
-      rule: p.rule,
-      scope: p.scope,           // 'global' | 'channel' | 'tool'
-      condition: p.condition,    // optional JS predicate string
-      priority: p.priority,      // higher = harder to override
-      temporal: p.temporal,      // { after: '22:00', before: '08:00', tz: 'America/New_York' }
-      resolution: p.resolution   // 'block' | 'modify' | 'escalate' | 'warn'
-    }));
-  }
+// Decision boundaries
+const THRESHOLDS = {
+  execute: 0.85,  // >= 0.85: auto-execute, no vote needed
+  notify: 0.60,   // >= 0.60: trigger deliberative alignment
+  queue: 0.40,    // >= 0.40: queue for review
+  // < 0.40: queue immediately
 };
+
+function shouldDeliberate(confidence) {
+  return confidence >= THRESHOLDS.notify && confidence < THRESHOLDS.execute;
+}
 ```
 
-### Action Proposal
+### Multi-Model Vote Dispatch
 
-Before execution, every action is wrapped in a proposal object that describes what the agent intends to do:
+When a tool decision lands in the notify band, the system dispatches the decision context to multiple available agents. Each agent is asked a simple binary question: EXECUTE or QUEUE?
 
 ```javascript
-function createProposal(action) {
-  return {
-    id: crypto.randomUUID(),
-    tool: action.tool,
-    params: action.params,
-    intent: action.intent,
-    timestamp: Date.now(),
-    metadata: {
-      channel: action.channel,
-      recipients: action.recipients || [],
-      reversible: action.reversible ?? true,
-      impact: estimateImpact(action)
-    }
+const DEFAULT_TIMEOUT_MS = 45000;
+const DEFAULT_MIN_AGENTS = 2;
+
+async function deliberate(toolName, context, options = {}) {
+  const {
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    minAgents = DEFAULT_MIN_AGENTS,
+    requireUnanimous = false,
+  } = options;
+
+  // Never log raw tool args — may contain PII/secrets
+  const sanitizedContext = {
+    tool: toolName,
+    description: context.description,
+    confidence: context.confidence,
   };
-}
 
-function estimateImpact(action) {
-  const irreversibleTools = ['git_push_force', 'delete_production', 'send_email'];
-  const broadcastTools = ['send_channel_message', 'deploy', 'publish'];
+  const agents = getAvailableAgents();
 
-  if (irreversibleTools.includes(action.tool)) return 'critical';
-  if (broadcastTools.includes(action.tool)) return 'high';
-  return 'standard';
+  if (agents.length < minAgents) {
+    // Insufficient agents — default to queue (safety)
+    return { decision: 'QUEUE', reason: 'insufficient_agents' };
+  }
+
+  const prompt = buildVotePrompt(sanitizedContext);
+  const votes = await collectVotes(agents, prompt, timeoutMs);
+
+  return tallyVotes(votes, { requireUnanimous });
 }
 ```
 
-### Conflict Detection
+### Vote Collection and Parsing
 
-The alignment engine compares each proposal against all applicable preferences, evaluating both static rules and temporal conditions:
+Each agent's response is parsed for a structured DECISION line. Agents that time out or error are counted as QUEUE votes (safe default):
 
 ```javascript
-async function detectConflicts(proposal, preferences) {
-  const conflicts = [];
+async function collectVotes(agents, prompt, timeoutMs) {
+  const results = await Promise.allSettled(
+    agents.map(agent =>
+      Promise.race([
+        agent.ask(prompt),
+        timeout(timeoutMs),
+      ])
+    )
+  );
 
-  for (const pref of preferences) {
-    // Scope filtering — skip preferences that don't apply
-    if (pref.scope === 'tool' && !pref.rule.includes(proposal.tool)) continue;
-    if (pref.scope === 'channel' && pref.channel !== proposal.metadata.channel) continue;
-
-    // Temporal check
-    if (pref.temporal && isWithinTimeWindow(pref.temporal)) {
-      const violation = evaluateTemporalRule(proposal, pref);
-      if (violation) {
-        conflicts.push({
-          preference: pref,
-          type: 'temporal',
-          message: violation.message,
-          resolution: pref.resolution
-        });
-      }
+  return results.map((result, i) => {
+    if (result.status === 'rejected') {
+      // Timeout or error — counted as QUEUE (safe default)
+      return { agent: agents[i].id, vote: 'QUEUE', reason: 'timeout_or_error' };
     }
 
-    // Semantic check — use LLM to evaluate natural-language rules
-    if (pref.condition) {
-      const result = await evaluateCondition(pref.condition, proposal);
-      if (result.violated) {
-        conflicts.push({
-          preference: pref,
-          type: 'semantic',
-          message: result.explanation,
-          resolution: pref.resolution
-        });
-      }
-    }
-  }
-
-  return conflicts;
+    return parseVote(agents[i].id, result.value);
+  });
 }
 
-function isWithinTimeWindow(temporal) {
-  const now = new Date().toLocaleTimeString('en-US', {
-    hour12: false,
-    timeZone: temporal.tz
-  });
-  return now >= temporal.after || now <= temporal.before;
+function parseVote(agentId, response) {
+  // Look for DECISION: EXECUTE|QUEUE|ESCALATE
+  const match = response.match(/DECISION:\s*(EXECUTE|QUEUE|ESCALATE)/i);
+
+  if (!match) {
+    return { agent: agentId, vote: 'QUEUE', reason: 'unparseable' };
+  }
+
+  const raw = match[1].toUpperCase();
+  // ESCALATE is treated as QUEUE
+  const vote = raw === 'ESCALATE' ? 'QUEUE' : raw;
+
+  return { agent: agentId, vote, reason: raw === 'ESCALATE' ? 'escalate_as_queue' : 'explicit' };
 }
 ```
 
-### Resolution Strategies
+### Vote Tallying
 
-When conflicts are detected, the system applies the resolution strategy specified by the preference:
+Two modes: unanimous (all must agree to execute) and majority (ties default to queue):
 
 ```javascript
-async function resolveConflicts(proposal, conflicts) {
-  if (conflicts.length === 0) return { action: 'proceed', proposal };
+function tallyVotes(votes, { requireUnanimous = false }) {
+  const executeCount = votes.filter(v => v.vote === 'EXECUTE').length;
+  const queueCount = votes.filter(v => v.vote === 'QUEUE').length;
 
-  // Sort by preference priority — highest priority conflict wins
-  conflicts.sort((a, b) => b.preference.priority - a.preference.priority);
-  const primary = conflicts[0];
-
-  switch (primary.resolution) {
-    case 'block':
-      return {
-        action: 'blocked',
-        reason: primary.message,
-        conflicts
-      };
-
-    case 'modify':
-      const modified = await suggestModification(proposal, primary);
-      return {
-        action: 'modified',
-        original: proposal,
-        proposal: modified,
-        reason: primary.message
-      };
-
-    case 'escalate':
-      return {
-        action: 'escalated',
-        proposal,
-        conflicts,
-        approvalRequired: true
-      };
-
-    case 'warn':
-      return {
-        action: 'proceed_with_warning',
-        proposal,
-        warnings: conflicts.map(c => c.message)
-      };
-  }
-}
-
-async function suggestModification(proposal, conflict) {
-  // Example: reschedule a message to an acceptable time
-  if (conflict.type === 'temporal') {
-    const nextWindow = computeNextAllowedWindow(conflict.preference.temporal);
-    return {
-      ...proposal,
-      params: { ...proposal.params, scheduledAt: nextWindow },
-      modified: true,
-      modificationReason: conflict.message
-    };
+  if (requireUnanimous) {
+    // All votes must be EXECUTE; any QUEUE = QUEUE
+    const decision = queueCount === 0 ? 'EXECUTE' : 'QUEUE';
+    return { decision, votes, mode: 'unanimous' };
   }
 
-  // Fallback: ask LLM for a modified version
-  return await llm.complete({
-    system: 'Modify this action to satisfy the constraint without losing the user intent.',
-    messages: [{ role: 'user', content: JSON.stringify({ proposal, conflict }) }]
-  });
+  // Majority vote — ties default to QUEUE
+  if (executeCount > queueCount) {
+    return { decision: 'EXECUTE', votes, mode: 'majority' };
+  }
+
+  return { decision: 'QUEUE', votes, mode: 'majority' };
 }
 ```
 
-### Integration Point
+### Configuration
 
-The alignment check sits between intent resolution and execution in the agent's main loop:
+Controlled via environment variables with sensible defaults:
 
 ```javascript
-async function executeWithAlignment(action, tenantId) {
-  const proposal = createProposal(action);
-  const preferences = await preferenceStore.load(tenantId);
-  const conflicts = await detectConflicts(proposal, preferences);
-  const resolution = await resolveConflicts(proposal, conflicts);
-
-  switch (resolution.action) {
-    case 'proceed':
-    case 'proceed_with_warning':
-      return await executeTool(resolution.proposal);
-
-    case 'modified':
-      return await executeTool(resolution.proposal);
-
-    case 'blocked':
-      return { status: 'blocked', reason: resolution.reason };
-
-    case 'escalated':
-      return await requestHumanApproval(resolution);
-  }
-}
+const config = {
+  enabled: process.env.RILEY_DELIBERATIVE_ALIGNMENT_ENABLED === 'true',
+  timeoutMs: parseInt(process.env.RILEY_DELIBERATIVE_ALIGNMENT_TIMEOUT_MS) || 45000,
+  minAgents: parseInt(process.env.RILEY_DELIBERATIVE_ALIGNMENT_MIN_AGENTS) || 2,
+  requireUnanimous: process.env.RILEY_DELIBERATIVE_ALIGNMENT_REQUIRE_UNANIMOUS === 'true',
+  models: process.env.RILEY_DELIBERATIVE_ALIGNMENT_MODELS?.split(',') || [],
+};
 ```
 
 ## Implications
 
-- Semantic conflict detection requires an LLM call per preference per action — batching helps but adds latency
-- Natural-language preferences are inherently ambiguous; the system will produce both false positives and false negatives
-- Temporal rules depend on accurate timezone handling and clock synchronization
-- The "modify" resolution strategy may alter user intent in unexpected ways — always surface modifications
-- Preference priority ordering is critical; conflicting preferences without clear priority cause unpredictable behavior
-- This pattern works best with a small, curated set of high-signal preferences rather than an exhaustive rule list
+- Adds 0-45 seconds of latency to every notify-band decision — unacceptable for time-sensitive actions without a fast-path override
+- Requires at least 2 available agents; if the model pool shrinks below minimum, all notify-band decisions default to queue
+- ESCALATE votes from agents are treated as QUEUE — the system does not have a separate escalation path from deliberation
+- Never logging raw tool arguments is a hard privacy constraint that limits the quality of agent voting context
+- Unanimous mode is safer but produces more false queues; majority mode is faster but risks a single model's bad judgment tipping the balance
+- The 0.60-0.85 band width is a design choice — too narrow and deliberation rarely triggers, too wide and it becomes a bottleneck
+- Ties defaulting to QUEUE means the system is biased toward caution, which is appropriate for autonomy decisions
 
 ## Code Example
 
 ```javascript
-// Preference definition examples
-const preferences = [
-  {
-    id: 'quiet-hours',
-    rule: 'No notifications between 10pm and 8am',
-    scope: 'global',
-    temporal: { after: '22:00', before: '08:00', tz: 'America/New_York' },
-    priority: 90,
-    resolution: 'modify'  // reschedule, don't block
-  },
-  {
-    id: 'no-force-push',
-    rule: 'Never force-push to main or production branches',
-    scope: 'tool',
-    condition: 'action.tool === "git_push" && action.params.force && ["main", "production"].includes(action.params.branch)',
-    priority: 100,
-    resolution: 'block'
-  },
-  {
-    id: 'draft-review',
-    rule: 'External-facing content must be reviewed before sending',
-    scope: 'channel',
-    condition: 'action.metadata.recipients.some(r => r.external)',
-    priority: 80,
-    resolution: 'escalate'
+// Integration with the autonomy gating system
+async function gateToolExecution(toolName, context) {
+  const confidence = context.confidence;
+
+  if (confidence >= 0.85) {
+    return { action: 'execute' };
   }
-];
+
+  if (confidence >= 0.60 && config.enabled) {
+    const result = await deliberate(toolName, context, config);
+
+    if (result.decision === 'EXECUTE') {
+      return { action: 'execute', deliberation: result };
+    }
+
+    return { action: 'queue', deliberation: result };
+  }
+
+  return { action: 'queue' };
+}
 ```
 
 ## Related Patterns
 
 - [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
 - [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)
-- [Inner Monologue and Reflection](./inner-monologue-and-reflection.md)
+- [Multi-Model Deliberation](./multi-model-deliberation.md)

@@ -21,13 +21,14 @@ An orchestrator receives events from many sources — user messages, task result
 Each event type is assigned a static weight. When the dispatcher ticks, it evaluates all pending items and processes highest-weight items first:
 
 ```javascript
-// cognitive/processor.js
+// worker/dispatcher.js
 const SOURCE_WEIGHTS = {
-  message:      90,  // Highest: human is waiting for a response
-  task_result:  80,  // Completed work needs processing before new dispatch
-  webhook:      70,  // External event, time-sensitive
-  scheduled:    50,  // Important but expected, can wait briefly
-  ambient:      30,  // Lowest: background activity, observations
+  user_request:        90,  // Highest: human is waiting for a response
+  retry_failed:        80,  // Previously failed work deserves quick retry
+  github_issue_ready:  70,  // Issue marked ready, time-sensitive
+  coding_todo:         50,  // Scheduled coding work
+  github_issue:        40,  // General issue triage
+  health_check:        30,  // Lowest: background health monitoring
 };
 
 function getWeight(item) {
@@ -39,65 +40,59 @@ function sortByPriority(items) {
 }
 ```
 
-### Resource-Level Locking
+### Conflict Check
 
-Before dispatching a worker to a resource, the dispatcher checks whether another worker is already operating on that resource. This prevents concurrent operations that would cause conflicts:
+Before dispatching a worker to a repository, the dispatcher checks for conflicts based on task type. Worktree-isolated task types (`solve_issue`, `solve-issue`, `self-improve`, `coding`) can safely run in parallel on the same repo because each operates in its own git worktree. Non-worktree tasks require exclusive access:
 
 ```javascript
-// worker/repo-lock.js
-const activeResources = new Map(); // resource → { workerId, startedAt }
+// worker/conflict-check.js
+const WORKTREE_TASK_TYPES = ['solve_issue', 'solve-issue', 'self-improve', 'coding'];
 
-function canDispatch(item) {
-  const resource = item.resource || item.workdir;
-  if (!resource) return true; // No resource context — allow
+function canDispatch(item, runningRepos) {
+  const repo = item.resource || item.workdir;
+  if (!repo) return true;
 
-  if (activeResources.has(resource)) {
-    // Exception: isolated tasks can run in parallel
-    if (item.isolation === 'isolated') return true;
+  const running = runningRepos.get(repo);
+  if (!running) return true;
 
-    audit.log('dispatcher:skip_item', {
-      reason: 'resource_in_use',
-      resource,
-      source: item.source,
-    });
-    return false;
+  // Multiple worktree tasks on same repo = safe, can run parallel
+  if (WORKTREE_TASK_TYPES.includes(item.taskType) &&
+      running.every(r => WORKTREE_TASK_TYPES.includes(r.taskType))) {
+    return true;
   }
 
-  return true;
-}
-
-function lockResource(resource, workerId) {
-  activeResources.set(resource, { workerId, startedAt: Date.now() });
-}
-
-function unlockResource(resource) {
-  activeResources.delete(resource);
+  // One non-worktree task on repo = defer other tasks (potential conflict)
+  audit.log('dispatcher:skip_item', {
+    reason: 'repo_conflict',
+    repo,
+    source: item.source,
+  });
+  return false;
 }
 ```
 
 ### Dispatch Loop
 
-The dispatcher runs on a tick interval, evaluating pending work and dispatching to available workers:
+The dispatcher collects work from all sources via `identifyWork()`, filters by parallel limits, budget, and conflicts, then dispatches the highest-scoring items:
 
 ```javascript
-async function tick() {
-  const pending = await getPendingItems();
-  const sorted = sortByPriority(pending);
+async function dispatch() {
+  const candidates = await identifyWork();  // Collect from all sources with weights
+  const sorted = sortByPriority(candidates);
   const availableWorkers = getAvailableWorkerCount();
 
   let dispatched = 0;
 
   for (const item of sorted) {
     if (dispatched >= availableWorkers) break;
-    if (!canDispatch(item)) continue;
+    if (!canDispatch(item, runningRepos)) continue;
 
-    const resource = item.resource || item.workdir;
-    if (resource) lockResource(resource, item.id);
+    // Track running repos to prevent simultaneous non-worktree tasks
+    trackRepo(item);
 
     await dispatchToWorker(item);
     dispatched++;
 
-    // Track budget
     recordDispatchCost(item);
   }
 }
@@ -129,7 +124,7 @@ function recordDispatchCost(item) {
 A global cap prevents overloading the machine:
 
 ```javascript
-const MAX_PARALLEL_WORKERS = parseInt(process.env.MAX_WORKERS || '4');
+const MAX_PARALLEL_WORKERS = parseInt(process.env.MAX_PARALLEL_WORKERS) || 3;
 
 function getAvailableWorkerCount() {
   const active = getActiveWorkerCount();
@@ -155,7 +150,7 @@ audit.log('dispatcher:dispatch', {
 ## Implications
 
 - Static weights are simple but inflexible — a user message always beats a webhook, even if the webhook is critical and the message is trivial. Dynamic weight adjustment could address this but adds complexity.
-- Resource-level locking is coarse — two workers could safely operate on different parts of the same resource, but the lock prevents it. The isolation exception handles the most common safe-parallel case.
+- Conflict checking distinguishes worktree-isolated tasks (which can run in parallel on the same repo) from non-worktree tasks (which require exclusive access). This handles the most common safe-parallel case without over-locking.
 - Budget tracking is advisory (warns but doesn't stop) — hard budget enforcement would require a policy decision about which events to drop.
 - The tick interval creates a maximum latency of one tick between an event arriving and dispatch. Sub-second dispatch requires a tighter interval at the cost of more CPU.
 - Audit logging enables replay and diagnosis but generates volume — needs rotation or aggregation.
@@ -164,30 +159,28 @@ audit.log('dispatcher:dispatch', {
 ## Code Example
 
 ```javascript
-// Complete dispatch cycle with priority, locking, and budget
+// Complete dispatch cycle with priority, conflict checks, and budget
 async function dispatchCycle() {
-  const pending = sortByPriority(await getPendingItems());
+  const candidates = sortByPriority(await identifyWork());
   const available = getAvailableWorkerCount();
 
-  for (const item of pending.slice(0, available)) {
-    const resource = item.resource || item.workdir;
+  for (const item of candidates.slice(0, available)) {
+    const repo = item.resource || item.workdir;
 
-    // Skip if resource is busy (unless isolated)
-    if (resource && activeResources.has(resource) && item.isolation !== 'isolated') {
-      continue;
-    }
+    // Skip if repo has a conflict (non-worktree task running)
+    if (!canDispatch(item, runningRepos)) continue;
 
-    // Lock resource and dispatch
-    if (resource) lockResource(resource, item.id);
+    // Track repo and dispatch
+    if (repo) trackRepo(item);
 
     audit.log('dispatcher:dispatch', {
       source: item.source,
       weight: getWeight(item),
-      resource,
+      repo,
     });
 
     dispatchToWorker(item).finally(() => {
-      if (resource) unlockResource(resource);
+      if (repo) untrackRepo(item);
     });
 
     recordDispatchCost(item);

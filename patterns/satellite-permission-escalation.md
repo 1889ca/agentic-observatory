@@ -1,199 +1,202 @@
-# Satellite Permission Escalation
+# Worker Permission Escalation
 
-> Handling permission boundaries in multi-agent dispatch so blocked workers report why, not just that they failed.
+> Multi-model voting mechanism for escalating worker actions that fall in the borderline autonomy band, using deliberative alignment for EXECUTE/QUEUE consensus.
 
 ## Problem
 
-When an orchestrator dispatches work to AI agent workers (e.g., Claude Code instances), those workers operate within permission boundaries — tool restrictions, file access limits, network constraints, approval gates. From the orchestrator's perspective, a permission block is indistinguishable from a crash or timeout: the worker simply stops producing output. This creates silent failures where the orchestrator retries work that can never succeed, wastes worker slots, and has no diagnostic signal to inform alternative strategies.
+When a worker agent needs to perform an action that sits between "clearly allowed" and "clearly needs human approval," the system has no good default. Auto-executing risks overstepping. Auto-queuing wastes human attention. A single model's judgment on borderline cases is unreliable. The system needs a structured escalation path that resolves ambiguity without always punting to the user.
 
 ## Context
 
-- Multi-agent systems where an orchestrator dispatches tasks to AI agent workers
-- Workers running with varying permission configurations (full auto-accept, selective approval, manual-only)
-- Long-running tasks that span multiple tool categories (file reads, writes, shell execution, network access)
-- Workers that cannot programmatically grant themselves additional permissions mid-session
-- Need to distinguish between "worker is stuck on permissions" and "worker crashed" and "worker is just slow"
+- Workers executing tool calls with varying levels of risk and reversibility
+- A confidence scoring system that produces a numeric score for each action
+- A "notify" band (0.60-0.85) where actions are neither clearly safe nor clearly dangerous
+- Multiple AI models available to participate in voting
+- The need for a safe default when the voting system itself fails (timeouts, insufficient agents)
 
 ## Solution
 
-### Integrated Permission Checking in the Dispatch Cycle
+### Permission Escalation via Deliberative Alignment
 
-Permission escalation is part of the orchestrator's dispatch cycle, not an isolated flow. Before dispatching work, the orchestrator evaluates required permissions and uses confidence score thresholds (via `deliberative-alignment.js`) to gate escalation decisions:
-
-- Score >= 0.85: Auto-execute (high confidence)
-- Score >= 0.60: Execute with notification
-- Score >= 0.40: Execute with caution, log for review
-- Score < 0.40: Escalate to human
+Permission escalation is not a standalone module — it is integrated into the confidence-based autonomy system through deliberative alignment. When a tool decision's confidence score falls in the notify band, the system dispatches the decision to multiple agents for a vote:
 
 ```javascript
-// Permission check integrated into dispatch planning
-// Confidence thresholds via deliberative-alignment.js
-async function planDispatch(job) {
-  const requiredPerms = job.requiredPermissions ?? ['read'];
-  const worker = findCompatibleWorker(job);
+async function escalatePermission(toolName, context) {
+  const confidence = context.confidence;
 
-  if (worker) {
-    // Worker has all required permissions — dispatch based on confidence score
-    const confidence = await assessConfidence(job);
-    if (confidence < 0.40) {
-      await requestApproval({ job, reason: `Low confidence (${confidence}) — requires human approval` });
+  // High confidence — no escalation needed
+  if (confidence >= 0.85) {
+    return { action: 'execute', method: 'auto' };
+  }
+
+  // Notify band — use multi-model voting
+  if (confidence >= 0.60) {
+    const result = await deliberate(toolName, context);
+
+    if (result.decision === 'EXECUTE') {
+      return { action: 'execute', method: 'deliberation', votes: result.votes };
     }
-    return { action: 'dispatch', worker, confidence };
+
+    // QUEUE decision — escalate to user approval
+    return { action: 'queue', method: 'deliberation', votes: result.votes };
   }
 
-  // No compatible worker — escalate permission request
-  const missing = getMissingPermissions(job);
-  return { action: 'escalate', missing, job };
+  // Low confidence — queue directly, no vote needed
+  return { action: 'queue', method: 'auto' };
 }
 ```
 
-### Permission Requirement Declaration
+### Vote Outcomes Map to Permission Decisions
 
-Task definitions declare expected permission categories upfront. The orchestrator validates compatibility before dispatch, bundling permission requests with approval workflows:
+The voting system produces one of two outcomes, each mapping directly to a permission decision:
 
 ```javascript
-const task = {
-  id: 'apply-fixes',
-  prompt: 'Apply the suggested code fixes',
-  requiredPermissions: ['read', 'edit', 'write', 'bash'],
-};
+// Vote outcome: EXECUTE → proceed with tool execution
+// Vote outcome: QUEUE → add to user approval queue
 
-function canWorkerHandle(worker, task) {
-  const workerPermissions = worker.permissionProfile;
-  const missing = task.requiredPermissions.filter(
-    p => !workerPermissions.includes(p)
-  );
-  if (missing.length > 0) {
-    return { compatible: false, missing };
+async function handleVoteOutcome(toolName, context, voteResult) {
+  switch (voteResult.decision) {
+    case 'EXECUTE':
+      // Majority (or unanimous) agents agree: safe to proceed
+      return await executeTool(toolName, context.args);
+
+    case 'QUEUE':
+      // Agents disagree or vote to queue: escalate to human
+      return await addToApprovalQueue({
+        tool: toolName,
+        context: context.description,
+        confidence: context.confidence,
+        votes: voteResult.votes,
+        reason: summarizeVoteReason(voteResult),
+      });
   }
-  return { compatible: true };
 }
 ```
 
-### Stall Detection
+### Safe Defaults for Failure Cases
 
-Workers that hit permission prompts don't crash — they hang waiting for input. The orchestrator detects this via activity monitoring, not just exit codes:
-
-```javascript
-function detectStalls(activeJobs) {
-  const now = Date.now();
-  for (const job of activeJobs) {
-    const silentDuration = now - job.lastActivityAt;
-
-    if (silentDuration > STALL_THRESHOLD_MS) {
-      job.status = 'suspected_permission_block';
-      emitAlert(job);
-    }
-  }
-}
-
-setInterval(() => detectStalls(getActiveJobs()), 60000);
-```
-
-### Structured Failure Reporting
-
-Workers communicate **why** they're blocked, not just that they're blocked. A failure taxonomy distinguishes permission blocks from other failure modes:
+Every failure mode in the deliberation system defaults to QUEUE — the safe option:
 
 ```javascript
-function reportFailure(jobId, failure) {
+function getDefaultDecision(failureReason) {
+  // All failure modes default to queue (safety)
+  // - Insufficient agents available: QUEUE
+  // - Agent timeout: counted as QUEUE vote
+  // - Unparseable agent response: counted as QUEUE vote
+  // - Error during deliberation: QUEUE (logged, doesn't break execution)
+  // - Vote tie: QUEUE
+
   return {
-    jobId,
-    status: 'blocked',
-    reason: failure.type,     // 'permission_denied' | 'timeout' | 'crash' | 'resource_limit'
-    detail: failure.message,  // 'Write access to /etc/nginx required'
-    toolCategory: failure.tool, // 'bash' | 'edit' | 'write' | 'network'
-    recoverable: failure.recoverable,
+    decision: 'QUEUE',
+    reason: failureReason,
+    fallback: true,
   };
 }
+
+async function deliberateWithFallback(toolName, context) {
+  try {
+    return await deliberate(toolName, context);
+  } catch (err) {
+    // Error during deliberation — log but don't break execution
+    log.warn('Deliberation failed, defaulting to queue', {
+      tool: toolName,
+      error: err.message,
+    });
+    return getDefaultDecision('deliberation_error');
+  }
+}
 ```
 
-### Confidence-Gated Fallback Strategies
+### No Separate Permission Module
 
-When a permission block is detected, the fallback strategy is gated by the confidence score from `deliberative-alignment.js`:
+The permission escalation system does not exist as a standalone service. It is composed from existing patterns:
 
-- **>= 0.85 (high confidence)**: Silently retry with an elevated worker or decompose the task into safer sub-steps
-- **>= 0.60 (moderate confidence)**: Execute fallback and notify human after the fact
-- **>= 0.40 (low confidence)**: Execute with caution, log the recovery action for review
-- **< 0.40 (very low confidence)**: Block and request human approval before attempting recovery
+1. **Confidence scoring** determines the band (from confidence-based autonomy gating)
+2. **Deliberative alignment** handles the voting for notify-band decisions
+3. **Approval queue** receives decisions that need human review
 
 ```javascript
-async function handlePermissionBlock(job, failure) {
-  const confidence = await assessConfidence(job);
+// The full escalation flow is three existing systems composed together
+async function gateWorkerAction(toolName, args) {
+  // Step 1: Score confidence (from autonomy gating)
+  const confidence = await scoreConfidence(toolName, args);
 
-  if (confidence < 0.40) {
-    // Very low confidence — always escalate to human for approval
-    return await escalateToHuman(job, {
-      reason: `Worker needs ${failure.toolCategory} access: ${failure.detail}`,
+  // Step 2: Route by band
+  if (confidence >= 0.85) {
+    return await executeTool(toolName, args);
+  }
+
+  if (confidence >= 0.60) {
+    // Step 2a: Deliberative alignment votes
+    const result = await deliberateWithFallback(toolName, {
       confidence,
-      suggestion: 'Approve elevated permissions or apply changes manually',
+      description: describeAction(toolName, args),
     });
+
+    if (result.decision === 'EXECUTE') {
+      return await executeTool(toolName, args);
+    }
   }
 
-  // Confidence >= 0.40 — attempt automatic recovery
-  const result = await decomposeOrRedispatch(job, failure);
-
-  if (confidence < 0.85) {
-    // Moderate/low confidence — notify human about the recovery action
-    await sendNotification({ job, failure, recovery: result, confidence });
-  }
-
-  return result;
+  // Step 3: Queue for human approval
+  return await addToApprovalQueue({ tool: toolName, confidence });
 }
 ```
 
 ## Implications
 
-- Stall detection has inherent latency (polling interval) — fast-failing is preferable but not always possible with interactive permission models
-- Pre-dispatch permission checking requires upfront declaration of expected tool usage, adding authoring overhead to task definitions
-- No way to programmatically grant permissions mid-session in most AI agent runtimes — blocked workers must be restarted with new config
-- The decomposition strategy (breaking tasks into smaller steps) may produce worse results than a single cohesive execution
-- Human escalation requires a notification system and queue — adds infrastructure beyond the orchestrator itself
-- Permission profiles vary by runtime (Claude Code, OpenAI Codex, etc.) — the abstraction layer must account for different permission models
+- Permission escalation adds 0-45 seconds of latency for notify-band actions (the deliberation timeout) — fast actions may feel sluggish
+- The system biases heavily toward safety: ties, timeouts, errors, and insufficient agents all result in QUEUE
+- No way to grant elevated permissions mid-session — a queued action stays queued until a human reviews it
+- The voting mechanism inherits all limitations of deliberative alignment (minimum agent count, timeout handling, privacy constraints on tool args)
+- Composing escalation from existing patterns (confidence + deliberation + queue) avoids a standalone permission module but means changes to any component affect escalation behavior
+- Workers never know they were voted on — the escalation is transparent from the worker's perspective
 
 ## Code Example
 
 ```javascript
-// Permission-aware dispatch cycle with confidence-based gating
-async function dispatchWithPermissionHandling(job, maxRetries = 2) {
-  const plan = await planDispatch(job);
+// Practical integration: worker dispatch with permission gating
+async function dispatchWorkerTask(task) {
+  const tools = task.requiredTools || [];
 
-  if (plan.action === 'escalate') {
-    // No compatible worker — escalate based on confidence score
-    return await handlePermissionBlock(job, {
-      type: 'permission_denied',
-      toolCategory: plan.missing[0],
-      message: `No worker with permissions: ${plan.missing.join(', ')}`,
-      recoverable: false,
-    });
-  }
+  for (const tool of tools) {
+    const confidence = await scoreConfidence(tool, task.args);
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const result = await dispatchAndMonitor(plan.worker, job);
-
-    if (result.status === 'complete') {
-      return result;
+    if (confidence < 0.60) {
+      // Below notify band — queue entire task
+      return await addToApprovalQueue({
+        task: task.id,
+        tool,
+        confidence,
+        reason: 'Below notify band threshold',
+      });
     }
 
-    if (result.status === 'blocked' && result.reason === 'permission_denied') {
-      log(`Job ${job.id} blocked on ${result.toolCategory} (confidence: ${plan.confidence}) — attempt ${attempt + 1}`);
+    if (confidence < 0.85) {
+      // In notify band — deliberate
+      const result = await deliberateWithFallback(tool, {
+        confidence,
+        description: `Task ${task.id} requires ${tool}`,
+      });
 
-      if (result.recoverable) {
-        job.requiredPermissions.push(result.toolCategory);
-        continue;
+      if (result.decision === 'QUEUE') {
+        return await addToApprovalQueue({
+          task: task.id,
+          tool,
+          confidence,
+          votes: result.votes,
+        });
       }
-
-      return await handlePermissionBlock(job, result);
     }
-
-    // Non-permission failure — don't retry
-    throw new Error(`Job ${job.id} failed: ${result.detail}`);
   }
 
-  return await escalateToHuman(job, { reason: 'Max retries exceeded on permission blocks' });
+  // All tools passed — execute the task
+  return await executeTask(task);
 }
 ```
 
 ## Related Patterns
 
-- [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
 - [Deliberative Alignment](./deliberative-alignment.md)
+- [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
+- [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)

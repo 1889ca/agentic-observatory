@@ -35,38 +35,54 @@ Tasks are stored in PostgreSQL with a consistent schema:
 
 Storing task definitions in PostgreSQL rather than configuration files keeps task management centralized and auditable. Tasks can be created, updated, listed, toggled (enabled/disabled), and manually triggered through the orchestrator's task management layer — the exact API surface varies by implementation, but the lifecycle operations are consistent.
 
-### Kanban Queue with Claim-Based Locking
+### Worker Task Pipeline
 
-Rather than dispatching tasks directly via `node-cron`, the scheduler uses a kanban dequeue/claim model. Tasks whose schedule has elapsed are enqueued into a priority queue in `task-queue.js`. A processor loop calls `dequeueNext()` to claim the highest-priority ready task. Claiming a task locks it, preventing duplicate execution:
+Rather than a simple dequeue/claim model, the scheduler uses a multi-step pipeline architecture. Pipelines are stored in `worker_task_pipelines` and their executions in `worker_task_pipeline_executions`:
+
+```sql
+-- worker_task_pipelines
+id SERIAL PRIMARY KEY,
+name TEXT,
+description TEXT,
+steps JSON  -- Array of step definitions
+
+-- worker_task_pipeline_executions
+id SERIAL PRIMARY KEY,
+pipeline_id INTEGER REFERENCES worker_task_pipelines(id),
+document_id INTEGER,  -- FK, nullable
+status TEXT,          -- running | completed | failed | cancelled
+current_step_index INTEGER,
+step_history JSON,
+context JSON,
+started_at TIMESTAMP,
+completed_at TIMESTAMP,
+error TEXT
+```
+
+Each step in a pipeline defines a worker task type and parameters, with template interpolation for dynamic values:
 
 ```javascript
-// task-queue.js
-async function enqueueReady() {
-  const tasks = await getEnabledTasks();
-  for (const task of tasks) {
-    if (isDue(task) && !isClaimed(task)) {
-      await enqueue(task);
-    }
-  }
+// Step definition
+{ type: 'workerTask', name: 'run tests', taskType: 'coding', params: { description: '{{context.prompt}}' } }
+
+// Execution flow
+async function startPipeline(pipelineId, documentId, context) {
+  const execution = await createExecution(pipelineId, documentId, context);
+  await executeNextStep(execution);
 }
 
-async function dequeueNext() {
-  // Atomically claim the highest-priority unclaimed task
-  const task = await claimNext();
-  if (!task) return null;
-
-  try {
-    const result = await dispatch(task);
-    await recordResult({ type: 'task-result', task: task.id, result });
-  } finally {
-    await releaseClaim(task.id);
-  }
-
-  return task;
+async function executeNextStep(execution) {
+  const step = execution.steps[execution.current_step_index];
+  const resolved = resolveTemplate(step.params, execution.context);  // {{field}} and {{field.nested}}
+  const task = await createWorkerTask(resolved);
+  await dispatch(task);
+  // On completion: handleTaskComplete() advances to next step
+  // On failure: failExecution()
+  // On all steps complete: completeExecution()
 }
 ```
 
-If a task is already claimed when its next scheduled slot arrives, it is not re-enqueued. No queuing of duplicates, no retry — the next evaluation cycle will enqueue it again once the claim is released.
+Built-in pipelines like `code-review-merge` and `code-test-review` chain multiple worker tasks into a single orchestrated workflow. If a step fails, the entire execution is marked as failed — no partial retry.
 
 ### Task Lifecycle
 
@@ -103,7 +119,7 @@ All task results flow back through the orchestrator's message queue:
 // Register a maintenance task through the orchestrator's task management
 const task = {
   id: 'nightly-test-suite',
-  schedule: '0 3 * * *',       // Cron expression defines when the task becomes due
+  schedule: '0 3 * * *',
   prompt: `Run the full test suite. Report any failures with
            file paths and error messages. Do NOT attempt fixes.`,
   model: 'sonnet',
@@ -113,11 +129,15 @@ const task = {
 
 await taskManager.create(task);
 
-// The queue processor claims and executes due tasks
-const claimed = await dequeueNext();
-// → { id: 'nightly-test-suite', ... } if due and unclaimed
+// Start a multi-step pipeline execution
+await startPipeline(pipelineId, documentId, {
+  prompt: 'Review and test the latest changes',
+  repo: '/srv/my-project'
+});
+// → Creates execution, resolves {{context.prompt}} in each step,
+//   dispatches worker tasks sequentially, advances on completion
 
-// Manually trigger a task outside its schedule (enqueues immediately)
+// Manually trigger a task outside its schedule
 await taskManager.trigger('nightly-test-suite');
 
 // Pause a task without deleting it

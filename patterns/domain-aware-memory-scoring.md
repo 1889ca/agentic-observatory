@@ -217,7 +217,6 @@ await trackAccess(memories.slice(0, 5));
 
 ## Related Patterns
 
-- [Narrative Memory Generation](./narrative-memory-generation.md)
 - [Knowledge Graph and Relationship Discovery](./knowledge-graph-and-relationship-discovery.md)
 - [Unified Search Across KBs](./unified-search-across-kbs.md)
 - [Context Assembly Pipeline](./context-assembly-pipeline.md)

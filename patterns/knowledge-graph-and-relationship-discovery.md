@@ -259,6 +259,5 @@ async function processConversation(message, conversationId) {
 
 ## Related Patterns
 
-- [Narrative Memory Generation](./narrative-memory-generation.md)
 - [Context Assembly Pipeline](./context-assembly-pipeline.md)
 - [Unified Search Across KBs](./unified-search-across-kbs.md)

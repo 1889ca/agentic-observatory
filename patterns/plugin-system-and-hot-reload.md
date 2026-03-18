@@ -17,60 +17,60 @@ An AI orchestrator needs to grow its capabilities without modifying core code. H
 
 ### Plugin Structure
 
-Each plugin lives in its own directory with a standard entry point:
+Each plugin lives in its own directory with a `plugin.json` manifest that declares its metadata, dependencies, and contributions:
 
-```javascript
-// plugins/github-integration/index.js
-module.exports = {
-  name: 'github-integration',
-  version: '1.0.0',
-
-  tools: [
-    { name: 'github_pr', handler: handlePR, schema: prSchema },
-    { name: 'github_issue', handler: handleIssue, schema: issueSchema }
-  ],
-
-  events: [
-    { event: 'webhook:github', handler: onGithubWebhook }
-  ],
-
-  jobs: [
-    { id: 'github-sync', schedule: '*/30 * * * *', handler: syncRepos }
-  ],
-
-  routes: (router) => {
-    router.post('/webhook', handleWebhook);
-  }
-};
-```
-
-### Plugin Registry
-
-The registry scans the plugin directory, loads each plugin, and builds a unified context:
-
-```javascript
-async function loadPlugins(pluginDir) {
-  const entries = await fs.readdir(pluginDir, { withFileTypes: true });
-
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const manifest = require(path.join(pluginDir, entry.name));
-
-    // Register each contribution type
-    manifest.tools?.forEach(t => toolRegistry.register(t));
-    manifest.events?.forEach(e => eventBus.on(e.event, e.handler));
-    manifest.jobs?.forEach(j => scheduler.register(j));
-
-    if (manifest.routes) {
-      const router = express.Router();
-      manifest.routes(router);
-      app.use(`/api/plugins/${manifest.name}`, router);
-    }
-
-    loaded.set(manifest.name, manifest);
+```json
+// plugins/github-integration/plugin.json
+{
+  "name": "github-integration",
+  "version": "1.0.0",
+  "description": "GitHub webhook handling and PR/issue tools",
+  "author": "team",
+  "main": "index.js",
+  "dependencies": ["core-tools@^1.0.0"],
+  "riley": { "minVersion": "1.0.0" },
+  "hooks": { "init": "setup", "destroy": "cleanup" },
+  "provides": {
+    "tools": ["github_pr", "github_issue"],
+    "events": ["webhook.github.*"]
+  },
+  "permissions": {
+    "events": ["plugin.*"],
+    "tools": ["specific_tool"]
   }
 }
 ```
+
+Plugin discovery covers two locations:
+- **Local:** `plugins/*` directories containing a `plugin.json` manifest
+- **npm:** Packages matching `riley-plugin-*` or `@org/riley-plugin-*` in `node_modules`
+
+Plugins transition through defined states: `REGISTERED` → `INITIALIZING` → `ACTIVE` → `ERROR` → `DESTROYED`.
+
+### Plugin Registry
+
+The registry scans the plugin directory, parses each `plugin.json` manifest, and loads the module entry point:
+
+```javascript
+async function loadAll() {
+  const entries = await fs.readdir(PLUGINS_DIR, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const manifestPath = path.join(PLUGINS_DIR, entry.name, 'plugin.json');
+    const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+    const plugin = require(path.join(PLUGINS_DIR, entry.name, manifest.main));
+
+    // Register contributions declared in the manifest
+    manifest.provides?.tools?.forEach(t => toolRegistry.register(t, plugin));
+    manifest.provides?.events?.forEach(e => eventBus.register(e, plugin));
+
+    loaded.set(manifest.name, { manifest, plugin, state: 'ACTIVE' });
+  }
+}
+```
+
+Core lifecycle functions: `loadAll()`, `reload(name)`, `startWatching()`, `stopWatching()`.
 
 ### Context Builder
 
@@ -95,58 +95,30 @@ function buildToolContext() {
 
 ### Hot-Reload via File Watching
 
-The plugin loader watches the plugins directory for changes. When a plugin file is added or modified, the loader clears `require.cache` for the changed module, re-requires it, and dynamically re-registers its tools, events, jobs, and routes:
+The plugin loader uses Node's built-in `fs.watch` (no external dependencies) to monitor the plugins directory. When a plugin file is added or modified, the loader parses the `plugin.json` manifest, clears `require.cache`, and re-registers the plugin's contributions:
 
 ```javascript
-const chokidar = require('chokidar');
+function startWatching() {
+  const watcher = fs.watch(PLUGINS_DIR, { recursive: true }, async (eventType, filename) => {
+    // Debounce rapid changes (500ms window)
+    clearTimeout(debounceTimers.get(filename));
+    debounceTimers.set(filename, setTimeout(async () => {
+      // Find plugin dir from filename
+      const pluginName = filename.split(path.sep)[0];
+      const manifestPath = path.join(PLUGINS_DIR, pluginName, 'plugin.json');
+      const manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8'));
 
-function watchPlugins(pluginDir) {
-  const watcher = chokidar.watch(pluginDir, { ignoreInitial: true });
-
-  watcher.on('change', async (filePath) => {
-    const pluginName = path.basename(path.dirname(filePath));
-    log.info(`Plugin changed: ${pluginName}, reloading...`);
-
-    // Clear cached module so require() picks up the new version
-    const modulePath = require.resolve(path.join(pluginDir, pluginName));
-    delete require.cache[modulePath];
-
-    // Unregister old contributions
-    const old = loaded.get(pluginName);
-    if (old) {
-      old.tools?.forEach(t => toolRegistry.unregister(t.name));
-      old.events?.forEach(e => eventBus.off(e.event, e.handler));
-      old.jobs?.forEach(j => scheduler.unregister(j.id));
-      if (old.routes) routeManager.unmount(`/api/plugins/${pluginName}`);
-    }
-
-    // Re-require and re-register
-    const manifest = require(modulePath);
-    manifest.tools?.forEach(t => toolRegistry.register(t));
-    manifest.events?.forEach(e => eventBus.on(e.event, e.handler));
-    manifest.jobs?.forEach(j => scheduler.register(j));
-
-    if (manifest.routes) {
-      const router = express.Router();
-      manifest.routes(router);
-      routeManager.mount(`/api/plugins/${manifest.name}`, router);
-    }
-
-    loaded.set(manifest.name, manifest);
-    log.info(`Plugin reloaded: ${pluginName}`);
-  });
-
-  watcher.on('add', async (filePath) => {
-    // New plugin directory detected — load it
-    const pluginName = path.basename(path.dirname(filePath));
-    if (!loaded.has(pluginName)) {
-      await loadPlugin(pluginDir, pluginName);
-    }
+      if (loaded.has(pluginName)) {
+        await reload(pluginName);
+      } else {
+        await init(pluginName);
+      }
+    }, 500));
   });
 }
 ```
 
-The route-manager handles dynamic mount/unmount of plugin routes so Express does not accumulate stale route handlers on reload.
+The 500ms debounce window prevents cascading reloads when editors write multiple files in rapid succession (e.g., save-all). The `reload()` function transitions the plugin through `DESTROYED` → `REGISTERED` → `INITIALIZING` → `ACTIVE`, calling the manifest's `hooks.destroy` and `hooks.init` handlers at the appropriate points.
 
 ## Implications
 
@@ -154,17 +126,25 @@ The route-manager handles dynamic mount/unmount of plugin routes so Express does
 - Hot-reload means a malformed plugin can take down registered tools mid-session — error handling during reload is critical
 - Route mounting at `/api/plugins/{name}/*` creates a clean namespace but limits URL flexibility
 - The registry pattern means all plugins must conform to a fixed interface — ad-hoc extensions are not supported
-- Plugin load order may matter if plugins depend on each other — no dependency resolution is built in
+- Plugin load order may matter if plugins depend on each other — the `dependencies` field in `plugin.json` declares requirements but resolution is load-time only
 
 ## Code Example
 
 ```javascript
 // Full plugin lifecycle with hot-reload
 const pluginManager = {
-  async init(pluginDir) {
-    await loadPlugins(pluginDir);
-    watchPlugins(pluginDir);
+  async init() {
+    await loadAll();
+    startWatching();
     log.info(`Loaded ${loaded.size} plugins with ${toolRegistry.size} tools (watching for changes)`);
+  },
+
+  async reloadPlugin(name) {
+    await reload(name);  // ACTIVE → DESTROYED → REGISTERED → INITIALIZING → ACTIVE
+  },
+
+  stopWatching() {
+    stopWatching();
   },
 
   getTools() {
@@ -172,7 +152,7 @@ const pluginManager = {
   },
 
   getPlugins() {
-    return Array.from(loaded.keys());
+    return Array.from(loaded.entries()).map(([name, { state }]) => ({ name, state }));
   }
 };
 ```

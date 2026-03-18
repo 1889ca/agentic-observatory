@@ -5,20 +5,20 @@
 const PATTERNS = [
   {
     slug: "orchestrator-satellite-communication",
-    title: "Orchestrator-Satellite Communication",
-    summary: "DB-backed task queue with subprocess spawning for orchestrator-to-satellite job dispatch and result collection.",
+    title: "Orchestrator-Worker Communication",
+    summary: "DB-backed worker task pipeline with typed runners, status tracking, and document-synced result collection.",
     status: "published",
   },
   {
     slug: "satellite-permission-escalation",
-    title: "Satellite Permission Escalation",
-    summary: "Integrated permission checking in the dispatch cycle with confidence-score-gated escalation and structured failure reporting.",
+    title: "Worker Permission Escalation",
+    summary: "Multi-model voting mechanism for escalating worker actions in the borderline autonomy band, using deliberative alignment for EXECUTE/QUEUE consensus.",
     status: "published",
   },
   {
     slug: "activity-tracking-architecture",
     title: "Activity Tracking Architecture",
-    summary: "Three-layer tracking combining JSONL job logs, database session metadata, and in-memory rolling windows.",
+    summary: "Session-based activity tracking with inter-session messaging, per-session tool permissions, and parent-child session hierarchies.",
     status: "published",
   },
   {
@@ -36,7 +36,7 @@ const PATTERNS = [
   {
     slug: "scheduled-autonomous-maintenance",
     title: "Scheduled Autonomous Maintenance",
-    summary: "Kanban-style task queue for agent-managed projects with claim-based locking and centralized result processing.",
+    summary: "Worker task pipeline with multi-step execution, template interpolation, and built-in pipelines for automated project maintenance.",
     status: "published",
   },
   {
@@ -78,7 +78,7 @@ const PATTERNS = [
   {
     slug: "error-triage-and-recovery",
     title: "Error Triage and Recovery",
-    summary: "Dual-layer error handling with pattern-based retryability classification and three-category learning triage.",
+    summary: "Dual-layer error handling where build/test failures are auto-retryable (agents can fix code) and network/permission errors are not (agents cannot fix infrastructure).",
     status: "published",
   },
   {
@@ -102,7 +102,7 @@ const PATTERNS = [
   {
     slug: "plugin-system-and-hot-reload",
     title: "Plugin System and Hot-Reload",
-    summary: "Extensible plugin architecture with directory scanning, contribution registration, and file-watched hot-reload for dynamic capability updates.",
+    summary: "Manifest-based plugin architecture with fs.watch hot-reload, lifecycle states, and dual discovery from local directories and npm packages.",
     status: "published",
   },
   {
@@ -180,7 +180,7 @@ const PATTERNS = [
   {
     slug: "worker-dispatcher-and-priority-queue",
     title: "Worker Dispatcher and Priority Queue",
-    summary: "Weighted event prioritization with resource-level locking and budget tracking for general-purpose cognitive dispatch.",
+    summary: "Source-weighted task prioritization with worktree-aware conflict checking and budget tracking for parallel worker dispatch.",
     status: "published",
   },
   {
@@ -204,19 +204,13 @@ const PATTERNS = [
   {
     slug: "deliberative-alignment",
     title: "Deliberative Alignment",
-    summary: "Value-action comparison ensuring agent behavior aligns with stated preferences through pre-execution conflict detection.",
+    summary: "Multi-model voting system for borderline autonomy decisions, dispatching to multiple agents for EXECUTE/QUEUE consensus in the notify band.",
     status: "published",
   },
   {
     slug: "agent-recovery-and-escalation",
     title: "Agent Recovery and Escalation",
     summary: "Strategy-based recovery from tool failures with clarification workflows, batch approval grouping, and action buffering.",
-    status: "published",
-  },
-  {
-    slug: "tenant-context-and-multi-tenancy",
-    title: "Tenant Context and Multi-Tenancy",
-    summary: "Request-scoped tenant isolation via async local storage with automatic database scoping and configuration partitioning.",
     status: "published",
   },
   {
@@ -241,6 +235,30 @@ const PATTERNS = [
     slug: "implicit-approval-parsing",
     title: "Implicit Approval Parsing",
     summary: "Natural language approval and denial detection with batch approval handling, qualified approval parsing, and context-gated activation.",
+    status: "published",
+  },
+  {
+    slug: "widget-sdk-and-declarative-ui",
+    title: "Widget SDK and Declarative UI",
+    summary: "JSON-based UI primitive system with template binding, layout composition, and runtime widget registration for agent-rendered interfaces.",
+    status: "published",
+  },
+  {
+    slug: "undo-and-revert-system",
+    title: "Undo and Revert System",
+    summary: "Tool-level undo declarations with action log tracking before/after state for time-bounded reversible agent operations.",
+    status: "published",
+  },
+  {
+    slug: "embedding-pipeline-and-async-vectorization",
+    title: "Embedding Pipeline and Async Vectorization",
+    summary: "Non-blocking embedding generation via queue-based batch processing with graceful degradation to keyword search.",
+    status: "published",
+  },
+  {
+    slug: "autonomy-boost-and-approval-learning",
+    title: "Autonomy Boost and Approval Learning",
+    summary: "Action fingerprinting with consecutive approval tracking for progressive auto-approval of repeatedly-authorized agent actions.",
     status: "published",
   },
 ];
