@@ -227,3 +227,4 @@ async function runIsolatedWorker(taskName, allowedTools, task) {
 
 - [Orchestrator-Worker Communication](./orchestrator-satellite-communication.md)
 - [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
+- [Request-Scoped Context Propagation](./request-scoped-context.md)

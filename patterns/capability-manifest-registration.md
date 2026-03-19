@@ -178,6 +178,15 @@ register('entity', {
 // → returns { result: { id: '...', type: 'task' }, render: 'TaskCard' }
 ```
 
+## Relationship to Declarative Capability System
+
+This pattern and [Declarative Capability System](./declarative-capability-system.md) document different aspects of Riley's unified `lib/capabilities/` system:
+
+- **Capability Manifest Registration (this pattern)** — Describes the runtime registry: Map-based tool lookup, entity type resolution with aliases, and widget type mapping.
+- **Declarative Capability System** — Describes the four-tier capability model (tools, skills, reflexes, workflows) and string-based autonomy tiers that gate execution.
+
+The manifest registration is the _how_ (storage and lookup), while the declarative system is the _what_ (capability types and autonomy gating).
+
 ## Related Patterns
 
 - [Declarative Capability System](./declarative-capability-system.md)

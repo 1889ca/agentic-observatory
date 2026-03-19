@@ -155,8 +155,19 @@ const result = await executeToolWithAutonomy('create_pr', prArgs, userId);
 // → Score drops, future PRs may require notification again
 ```
 
+## Relationship to Other Autonomy Patterns
+
+This pattern sits between [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md) and [Deliberative Alignment](./deliberative-alignment.md) in the autonomy stack:
+
+- **Decision Gating** sets the static baseline (AUTO/NOTIFY/ASK per decision type)
+- **Confidence-Based Gating (this pattern)** modulates that baseline using earned trust — a NOTIFY-tier action with high domain confidence (>0.8) can auto-execute
+- **Deliberative Alignment** resolves ambiguity when confidence lands in the notify band (0.60-0.85) via multi-model voting
+
+The confidence score from this pattern is the input signal that triggers deliberative alignment. Without it, the system has no continuous measure of trust.
+
 ## Related Patterns
 
 - [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
+- [Deliberative Alignment](./deliberative-alignment.md)
 - [Anticipation Engine](./anticipation-engine.md)
 - [Error Triage and Recovery](./error-triage-and-recovery.md)

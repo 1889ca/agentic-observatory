@@ -261,4 +261,28 @@ const PATTERNS = [
     summary: "Action fingerprinting with consecutive approval tracking for progressive auto-approval of repeatedly-authorized agent actions.",
     status: "published",
   },
+  {
+    slug: "request-scoped-context",
+    title: "Request-Scoped Context Propagation",
+    summary: "AsyncLocalStorage-based per-request context carrying correlation IDs, tenant isolation, and embedding caches through async chains without parameter drilling.",
+    status: "published",
+  },
+  {
+    slug: "commitment-tracking",
+    title: "Commitment Tracking and Extraction",
+    summary: "Automatic detection of commitments from conversations with lifecycle tracking, fulfillment detection, and overdue escalation.",
+    status: "published",
+  },
+  {
+    slug: "relationship-health-monitoring",
+    title: "Relationship Health Monitoring",
+    summary: "Decay-based health scoring per contact with neglect detection, expected cadence tracking, and proactive outreach suggestions.",
+    status: "published",
+  },
+  {
+    slug: "webhook-event-bridge",
+    title: "Webhook Event Bridge",
+    summary: "Unified inbound webhook receiver with per-source signature verification, payload normalization to internal events, and outbound webhook dispatch with retry.",
+    status: "published",
+  },
 ];

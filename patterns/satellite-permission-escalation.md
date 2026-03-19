@@ -195,8 +195,19 @@ async function dispatchWorkerTask(task) {
 }
 ```
 
+## Relationship to the Autonomy Stack
+
+Worker permission escalation is not a standalone module — it composes three existing patterns into an escalation flow for worker tool calls:
+
+1. **[Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)** scores the action's confidence
+2. **[Deliberative Alignment](./deliberative-alignment.md)** votes on notify-band decisions
+3. **[Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)** routes the final decision
+
+See each pattern for details on its specific layer. This pattern documents how they compose for the worker dispatch use case.
+
 ## Related Patterns
 
 - [Deliberative Alignment](./deliberative-alignment.md)
 - [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
 - [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)
+- [Orchestrator-Worker Communication](./orchestrator-satellite-communication.md)

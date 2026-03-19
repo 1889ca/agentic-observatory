@@ -185,8 +185,19 @@ async function gateToolExecution(toolName, context) {
 }
 ```
 
+## Relationship to Other Autonomy Patterns
+
+This pattern is the innermost layer of the three-layer autonomy system:
+
+- **[Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)** — Static routing. Classifies decisions into tiers and controls notification delivery.
+- **[Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)** — Dynamic trust. Tracks domain success/failure and provides the confidence score that determines which band a decision falls into.
+- **Deliberative Alignment (this pattern)** — Tiebreaker. Only fires when confidence is in the notify band (0.60-0.85). Uses multi-model voting to resolve ambiguity without human intervention.
+
+Deliberative alignment never activates outside the notify band — high-confidence and low-confidence decisions are handled by the outer layers.
+
 ## Related Patterns
 
 - [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
 - [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)
 - [Multi-Model Deliberation](./multi-model-deliberation.md)
+- [Worker Permission Escalation](./satellite-permission-escalation.md)

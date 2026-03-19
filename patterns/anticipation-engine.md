@@ -182,5 +182,6 @@ await followUps.schedule({
 ## Related Patterns
 
 - [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)
+- [Commitment Tracking and Extraction](./commitment-tracking.md)
 - [Evolution and Self-Improvement](./evolution-and-self-improvement.md)
 - [Unified Event System](./unified-event-system.md)

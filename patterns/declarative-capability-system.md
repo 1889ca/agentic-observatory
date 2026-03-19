@@ -142,6 +142,15 @@ async function execute(toolName, params, userId) {
 }
 ```
 
+## Relationship to Capability Manifest Registration
+
+This pattern and [Capability Manifest Registration](./capability-manifest-registration.md) document different aspects of Riley's unified `lib/capabilities/` system:
+
+- **Declarative Capability System (this pattern)** — Describes the four-tier capability model (tools, skills, reflexes, workflows), string-based autonomy tiers (AUTO/NOTIFY/ASK/NEVER), and how capabilities self-describe via JSON Schema for LLM consumption.
+- **Capability Manifest Registration** — Describes the runtime registry mechanics: Map-based tool lookup, entity type resolution with aliases, and widget type mapping.
+
+In practice, the declarative system defines _what_ capabilities are and how they're gated, while the manifest registration handles _how_ they're stored, resolved, and looked up at runtime.
+
 ## Related Patterns
 
 - [Capability Manifest Registration](./capability-manifest-registration.md)

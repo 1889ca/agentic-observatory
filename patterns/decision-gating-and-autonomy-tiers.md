@@ -155,8 +155,18 @@ handleAgentDecision('billing-api', 'deploy-suggestion',
 // 'maintenance-complete': silent (tier 1 AUTO, logged only)
 ```
 
+## Relationship to Other Autonomy Patterns
+
+This pattern, [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md), and [Deliberative Alignment](./deliberative-alignment.md) form a three-layer autonomy system:
+
+- **Decision Gating (this pattern)** — Static routing policy. Classifies decisions by type into tiers (AUTO/NOTIFY/ASK) and controls notification delivery. This is the outermost layer — it determines _how_ a decision is communicated.
+- **Confidence-Based Autonomy Gating** — Dynamic trust scoring. Tracks per-domain success/failure ratios to adjust whether a NOTIFY-tier action can be auto-executed or needs approval. This modulates the static tiers based on track record.
+- **Deliberative Alignment** — Tiebreaker for the middle ground. When confidence falls in the notify band (0.60-0.85), multi-model voting resolves whether to execute or queue. This is the innermost layer — it handles ambiguous cases that neither static tiers nor confidence scoring can resolve alone.
+
 ## Related Patterns
 
+- [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)
+- [Deliberative Alignment](./deliberative-alignment.md)
 - [Capability Manifest Registration](./capability-manifest-registration.md)
 - [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
 - [Error Triage and Recovery](./error-triage-and-recovery.md)
