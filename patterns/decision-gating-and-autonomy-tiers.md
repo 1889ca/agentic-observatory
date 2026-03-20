@@ -25,36 +25,80 @@ Every autonomous decision is classified into one of three numeric tiers:
 | 2 | NOTIFY | Execute and notify human after the fact (rate-limited per window) | Deploy suggestions, optimization findings, PR review requests |
 | 3 | ASK | Block and request human approval before executing | Production errors, security events, blocking failures |
 
-### Centralized Decision Policy
+### Dynamic Rule Evaluation
 
-The orchestrator maintains a centralized policy that defines decision tiers programmatically. Rather than scattering configuration across projects, the policy lives within the orchestrator itself:
+Rather than a static lookup table, tier assignment is computed at runtime by `lib/agent/autonomy-rules.js`. Rules evaluate context, domain confidence (from `autonomyTracker`), and action fingerprints to produce a numeric confidence score (0–1). That score is then mapped to a tier:
 
 ```javascript
-// Decision tier registry — centralized in the orchestrator
-// 1 = AUTO, 2 = NOTIFY, 3 = ASK
-const decisionPolicy = {
-  defaults: {
-    tier: 1,  // AUTO — silent by default
-    notifyWindowMs: 60 * 60 * 1000, // 1 hour batching window for tier 2
-  },
+// lib/agent/autonomy-rules.js — rules evaluate at runtime, not at deploy time
+import { autonomyTracker } from './autonomy-tracker.js';
 
-  decisions: {
-    'health-check-failure':  { tier: 3 },  // ASK
-    'deploy-suggestion':     { tier: 2 },  // NOTIFY
-    'error-recovery':        { tier: 3 },  // ASK
-    'maintenance-complete':  { tier: 1 },  // AUTO
-    'dependency-update':     { tier: 2 },  // NOTIFY
-    'ssl-cert-expiry':       { tier: 3 },  // ASK
+const rules = [
+  {
+    name: 'domain-confidence',
+    evaluate(context) {
+      const score = autonomyTracker.getDomainConfidence(context.domain);
+      // High tracked confidence → lean AUTO; low or unknown → lean ASK
+      return score;
+    }
   },
-};
+  {
+    name: 'action-fingerprint',
+    evaluate(context) {
+      const fingerprint = computeActionFingerprint(context.action, context.params);
+      const history = autonomyTracker.getFingerprintHistory(fingerprint);
+      if (!history) return 0.5;  // unknown action — neutral
+      return history.successRate;
+    }
+  },
+  {
+    name: 'blast-radius',
+    evaluate(context) {
+      // Destructive or production-scoped actions reduce confidence
+      if (context.scope === 'production' || context.destructive) return 0.1;
+      if (context.scope === 'staging') return 0.7;
+      return 0.9;
+    }
+  },
+];
 
-function getDecisionTier(decisionName) {
-  const entry = decisionPolicy.decisions[decisionName];
-  return entry?.tier ?? decisionPolicy.defaults.tier;
+export function evaluateTier(context) {
+  const scores = rules.map(r => r.evaluate(context));
+  const confidence = scores.reduce((a, b) => a + b, 0) / scores.length;
+
+  if (confidence >= 0.85) return { tier: 1, label: 'AUTO',   confidence };
+  if (confidence >= 0.50) return { tier: 2, label: 'NOTIFY', confidence };
+  return                         { tier: 3, label: 'ASK',    confidence };
 }
 ```
 
-This centralized approach means the orchestrator has a single source of truth for all routing decisions. Adding new decision types or changing tiers is a code change in one place, not a config file hunt across projects.
+The three tiers remain the output classification — AUTO, NOTIFY, ASK — but the input is dynamic rather than a fixed enum lookup.
+
+### Autonomy Boost: NOTIFY → AUTO Promotion
+
+The `autonomy-boost` subsystem tracks consecutive approvals per action fingerprint. When a NOTIFY-tier action is approved by the human enough times in a row, it is promoted to AUTO:
+
+```javascript
+// autonomy-boost: promotes NOTIFY → AUTO on repeated approval
+export function recordApproval(fingerprint) {
+  const record = autonomyTracker.getOrCreate(fingerprint);
+  record.consecutiveApprovals += 1;
+
+  if (record.consecutiveApprovals >= BOOST_THRESHOLD) {
+    // Promote: future evaluations will see high confidence for this fingerprint
+    autonomyTracker.setFingerprintConfidence(fingerprint, 0.92);
+    record.consecutiveApprovals = 0;  // reset streak
+  }
+}
+
+export function recordRejection(fingerprint) {
+  const record = autonomyTracker.getOrCreate(fingerprint);
+  record.consecutiveApprovals = 0;  // break the streak on any rejection
+  autonomyTracker.decayFingerprintConfidence(fingerprint, 0.15);
+}
+```
+
+This replaces the static `decisions` map: new action types start unknown (neutral confidence), earn AUTO status through demonstrated approval history, and lose it on rejection.
 
 ### Notification Batching for Tier 2
 
@@ -109,12 +153,13 @@ function getRecentDecisions() {
 
 ## Implications
 
-- Default tier is 1 (AUTO, silent) — agents are quiet by default and opt in to noisier tiers
-- Centralized policy avoids configuration drift across projects but requires orchestrator changes to update tiers
-- The tier 2 batching window is global — different decision types may warrant different rate limits in practice
-- In-memory rate-limiting means notification gates reset on orchestrator restart, which could cause a brief burst of tier 2 notifications
+- Default confidence for unknown actions is neutral (0.5 → NOTIFY) — agents are not silently autonomous for new action types until they build a track record
+- Dynamic rules mean tier assignment can shift at runtime without code deploys — `autonomyTracker` state is the live source of truth for routing behavior
+- The autonomy-boost streak counter resets on any rejection, making demotion fast and promotion slow by design
+- The tier 2 batching window is global — different action types may warrant different rate limits in practice
+- In-memory rate-limiting and tracker state reset on orchestrator restart, which could cause a brief burst of tier 2 notifications and temporary loss of promotion history
 - No "off" tier — even tier 1 (AUTO) decisions are recorded in the audit trail, maintaining full observability
-- The three-tier numeric model is deliberately simple. More granular systems (5+ tiers, per-user routing) add complexity without proportional benefit for most deployments
+- The three-tier output model is deliberately stable. The complexity lives in the rule evaluation layer, not in the tier definitions themselves
 
 ## Code Example
 
@@ -122,46 +167,62 @@ function getRecentDecisions() {
 // Reference implementation: Riley orchestrator
 
 // An agent reports a decision during autonomous operation
-async function handleAgentDecision(project, decision, details) {
-  const tier = getDecisionTier(decision);
+async function handleAgentDecision(project, action, details) {
+  const context = {
+    domain: project,
+    action: action.type,
+    params: action.params,
+    scope: action.scope ?? 'unknown',
+    destructive: action.destructive ?? false,
+  };
+
+  const { tier, label, confidence } = evaluateTier(context);
+  const fingerprint = computeActionFingerprint(action.type, action.params);
+
+  recordDecision(project, action.type, tier, confidence);
 
   if (tier === 3) {
     // ASK — block and wait for human approval
-    await requestApproval({ project, decision, tier, details });
+    const approved = await requestApproval({ project, action, tier, confidence, details });
+    if (approved) recordApproval(fingerprint);
+    else           recordRejection(fingerprint);
     return;
   }
 
-  if (shouldNotify(project, decision)) {
+  if (shouldNotify(project, action.type)) {
     // NOTIFY (tier 2) — execute and inform human after the fact
     await sendNotification({
       project,
-      decision,
+      action: action.type,
       tier,
+      confidence,
       details,
       timestamp: new Date().toISOString(),
     });
+    // Implicit approval — count toward boost streak
+    recordApproval(fingerprint);
   }
 
   // AUTO (tier 1) — silent execution, recorded in audit trail only
 }
 
 // Usage from a flow step
-handleAgentDecision('billing-api', 'deploy-suggestion',
-  'All tests pass on feature/new-pricing. Ready for production deploy.');
+handleAgentDecision('billing-api',
+  { type: 'deploy-suggestion', scope: 'production', destructive: false, params: { branch: 'feature/new-pricing' } },
+  'All tests pass. Ready for production deploy.');
 
-// First call: notifies (tier 2 NOTIFY, no recent notification)
-// Second call within 1 hour: suppressed (batching window active)
-// 'health-check-failure': blocks for approval (tier 3 ASK)
-// 'maintenance-complete': silent (tier 1 AUTO, logged only)
+// First call (unknown fingerprint): confidence ~0.5 → NOTIFY, notifies, records approval
+// After BOOST_THRESHOLD consecutive approvals: fingerprint confidence → 0.92 → AUTO
+// scope:'production' + destructive:true: blast-radius rule lowers confidence → ASK
 ```
 
 ## Relationship to Other Autonomy Patterns
 
 This pattern, [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md), and [Deliberative Alignment](./deliberative-alignment.md) form a three-layer autonomy system:
 
-- **Decision Gating (this pattern)** — Static routing policy. Classifies decisions by type into tiers (AUTO/NOTIFY/ASK) and controls notification delivery. This is the outermost layer — it determines _how_ a decision is communicated.
-- **Confidence-Based Autonomy Gating** — Dynamic trust scoring. Tracks per-domain success/failure ratios to adjust whether a NOTIFY-tier action can be auto-executed or needs approval. This modulates the static tiers based on track record.
-- **Deliberative Alignment** — Tiebreaker for the middle ground. When confidence falls in the notify band (0.60-0.85), multi-model voting resolves whether to execute or queue. This is the innermost layer — it handles ambiguous cases that neither static tiers nor confidence scoring can resolve alone.
+- **Decision Gating (this pattern)** — Dynamic routing policy. `autonomy-rules.js` evaluates context, domain confidence, and action fingerprints at runtime to produce a tier (AUTO/NOTIFY/ASK). The `autonomy-boost` subsystem promotes NOTIFY → AUTO based on consecutive approval history. This is the outermost layer — it determines _how_ a decision is communicated and whether its tier has been earned.
+- **Confidence-Based Autonomy Gating** — Persistent trust scoring. Tracks per-domain success/failure ratios; those scores feed directly into the rule evaluation above. The two patterns share `autonomyTracker` as a common substrate.
+- **Deliberative Alignment** — Tiebreaker for the middle ground. When confidence falls in the notify band (0.50–0.85), multi-model voting resolves whether to execute or queue. This is the innermost layer — it handles ambiguous cases that neither dynamic rules nor tracker history can resolve alone.
 
 ## Related Patterns
 

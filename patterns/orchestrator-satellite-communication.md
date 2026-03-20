@@ -1,6 +1,6 @@
 # Orchestrator-Worker Communication
 
-> Database-backed task pipeline with typed runners for orchestrator-to-worker job dispatch, state tracking via worker_tasks and worker_history tables, and result synchronization back to source documents.
+> Socket.io-based real-time task dispatch with a taskQueue dequeue pattern, worker registration via events, and GitHub CC fallback when workers are offline.
 
 ## Problem
 
@@ -8,263 +8,173 @@ An orchestrator needs to dispatch heterogeneous work (code generation, issue sol
 
 ## Context
 
-- A central orchestrator dispatching work to typed runner functions (claude-executor, solve-issue, coding, etc.)
-- Multiple task types requiring different execution strategies but a unified dispatch pipeline
-- Documents (issues, maintenance items, coding tasks) that need their state kept in sync with worker outcomes
-- Need for execution history — not just current status, but a full audit trail per document
-- Workers that can produce multiple outcome types: successful completion, failure, PR creation, or voluntary abandonment
+- A central orchestrator dispatching work to connected Socket.io workers
+- Workers register dynamically at runtime — availability is not guaranteed
+- Tasks queue in a persistent taskQueue when no worker is available
+- GitHub CC (Claude Code) serves as a fallback executor when all workers are offline
+- Workers can produce multiple outcome types: successful completion, failure, PR creation, or voluntary abandonment
 - Isolated execution contexts via agent sessions to prevent cross-task contamination
 
 ## Solution
 
-### Database Schema: worker_tasks and worker_history
+### Worker Registration via Socket.io
 
-Two tables form the backbone. `worker_tasks` tracks active dispatch state, while `worker_history` provides a per-document audit trail:
-
-```sql
--- Active task dispatch
-CREATE TABLE worker_tasks (
-  id SERIAL PRIMARY KEY,
-  document_id UUID REFERENCES documents(id),
-  task_type VARCHAR(50) NOT NULL,
-  status VARCHAR(20) DEFAULT 'pending',  -- pending, running, completed, failed, pr_created, abandoned
-  result JSONB,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  started_at TIMESTAMPTZ,
-  completed_at TIMESTAMPTZ
-);
-
--- Execution history per document
-CREATE TABLE worker_history (
-  id SERIAL PRIMARY KEY,
-  document_id UUID REFERENCES documents(id),
-  worker_task_id INTEGER REFERENCES worker_tasks(id),
-  task_type VARCHAR(50),
-  status VARCHAR(20),
-  result JSONB,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  completed_at TIMESTAMPTZ
-);
-
--- Isolated execution contexts
-CREATE TABLE agent_sessions (
-  id UUID PRIMARY KEY,
-  tenant_id UUID REFERENCES tenants(id),
-  name VARCHAR(100),
-  status VARCHAR(20) DEFAULT 'active',
-  context JSONB,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
-
-### Worker Status Values
-
-Tasks move through a richer state machine than simple pass/fail:
-
-```
-QUEUED → RUNNING → COMPLETED
-                 → FAILED
-                 → PR_CREATED
-                 → ABANDONED
-```
-
-`PR_CREATED` captures when a worker's output is a pull request rather than a direct result. `ABANDONED` handles cases where a worker determines the task isn't feasible and voluntarily stops.
-
-### Task Dispatch Flow
-
-The dispatch pipeline follows five phases, coordinated through `worker-execution.js`:
+Workers announce themselves to the orchestrator on connect using a `worker:register` event. The orchestrator maintains an in-memory registry of available workers keyed by socket ID:
 
 ```javascript
-// lib/worker-execution.js
+// orchestrator/workerRegistry.js
+io.on('connection', (socket) => {
+  socket.on('worker:register', ({ capabilities, workerId }) => {
+    registry.set(socket.id, { socket, capabilities, workerId, busy: false });
 
-// Phase 1: Task enters worker_tasks
-async function dispatchTask(documentId, taskType, params) {
-  const [task] = await db('worker_tasks').insert({
-    document_id: documentId,
-    task_type: taskType,
-    status: 'pending',
-  }).returning('*');
-
-  // Phase 2: Initialize execution tracking
-  await initWorkerExecution(documentId, {
-    workerTaskId: task.id,
-    taskType,
+    // Drain any queued tasks this worker can handle
+    drainQueue(socket.id);
   });
 
-  return task;
-}
-
-// Phase 2: Create worker_history entry linking document to task
-async function initWorkerExecution(documentId, { workerTaskId, taskType }) {
-  await db('worker_history').insert({
-    document_id: documentId,
-    worker_task_id: workerTaskId,
-    task_type: taskType,
-    status: 'pending',
+  socket.on('disconnect', () => {
+    registry.delete(socket.id);
   });
-}
-
-// Phase 3: Transition to RUNNING
-async function markStarted(documentId) {
-  const now = new Date();
-  await db('worker_tasks')
-    .where({ document_id: documentId, status: 'pending' })
-    .update({ status: 'running', started_at: now });
-
-  await db('worker_history')
-    .where({ document_id: documentId, status: 'pending' })
-    .orderBy('created_at', 'desc')
-    .first()
-    .update({ status: 'running' });
-}
+});
 ```
 
-### Progress Updates
+### Task Assignment and the Dequeue Pattern
 
-Workers report brief status updates during execution without changing the task's state:
-
-```javascript
-// lib/worker-execution.js
-async function updateProgress(documentId, message) {
-  await db('worker_tasks')
-    .where({ document_id: documentId, status: 'running' })
-    .update({
-      result: db.raw(`COALESCE(result, '{}'::jsonb) || ?::jsonb`, [
-        JSON.stringify({ progress: message, updated_at: new Date().toISOString() })
-      ]),
-    });
-}
-```
-
-### Completion and Result Sync
-
-When a worker finishes, `markCompleted` writes the result and synchronizes it back to the source document:
+When a task arrives, the orchestrator attempts to find a free worker immediately. If none is available, the task is persisted to a queue and dequeued when a worker registers or becomes free:
 
 ```javascript
-// lib/worker-execution.js
+// orchestrator/taskDispatcher.js
+async function dispatch(task) {
+  const worker = findFreeWorker(task.type);
 
-// Phase 5: Complete and sync result back to document
-async function markCompleted(documentId, result) {
-  const status = result.pr_url ? 'pr_created'
-    : result.abandoned ? 'abandoned'
-    : result.error ? 'failed'
-    : 'completed';
+  if (worker) {
+    assignToWorker(worker, task);
+  } else {
+    // Persist for later — queue survives restarts
+    await taskQueue.enqueue(task);
 
-  const now = new Date();
-
-  await db('worker_tasks')
-    .where({ document_id: documentId, status: 'running' })
-    .update({ status, result, completed_at: now });
-
-  await db('worker_history')
-    .where({ document_id: documentId, status: 'running' })
-    .orderBy('created_at', 'desc')
-    .first()
-    .update({ status, result, completed_at: now });
-
-  // Sync result back to source document
-  await db('documents')
-    .where({ id: documentId })
-    .update({
-      worker_status: status,
-      worker_result: result,
-      updated_at: now,
-    });
-}
-```
-
-### Typed Runners
-
-Each task type has a dedicated runner that knows how to execute that category of work:
-
-```javascript
-// worker/runners/claude-executor.js
-async function run(task, session) { /* general Claude prompts */ }
-
-// worker/runners/solve-issue.js
-async function run(task, session) { /* GitHub issue resolution */ }
-
-// worker/runners/coding.js
-async function run(task, session) { /* code generation tasks */ }
-```
-
-The task runner selects the appropriate runner based on `task_type` and executes within an isolated agent session.
-
-### Auto-Init for Direct Dispatch
-
-When tasks arrive via `dispatch_to_worker` (bypassing the normal init flow), `syncFromWorkerTask` handles retroactive initialization:
-
-```javascript
-// lib/worker-execution.js
-async function syncFromWorkerTask(workerTaskId) {
-  const task = await db('worker_tasks').where({ id: workerTaskId }).first();
-  if (!task) throw new Error(`Worker task ${workerTaskId} not found`);
-
-  // Create history entry if one doesn't exist
-  const existing = await db('worker_history')
-    .where({ worker_task_id: workerTaskId })
-    .first();
-
-  if (!existing) {
-    await initWorkerExecution(task.document_id, {
-      workerTaskId: task.id,
-      taskType: task.task_type,
-    });
+    // If no workers at all, fall back to GitHub CC
+    if (registry.size === 0) {
+      await githubCCFallback.run(task);
+    }
   }
+}
 
-  return task;
+async function drainQueue(socketId) {
+  const worker = registry.get(socketId);
+  let task;
+
+  while ((task = await taskQueue.dequeue(worker.capabilities))) {
+    assignToWorker(worker, task);
+    if (worker.busy) break;
+  }
+}
+```
+
+### Task Assignment Event
+
+The orchestrator pushes work to the worker via a `task:assign` event. The payload includes everything the worker needs to execute independently:
+
+```javascript
+// orchestrator/taskDispatcher.js
+function assignToWorker(worker, task) {
+  worker.busy = true;
+  worker.socket.emit('task:assign', {
+    taskId: task.id,
+    type: task.type,
+    payload: task.payload,
+  });
+}
+```
+
+### Completion Reporting
+
+Workers emit `task:complete` when finished. The orchestrator receives it, marks the worker free, and drains the queue again:
+
+```javascript
+// worker/index.js — worker side
+socket.on('task:assign', async ({ taskId, type, payload }) => {
+  try {
+    const result = await runTask(type, payload);
+    socket.emit('task:complete', { taskId, status: 'completed', result });
+  } catch (err) {
+    socket.emit('task:complete', { taskId, status: 'failed', error: err.message });
+  }
+});
+
+// orchestrator/taskDispatcher.js — orchestrator side
+socket.on('task:complete', async ({ taskId, status, result, error }) => {
+  const worker = registry.get(socket.id);
+  if (worker) worker.busy = false;
+
+  await taskQueue.markDone(taskId, { status, result, error });
+
+  // Immediately pick up next queued task if any
+  drainQueue(socket.id);
+});
+```
+
+### GitHub CC Fallback
+
+When the worker registry is empty, the orchestrator spawns a GitHub CC (Claude Code) process as a synchronous fallback. This ensures tasks are never stranded when no persistent workers are online:
+
+```javascript
+// orchestrator/githubCCFallback.js
+async function run(task) {
+  const prompt = buildPrompt(task);
+  await spawnCC({ prompt, workdir: task.workdir });
+  // CC exits when done — result is captured via git push / PR creation
 }
 ```
 
 ## Implications
 
-- The six-value status enum (QUEUED, RUNNING, COMPLETED, FAILED, PR_CREATED, ABANDONED) captures real-world outcomes that binary pass/fail misses — a PR creation is a success but requires different downstream handling than a direct completion
-- `worker_history` provides a full audit trail per document, enabling questions like "how many times was this issue attempted before it succeeded?"
-- Result sync back to the source document means consumers don't need to join against worker_tasks — the document itself carries its latest worker outcome
-- `syncFromWorkerTask` handles the two entry paths (normal init vs. direct dispatch) gracefully, preventing orphaned tasks
-- Progress updates via `updateProgress` are lightweight JSONB merges — they don't create new rows or change state, keeping the history clean
-- Typed runners allow specialized execution strategies per task category while sharing the same dispatch and tracking infrastructure
-- Agent sessions provide isolation between concurrent workers, preventing context bleed across tasks
+- Socket.io dispatch is real-time and push-based — the orchestrator does not poll; workers pull work the moment they register or finish a prior task
+- The `taskQueue.dequeue()` pattern decouples arrival from execution — tasks can accumulate during worker downtime and drain automatically on reconnect
+- The GitHub CC fallback ensures no task is permanently stranded, but it is synchronous and slower than a live worker; it should be treated as a safety net, not a primary path
+- Worker availability is ephemeral — the registry is in-memory, so a restart clears it; the persistent queue is the source of truth for unprocessed work
+- `drainQueue` runs after both registration and task completion, so a single worker coming online can process a backlog without any external trigger
+- The `task:complete` event carries the full outcome (status, result, error), giving the orchestrator everything it needs to update persistence and notify downstream consumers in one step
+- Agent sessions still provide isolation between concurrent workers, preventing context bleed across tasks
 
 ## Code Example
 
 ```javascript
-// Complete dispatch cycle: submit → init → start → progress → complete → sync
+// Full lifecycle: worker comes online, picks up queued task, reports completion
 
-async function executeWorkerTask(documentId, taskType, runnerFn) {
-  // 1. Dispatch and initialize tracking
-  const task = await dispatchTask(documentId, taskType);
+// --- Orchestrator side ---
 
-  // 2. Mark as started
-  await markStarted(documentId);
+io.on('connection', (socket) => {
+  socket.on('worker:register', ({ workerId, capabilities }) => {
+    registry.set(socket.id, { socket, workerId, capabilities, busy: false });
+    drainQueue(socket.id); // immediately assign any waiting tasks
+  });
 
+  socket.on('task:complete', async ({ taskId, status, result, error }) => {
+    const worker = registry.get(socket.id);
+    if (worker) worker.busy = false;
+
+    await taskQueue.markDone(taskId, { status, result, error });
+    drainQueue(socket.id); // pick up the next task without waiting
+  });
+
+  socket.on('disconnect', () => registry.delete(socket.id));
+});
+
+// Enqueue a new task — dispatch immediately if a worker is free
+await dispatch({ id: 'task-42', type: 'solve-issue', payload: { issueId: 99 } });
+
+// --- Worker side ---
+
+socket.emit('worker:register', { workerId: 'cc-worker-1', capabilities: ['solve-issue', 'coding'] });
+
+socket.on('task:assign', async ({ taskId, type, payload }) => {
   try {
-    // 3. Execute with progress reporting
-    const result = await runnerFn(task, {
-      onProgress: (msg) => updateProgress(documentId, msg),
-    });
-
-    // 4. Complete and sync result to document
-    await markCompleted(documentId, result);
-    return result;
-  } catch (error) {
-    await markCompleted(documentId, {
-      error: error.message,
-      stack: error.stack,
-    });
-    throw error;
+    const result = await runTask(type, payload);
+    socket.emit('task:complete', { taskId, status: 'completed', result });
+  } catch (err) {
+    socket.emit('task:complete', { taskId, status: 'failed', error: err.message });
   }
-}
-
-// Usage with typed runner
-const result = await executeWorkerTask(
-  documentId,
-  'solve-issue',
-  solveIssueRunner.run
-);
-// result.pr_url → task status is 'pr_created'
-// result.abandoned → task status is 'abandoned'
-// no error field → task status is 'completed'
+});
 ```
 
 ## Related Patterns

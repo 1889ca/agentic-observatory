@@ -1,6 +1,6 @@
 # Evolution and Self-Improvement
 
-> Corrections-driven learning cycle with coactivation tracking, anti-pattern extraction, and preference synthesis from operational data.
+> Success-first learning cycle where successDetector and evolution.observe() lead the improvement loop, with corrections as a secondary signal, coactivation tracking, anti-pattern extraction, and preference synthesis.
 
 ## Problem
 
@@ -16,12 +16,49 @@ An AI orchestrator handles thousands of interactions, but the lessons from those
 
 ## Solution
 
-### Corrections-Based Learning
+### Success Detection (Primary Signal)
 
-The primary learning signal comes from user corrections — moments where the user explicitly corrects the agent's behavior. A dedicated corrections system tracks these and applies them through a correction applicator:
+The primary learning path is success detection. `successDetector.analyzeMessage()` inspects each completed interaction for positive signals — task completions, user confirmations, and low-friction exchanges. `evolution.observe()` records the behavioral context so the system can reinforce what worked:
 
 ```javascript
-// learning/learner.js — orchestrates all learning subsystems
+// learning/learner.js — success detection runs first
+async function learn() {
+  // 1. Detect and record successes — what went right?
+  await successDetector.scan();
+
+  // 2. Feed observations into the evolution module
+  const successes = await successDetector.getRecent();
+  for (const success of successes) {
+    await evolution.observe(success);
+  }
+
+  // 3. Process corrections (secondary signal — see below)
+  await processCorrections();
+
+  // 4. Run pattern detection — recurring behaviors
+  await patternDetector.scan();
+
+  // 5. Check for skill promotion candidates
+  // NOTE: Designed but not yet operational — reflex promotion is not implemented in Riley
+  await skillMatcher.evaluate();
+}
+```
+
+`successDetector.analyzeMessage()` can also be called inline during message processing to capture signal while context is fresh:
+
+```javascript
+// During message processing (non-blocking)
+successDetector.analyzeMessage(correlationId, { request, response, toolCalls })
+  .then(result => result.isSuccess && evolution.observe(result))
+  .catch(() => {});
+```
+
+### Corrections-Based Learning (Secondary Signal)
+
+User corrections remain a high-fidelity signal when they occur — explicit corrections represent unambiguous intent. They are processed after success detection, applying patterns that cross a frequency threshold:
+
+```javascript
+// learning/learner.js
 async function processCorrections({ dryRun = false } = {}) {
   const stats = await corrections.getStats(30); // Last 30 days
 
@@ -100,28 +137,6 @@ The vibe subsystem mines behavioral patterns to infer user preferences without e
 // "user prefers bullet points over prose → adjust response style"
 ```
 
-### Learning Orchestration
-
-The learner module coordinates all learning subsystems, running as a scheduled job:
-
-```javascript
-// learning/learner.js — main orchestrator
-async function learn() {
-  // 1. Process accumulated corrections
-  await processCorrections();
-
-  // 2. Run success detection — what went right?
-  await successDetector.scan();
-
-  // 3. Run pattern detection — recurring behaviors
-  await patternDetector.scan();
-
-  // 4. Check for skill promotion candidates
-  // NOTE: Designed but not yet operational — reflex promotion is not implemented in Riley
-  await skillMatcher.evaluate();
-}
-```
-
 ### Improvement Recording
 
 All improvements are logged with the observations that motivated them, creating an audit trail:
@@ -139,7 +154,8 @@ async function recordImprovement(improvement) {
 
 ## Implications
 
-- Corrections are the highest-fidelity learning signal — they represent explicit user intent, not inferred patterns
+- Success detection is the primary learning path — `successDetector.analyzeMessage()` and `evolution.observe()` run before corrections processing, reinforcing what works rather than waiting for failures
+- Corrections remain the highest-fidelity signal when they occur, but they are relatively rare; success signals are abundant in normal operation and provide continuous learning without user friction
 - Coactivation tracking reveals missing abstractions organically — frequently paired tools suggest a skill that should exist
 - Anti-pattern injection into the system prompt is self-limiting (max 5 patterns, 7-day window) to prevent prompt bloat
 - Preference synthesis operates on aggregate behavior, not individual interactions — it needs volume to be reliable
@@ -150,13 +166,25 @@ async function recordImprovement(improvement) {
 
 ```javascript
 // Complete learning cycle: observe → analyze → improve
-// 1. During message processing, observations are recorded (non-blocking)
+
+// 1. During message processing, capture signal inline (non-blocking)
 trackRequest(correlationId, toolCallsLog).catch(() => {});
+successDetector.analyzeMessage(correlationId, { request, response, toolCalls })
+  .then(result => result.isSuccess && evolution.observe(result))
+  .catch(() => {});
+// Corrections are recorded when users explicitly correct behavior:
 corrections.record(userId, originalResponse, correctedResponse).catch(() => {});
 
 // 2. Scheduled learning job runs periodically
 async function scheduledLearningCycle() {
-  // Process corrections → generate improvements
+  // Lead with success detection — reinforce what works
+  await successDetector.scan();
+  const successes = await successDetector.getRecent();
+  for (const s of successes) {
+    await evolution.observe(s);
+  }
+
+  // Then process corrections as a secondary signal
   await learner.processCorrections();
 
   // Analyze coactivation → suggest new skills
@@ -164,7 +192,7 @@ async function scheduledLearningCycle() {
   for (const candidate of candidates) {
     if (candidate.frequency > SKILL_PROMOTION_THRESHOLD) {
       // Aspirational: skill promotion from coactivation is designed but not yet implemented
-      await proposeSKill(candidate);
+      await proposeSkill(candidate);
     }
   }
 

@@ -1,6 +1,6 @@
 # Skill Extraction and Fast-Path Routing
 
-> Embeddings-based semantic skill matching with learned reflex promotion for progressively faster dispatch.
+> Embeddings-based semantic skill matching via `skills_v2` table storage, with learned reflex promotion for progressively faster dispatch.
 
 ## Problem
 
@@ -40,27 +40,39 @@ async function matchSkill(message) {
 }
 ```
 
-### Pipeline Signature Computation
+### Skills Storage: `skills_v2` Table
 
-Each skill has a "pipeline signature" — the sequence of tool calls it typically produces. These are computed from historical executions:
+Skills are stored in the `skills_v2` table with embeddings as the primary identifier. The pipeline signature is computed via normalized JSON hashing of the tool-call sequence and stored alongside the embedding:
 
 ```javascript
-function computePipelineSignature(executionHistory) {
-  // Group by final tool-call sequence
-  const sequences = executionHistory.map(exec =>
-    exec.toolCalls.map(tc => tc.name).join(' -> ')
-  );
+async function upsertSkill(skill) {
+  // Normalized JSON hash of the tool-call sequence — used for deduplication
+  const pipelineHash = computeNormalizedHash(skill.toolSequence);
 
-  // Find the dominant sequence
-  const counts = {};
-  for (const seq of sequences) {
-    counts[seq] = (counts[seq] || 0) + 1;
-  }
-
-  return Object.entries(counts)
-    .sort((a, b) => b[1] - a[1])[0][0];
+  await db.run(`
+    INSERT INTO skills_v2 (name, embedding, pipeline_hash, tool_sequence, examples, success_rate, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(pipeline_hash) DO UPDATE SET
+      embedding = excluded.embedding,
+      examples = excluded.examples,
+      success_rate = excluded.success_rate,
+      updated_at = excluded.updated_at
+  `, [
+    skill.name,
+    serializeEmbedding(skill.embedding),  // float32 array → blob
+    pipelineHash,
+    JSON.stringify(skill.toolSequence),
+    skill.examples,
+    skill.successRate,
+    Date.now()
+  ]);
 }
-// Example: "entity -> memory_search -> respond"
+
+function computeNormalizedHash(toolSequence) {
+  // Normalize tool names and JSON-serialize for consistent hashing
+  const normalized = toolSequence.map(t => t.toLowerCase().trim());
+  return hashFn(JSON.stringify(normalized));
+}
 ```
 
 ### Reflex Promotion via Coactivation
@@ -142,41 +154,48 @@ function onReflexFailure(reflex, error) {
 - The embedding search adds ~50ms overhead to every message — acceptable given potential savings of seconds. Semantic skill matching (Speed 2) is the only operational speed tier; reflex promotion (Speed 1) and LLM-free execution are designed but not yet implemented
 - False skill matches can cause incorrect fast-path routing — the 0.85 threshold is tunable
 - Reflex promotion, if implemented, would create behavior invisible to the LLM — debugging would require checking the reflex registry
-- Pipeline signatures are brittle to tool renames — aliases help but don't fully solve this
+- Pipeline signatures are stored as normalized JSON hashes — tool renames break existing hashes, requiring a re-extraction pass over history
 - Currently the system improves through better skill matching, not through reflex promotion — observability remains straightforward
 - Promoted reflexes, once implemented, would execute without LLM judgment and must be restricted to low-risk operations
 
 ## Code Example
 
 ```javascript
-// Skill extraction from conversation history
-async function extractSkills(conversations) {
+// Skill extraction from conversation history — writes to skills_v2
+async function extractAndStoreSkills(conversations) {
   const candidates = [];
 
   for (const conv of conversations) {
     const toolSequence = conv.toolCalls.map(tc => tc.name);
-    const signature = await computeEmbedding(conv.userMessage);
+    const embedding = await computeEmbedding(conv.userMessage);
 
     candidates.push({
       text: conv.userMessage,
-      embedding: signature,
+      embedding,
       toolSequence,
       success: conv.exitCode === 0
     });
   }
 
-  // Cluster by embedding similarity
+  // Cluster by embedding similarity — each cluster is a candidate skill
   const clusters = clusterByEmbedding(candidates, { threshold: 0.88 });
 
-  // Each cluster with 5+ successful examples becomes a skill
-  return clusters
+  // Each cluster with 5+ successful examples becomes a skill row in skills_v2
+  const skills = clusters
     .filter(c => c.items.length >= 5 && c.successRate > 0.9)
     .map(c => ({
       name: generateSkillName(c.items[0].text),
-      signature: computePipelineSignature(c.items),
-      embedding: c.centroid,
-      examples: c.items.length
+      embedding: c.centroid,          // stored as blob in skills_v2
+      toolSequence: dominantSequence(c.items),
+      examples: c.items.length,
+      successRate: c.successRate
     }));
+
+  for (const skill of skills) {
+    await upsertSkill(skill);  // writes to skills_v2 with normalized pipeline_hash
+  }
+
+  return skills;
 }
 ```
 

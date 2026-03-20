@@ -6,7 +6,7 @@ const PATTERNS = [
   {
     slug: "orchestrator-satellite-communication",
     title: "Orchestrator-Worker Communication",
-    summary: "DB-backed worker task pipeline with typed runners, status tracking, and document-synced result collection.",
+    summary: "Socket.io-based worker dispatch with dynamic registration, queue-backed persistence, and GitHub CC fallback for offline workers.",
     status: "published",
   },
   {
@@ -60,7 +60,7 @@ const PATTERNS = [
   {
     slug: "evolution-and-self-improvement",
     title: "Evolution and Self-Improvement",
-    summary: "Corrections-driven learning cycle with coactivation tracking, anti-pattern extraction, and preference synthesis.",
+    summary: "Success-driven learning cycle with coactivation tracking, secondary corrections processing, and preference synthesis from operational data.",
     status: "published",
   },
   {
@@ -90,7 +90,7 @@ const PATTERNS = [
   {
     slug: "decision-gating-and-autonomy-tiers",
     title: "Decision Gating and Autonomy Tiers",
-    summary: "Numeric autonomy tiers (1=AUTO, 2=NOTIFY, 3=ASK) routing agent decisions with notification batching and audit trails.",
+    summary: "Dynamic autonomy rules evaluating domain confidence and action fingerprints to route decisions through AUTO/NOTIFY/ASK tiers with autonomy-boost promotion.",
     status: "published",
   },
   {
@@ -108,7 +108,7 @@ const PATTERNS = [
   {
     slug: "skill-extraction-and-fast-path-routing",
     title: "Skill Extraction and Fast-Path Routing",
-    summary: "Embeddings-based semantic skill matching with designed (not yet operational) reflex promotion for progressively faster dispatch.",
+    summary: "Embeddings-based skill matching via skills_v2 table with normalized JSON hashing for pipeline signatures and designed (not yet operational) reflex promotion.",
     status: "published",
   },
   {
@@ -283,6 +283,30 @@ const PATTERNS = [
     slug: "webhook-event-bridge",
     title: "Webhook Event Bridge",
     summary: "Unified inbound webhook receiver with per-source signature verification, payload normalization to internal events, and outbound webhook dispatch with retry.",
+    status: "published",
+  },
+  {
+    slug: "session-episode-tracking",
+    title: "Session Episode Tracking",
+    summary: "Episode-based conversation grouping with DB-backed session reconstruction, per-session entity tracking, and topic-drift boundary detection.",
+    status: "published",
+  },
+  {
+    slug: "contact-resolution-and-entity-disambiguation",
+    title: "Contact Resolution and Entity Disambiguation",
+    summary: "Fuzzy cross-platform contact matching with confidence-scored disambiguation, multi-source profile aggregation, and unified entity construction.",
+    status: "published",
+  },
+  {
+    slug: "audit-trail-with-pii-sanitization",
+    title: "Audit Trail with PII Sanitization",
+    summary: "Correlation-ID traced audit logging with batched non-blocking DB persistence and configurable PII scrubbing before storage.",
+    status: "published",
+  },
+  {
+    slug: "multi-tenant-session-isolation",
+    title: "Multi-Tenant Session Isolation",
+    summary: "Socket.io room-per-tenant isolation with scoped state management, per-tenant event delivery, and cross-tenant data leak prevention.",
     status: "published",
   },
 ];
