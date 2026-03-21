@@ -112,6 +112,8 @@ async function extractAndStore(message, conversationId) {
 
 Strength is reinforced on each observation and decays with time. This ensures frequently-referenced relationships surface first, while stale connections fade.
 
+> **Note:** The decay formula and reinforcement increment shown here represent the designed behavior. The core relationship upsert with `ON CONFLICT` strength reinforcement is confirmed; the specific decay half-life and increment values may differ from what's shown.
+
 ```javascript
 async function upsertRelationship(sourceId, targetId, type) {
   await db.query(`
@@ -132,6 +134,8 @@ function decayStrength(daysSinceLastUpdate) {
 ### Multi-Hop Traversal
 
 To discover indirect connections, traverse document relationships multiple hops out from a starting entity. Each hop reduces the effective strength, so direct connections rank higher than indirect ones.
+
+> **Note:** The traversal parameters and depth limits shown here represent the designed behavior. Core entity and fact storage is confirmed in the implementation; specific traversal tuning (max hops, minimum strength thresholds) may vary.
 
 ```javascript
 async function expandGraph(documentId, maxHops = 3, minStrength = 0.3) {

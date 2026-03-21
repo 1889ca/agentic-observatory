@@ -6,7 +6,7 @@ const PATTERNS = [
   {
     slug: "orchestrator-satellite-communication",
     title: "Orchestrator-Worker Communication",
-    summary: "Socket.io-based worker dispatch with dynamic registration, queue-backed persistence, and GitHub CC fallback for offline workers.",
+    summary: "Event-bus-driven task dispatch with DB-persisted lifecycle, dynamic worker registration, and GitHub CC fallback for offline workers.",
     status: "published",
   },
   {
@@ -114,7 +114,7 @@ const PATTERNS = [
   {
     slug: "autonomous-agent-cycle",
     title: "Autonomous Agent Cycle",
-    summary: "Event-driven cognitive tick system with adaptive backpressure, priority-based event processing, and DB-backed outbound queue.",
+    summary: "Dual-cycle autonomous system: 5-second cognitive tick for event processing with backpressure, and 2-hour objectives review for strategic goal management.",
     status: "published",
   },
   {
@@ -168,7 +168,7 @@ const PATTERNS = [
   {
     slug: "confidence-based-autonomy-gating",
     title: "Confidence-Based Autonomy Gating",
-    summary: "Domain-level confidence tracking with asymmetric scoring and configurable correction multipliers for earned autonomy.",
+    summary: "Multi-signal weighted confidence scoring (tool success, parameter completeness, context alignment, recency, time-of-day) with context affinities for earned autonomy.",
     status: "published",
   },
   {
@@ -234,7 +234,7 @@ const PATTERNS = [
   {
     slug: "implicit-approval-parsing",
     title: "Implicit Approval Parsing",
-    summary: "Natural language approval and denial detection with batch approval handling, qualified approval parsing, and context-gated activation.",
+    summary: "Natural language approval and denial detection with context-gated activation. Batch and qualified approval parsing designed but not yet implemented.",
     status: "published",
   },
   {
@@ -269,14 +269,8 @@ const PATTERNS = [
   },
   {
     slug: "commitment-tracking",
-    title: "Commitment Tracking and Extraction",
-    summary: "Automatic detection of commitments from conversations with lifecycle tracking, fulfillment detection, and overdue escalation.",
-    status: "published",
-  },
-  {
-    slug: "relationship-health-monitoring",
-    title: "Relationship Health Monitoring",
-    summary: "Decay-based health scoring per contact with neglect detection, expected cadence tracking, and proactive outreach suggestions.",
+    title: "Commitment Tracking",
+    summary: "Document-based commitment storage with active/overdue querying, progressive three-level escalation, and integration with the cognitive processing loop.",
     status: "published",
   },
   {
@@ -300,13 +294,31 @@ const PATTERNS = [
   {
     slug: "audit-trail-with-pii-sanitization",
     title: "Audit Trail with PII Sanitization",
-    summary: "Correlation-ID traced audit logging with batched non-blocking DB persistence and configurable PII scrubbing before storage.",
+    summary: "Correlation-ID traced audit logging with batched non-blocking DB persistence and key-based sensitive field redaction before storage.",
     status: "published",
   },
   {
-    slug: "multi-tenant-session-isolation",
-    title: "Multi-Tenant Session Isolation",
-    summary: "Socket.io room-per-tenant isolation with scoped state management, per-tenant event delivery, and cross-tenant data leak prevention.",
+    slug: "declarative-socket-handler-factory",
+    title: "Declarative Socket Handler Factory",
+    summary: "Factory functions for defining Socket.io handlers declaratively with auto-validation, type coercion, cache invalidation, and broadcast support.",
+    status: "published",
+  },
+  {
+    slug: "entity-service-and-universal-crud",
+    title: "Entity Service and Universal CRUD",
+    summary: "Universal CRUD abstraction for all entity types with type normalization, alias resolution, batch operations, and automatic event emission.",
+    status: "published",
+  },
+  {
+    slug: "tools-factory-and-declarative-tool-definition",
+    title: "Tools Factory and Declarative Tool Definition",
+    summary: "Declarative tool definitions with parameter schemas, automatic validation, entity resolution, error wrapping, and Gemini-compatible declaration generation.",
+    status: "published",
+  },
+  {
+    slug: "task-lifecycle-and-state-machine",
+    title: "Task Lifecycle and State Machine",
+    summary: "Strict state machine for task transitions (todo/in_progress/done/blocked/cancelled) with transient failure auto-retry and progressive backoff.",
     status: "published",
   },
 ];

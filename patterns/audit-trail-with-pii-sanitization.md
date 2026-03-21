@@ -12,7 +12,7 @@ This pattern applies to any orchestration system that needs a tamper-evident rec
 
 ## Solution
 
-Every action is tagged with a correlation ID at the entry point (HTTP request, webhook, socket event) and that ID is propagated through the entire async chain via a request-scoped context object. Before any audit entry is written, a scrubbing pass detects and neutralizes PII using a set of configurable regex patterns. Writes are batched and flushed on an interval rather than on each event, so audit logging is never in the critical path.
+Every action is tagged with a correlation ID at the entry point (HTTP request, webhook, socket event) and that ID is propagated through the entire async chain via a request-scoped context object. Before any audit entry is written, a scrubbing pass detects and redacts sensitive fields using key-based redaction. Writes are batched and flushed on an interval rather than on each event, so audit logging is never in the critical path.
 
 The flow:
 
@@ -60,23 +60,26 @@ module.exports = { log };
 ```js
 // lib/audit/scrubber.js
 
-const RULES = [
-  { name: 'email',  pattern: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, replace: '[EMAIL]' },
-  { name: 'phone',  pattern: /(\+?1?\s?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g,  replace: '[PHONE]' },
-  { name: 'ssn',    pattern: /\b\d{3}-\d{2}-\d{4}\b/g,                            replace: '[SSN]'   },
-];
+const SENSITIVE_KEYS = new Set([
+  'password', 'secret', 'token', 'apiKey', 'api_key',
+  'authorization', 'credential', 'credentials',
+  'accessToken', 'access_token', 'refreshToken', 'refresh_token',
+  'privateKey', 'private_key',
+]);
 
-function scrubValue(value) {
-  if (typeof value !== 'string') return value;
-  return RULES.reduce((v, rule) => v.replace(rule.pattern, rule.replace), value);
+function isSensitiveKey(key) {
+  return SENSITIVE_KEYS.has(key) ||
+    SENSITIVE_KEYS.has(key.toLowerCase());
 }
 
 function scrubPII(obj) {
-  if (typeof obj === 'string') return scrubValue(obj);
+  if (typeof obj === 'string') return obj;
   if (Array.isArray(obj)) return obj.map(scrubPII);
   if (obj && typeof obj === 'object') {
     return Object.fromEntries(
-      Object.entries(obj).map(([k, v]) => [k, scrubPII(v)])
+      Object.entries(obj).map(([k, v]) =>
+        [k, isSensitiveKey(k) ? '[REDACTED]' : scrubPII(v)]
+      )
     );
   }
   return obj;
@@ -85,13 +88,15 @@ function scrubPII(obj) {
 module.exports = { scrubPII };
 ```
 
+> **Note:** Regex-based PII scrubbing (matching emails, phone numbers, SSNs within string values) is a natural extension of this pattern but is not currently implemented. The actual scrubber uses key-based redaction — checking whether object keys match a sensitive-key list and replacing their values wholesale. This is simpler and avoids regex false-positive issues, but does not catch PII embedded in free-text string values.
+
 Retention is configured per-action-type. A background job enforces TTLs, deleting entries older than the configured window for each action class.
 
 ## Implications
 
 - Audit entries are eventually consistent — the flush interval means a crash within the window can lose the last batch. This is acceptable for most orchestration use cases; use synchronous writes only for legally mandated events.
-- PII scrubbing is applied to values, not keys. If a key name itself is sensitive (e.g., a field named `ssn`), the scrubber must also be extended to handle key patterns.
-- Regex-based scrubbing has false positives and false negatives. It is a risk-reduction layer, not a guarantee. Do not log raw user input for high-sensitivity domains.
+- Key-based redaction catches structured sensitive fields (passwords, tokens, API keys) but does not scrub PII embedded in free-text string values. If free-text fields may contain emails, phone numbers, or SSNs, an additional regex-based scrubbing layer should be added.
+- Key-based redaction has no false-positive risk on values but depends on maintaining a complete sensitive-key list. New sensitive field names must be added to the list as the schema evolves.
 - Batching decouples audit throughput from DB throughput, enabling high-frequency orchestration without DB saturation.
 - The correlation ID enables full trace reconstruction across services, which is the primary value of this pattern for debugging.
 

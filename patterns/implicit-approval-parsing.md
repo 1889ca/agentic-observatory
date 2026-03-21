@@ -1,6 +1,6 @@
 # Implicit Approval Parsing
 
-> Natural language parsing of approval and denial responses so users can approve or reject pending agent actions without structured commands.
+> Natural language parsing of simple approval and denial responses so users can approve or reject pending agent actions without structured commands. Batch and qualified approval parsing are designed but not yet implemented.
 
 ## Problem
 
@@ -89,6 +89,8 @@ function parseApprovalIntent(message, pendingActions) {
 }
 ```
 
+Note: The basic yes/no approval and denial parsing above is fully implemented. The batch approval (`parseBatchApproval`) and qualified approval (`parseQualifiedApproval`) functions called in the flow above are designed but not yet implemented -- messages that would match those paths currently fall through to simple approval/denial or `not-applicable`.
+
 ### Signal Matching with Boundary Awareness
 
 Keyword matching uses word boundaries to avoid false positives. "yes" matches, but "yesterday" does not. "no" matches, but "note" does not:
@@ -109,6 +111,8 @@ function matchesAny(text, signals) {
 ```
 
 ### Batch Approval Parsing
+
+> **Status: Designed, not yet implemented.** The functions below describe the intended behavior.
 
 Users can approve or deny specific subsets of pending actions by referencing IDs, indices, or descriptions:
 
@@ -153,6 +157,8 @@ function parseBatchApproval(text, pendingActions) {
 ```
 
 ### Qualified Approval Handling
+
+> **Status: Designed, not yet implemented.** The functions below describe the intended behavior.
 
 A qualified approval ("yes but change the timeout first") is detected and routed back to the LLM for interpretation rather than being treated as a simple approval:
 

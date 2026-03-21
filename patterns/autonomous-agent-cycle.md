@@ -1,10 +1,10 @@
 # Autonomous Agent Cycle
 
-> Event-driven cognitive tick system with adaptive backpressure, priority-based event processing, and DB-backed outbound queue for autonomous agent behavior.
+> Two-tier autonomous cycle: a fast 5-second cognitive processor tick (event-driven with backpressure) and a slow 2-hour objectives review cycle for high-level goal management.
 
 ## Problem
 
-An AI orchestrator that only responds to user messages is reactive — it waits idle between interactions. But a capable system should proactively process events, triage incoming work, and maintain situational awareness. A continuous scan-strategy-execute loop wastes compute when idle and can't adapt to load. What's needed is an event-driven system with backpressure that processes autonomously while staying responsive.
+An AI orchestrator that only responds to user messages is reactive — it waits idle between interactions. But a capable system should proactively process events, triage incoming work, and maintain situational awareness. A continuous scan-strategy-execute loop wastes compute when idle and can't adapt to load. What's needed is an event-driven system with backpressure that processes autonomously while staying responsive. Additionally, the system needs a slower strategic cycle that periodically reviews high-level objectives, evaluates progress, and generates new goals — operating on a completely different timescale from the fast event processor.
 
 ## Context
 
@@ -16,7 +16,14 @@ An AI orchestrator that only responds to user messages is reactive — it waits 
 
 ## Solution
 
-### Event-Driven Tick System
+There are two distinct autonomous cycles operating at different timescales:
+
+1. **Cognitive Processor Tick** (5-second interval, `cognitive/processor.js`): The fast event-driven loop that processes pending cognitive events, applies backpressure, and manages the outbound queue. This handles the operational tempo.
+2. **Autonomous Objectives Review** (2-hour interval, `agent/cycle.js`): A slower cycle that reviews high-level objectives, evaluates progress against goals, and generates new tasks or adjusts priorities. This handles the strategic tempo.
+
+The sections below primarily document the cognitive processor tick. The objectives review cycle is described in its own section further down.
+
+### Event-Driven Tick System (Cognitive Processor)
 
 Instead of continuously scanning for work, the cognitive processor runs on a configurable tick interval (default 5 seconds). Each tick processes a batch of pending events from a database-backed queue:
 
@@ -149,21 +156,79 @@ async function process() {
 }
 ```
 
+### Autonomous Objectives Review (2-Hour Cycle)
+
+Separate from the fast cognitive tick, a slower objectives review cycle runs every 2 hours. This cycle operates at the strategic level — reviewing high-level goals, evaluating progress, and generating new tasks that feed into the cognitive processor's event queue:
+
+```javascript
+// agent/cycle.js
+const OBJECTIVES_INTERVAL = 2 * 60 * 60 * 1000; // 2 hours
+
+async function objectivesReview() {
+  // 1. Load current objectives and their progress
+  const objectives = await db.query(`
+    SELECT * FROM objectives WHERE status = 'active'
+    ORDER BY priority DESC
+  `);
+
+  for (const objective of objectives) {
+    // 2. Evaluate progress against each objective
+    const progress = await evaluateProgress(objective);
+
+    // 3. Generate new tasks or adjust priorities based on progress
+    if (progress.stalled) {
+      await createCognitiveEvent({
+        type: 'objective:stalled',
+        priority: 7,
+        payload: { objectiveId: objective.id, reason: progress.reason },
+      });
+    }
+
+    if (progress.complete) {
+      await db.query(
+        `UPDATE objectives SET status = 'completed', completed_at = NOW() WHERE id = $1`,
+        [objective.id]
+      );
+    }
+
+    // 4. Optionally generate new sub-goals
+    const newGoals = await deriveSubGoals(objective, progress);
+    for (const goal of newGoals) {
+      await createCognitiveEvent({
+        type: 'goal:proposed',
+        priority: 5,
+        payload: goal,
+      });
+    }
+  }
+}
+
+// Runs on its own interval, independent of the cognitive tick
+let objectivesTimer;
+function startObjectivesReview() {
+  objectivesTimer = setInterval(objectivesReview, OBJECTIVES_INTERVAL);
+}
+```
+
+The objectives review feeds work into the cognitive processor's event queue via `createCognitiveEvent`. The two cycles are decoupled -- the fast tick processes events regardless of their origin, and the slow review generates strategic events at its own pace.
+
 ### Startup Sequence
 
 The cognitive system starts in a specific order — producers seed initial events, then the processor begins ticking:
 
 ```javascript
-// Contract: startAll() seeds rules, starts processor, then producers
+// Contract: startAll() seeds rules, starts both cycles, then producers
 async function startAll({ tickInterval = 5000, timezone }) {
   await seedRules();                    // Load cognitive rules
-  startProcessor(tickInterval);         // Begin tick loop
+  startProcessor(tickInterval);         // Begin 5-second cognitive tick loop
+  startObjectivesReview();              // Begin 2-hour objectives review cycle
   await startProducers();               // Begin event generation
 }
 
 // Shutdown reverses the order
 async function stopAll() {
   stopProcessor();                      // Stop consuming first
+  clearInterval(objectivesTimer);       // Stop objectives review
   await stopProducers();                // Then stop producing
 }
 ```

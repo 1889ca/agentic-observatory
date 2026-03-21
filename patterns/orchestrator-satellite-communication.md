@@ -1,6 +1,6 @@
 # Orchestrator-Worker Communication
 
-> Socket.io-based real-time task dispatch with a taskQueue dequeue pattern, worker registration via events, and GitHub CC fallback when workers are offline.
+> Event-bus-driven task dispatch with DB-persisted task lifecycle, worker registration via Socket.io, and GitHub CC fallback when workers are offline.
 
 ## Problem
 
@@ -17,6 +17,10 @@ An orchestrator needs to dispatch heterogeneous work (code generation, issue sol
 
 ## Solution
 
+### Architecture Overview
+
+Task dispatch uses an internal event bus (`internalBus`) for event aggregation rather than direct Socket.io dequeue. Tasks are persisted in the database with a full lifecycle state machine (pending -> assigned -> running -> completed/failed/abandoned). The Socket.io layer still exists for real-time worker communication, but task state management has moved to DB-backed persistence with event-driven transitions.
+
 ### Worker Registration via Socket.io
 
 Workers announce themselves to the orchestrator on connect using a `worker:register` event. The orchestrator maintains an in-memory registry of available workers keyed by socket ID:
@@ -27,8 +31,8 @@ io.on('connection', (socket) => {
   socket.on('worker:register', ({ capabilities, workerId }) => {
     registry.set(socket.id, { socket, capabilities, workerId, busy: false });
 
-    // Drain any queued tasks this worker can handle
-    drainQueue(socket.id);
+    // Notify the event bus that a worker is available
+    internalBus.emit('worker:available', { socketId: socket.id, capabilities });
   });
 
   socket.on('disconnect', () => {
@@ -37,58 +41,47 @@ io.on('connection', (socket) => {
 });
 ```
 
-### Task Assignment and the Dequeue Pattern
+### DB-Persisted Task Lifecycle
 
-When a task arrives, the orchestrator attempts to find a free worker immediately. If none is available, the task is persisted to a queue and dequeued when a worker registers or becomes free:
-
-```javascript
-// orchestrator/taskDispatcher.js
-async function dispatch(task) {
-  const worker = findFreeWorker(task.type);
-
-  if (worker) {
-    assignToWorker(worker, task);
-  } else {
-    // Persist for later — queue survives restarts
-    await taskQueue.enqueue(task);
-
-    // If no workers at all, fall back to GitHub CC
-    if (registry.size === 0) {
-      await githubCCFallback.run(task);
-    }
-  }
-}
-
-async function drainQueue(socketId) {
-  const worker = registry.get(socketId);
-  let task;
-
-  while ((task = await taskQueue.dequeue(worker.capabilities))) {
-    assignToWorker(worker, task);
-    if (worker.busy) break;
-  }
-}
-```
-
-### Task Assignment Event
-
-The orchestrator pushes work to the worker via a `task:assign` event. The payload includes everything the worker needs to execute independently:
+Tasks are persisted in the database with a state machine governing transitions. The `internalBus` listens for events and triggers state transitions:
 
 ```javascript
-// orchestrator/taskDispatcher.js
-function assignToWorker(worker, task) {
-  worker.busy = true;
-  worker.socket.emit('task:assign', {
-    taskId: task.id,
-    type: task.type,
-    payload: task.payload,
-  });
+// orchestrator/taskLifecycle.js
+const TASK_STATES = ['pending', 'assigned', 'running', 'completed', 'failed', 'abandoned'];
+
+async function createTask(task) {
+  const record = await db.query(`
+    INSERT INTO tasks (id, type, payload, status, created_at)
+    VALUES ($1, $2, $3, 'pending', NOW()) RETURNING *
+  `, [task.id, task.type, JSON.stringify(task.payload)]);
+
+  internalBus.emit('task:created', record);
+  return record;
 }
+
+// Event-driven dispatch: when a worker becomes available, assign pending tasks
+internalBus.on('worker:available', async ({ socketId, capabilities }) => {
+  const task = await db.query(`
+    UPDATE tasks SET status = 'assigned', assigned_to = $1, assigned_at = NOW()
+    WHERE id = (
+      SELECT id FROM tasks WHERE status = 'pending' AND type = ANY($2)
+      ORDER BY created_at ASC LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    ) RETURNING *
+  `, [socketId, capabilities]);
+
+  if (task) {
+    const worker = registry.get(socketId);
+    worker.socket.emit('task:assign', {
+      taskId: task.id, type: task.type, payload: task.payload,
+    });
+  }
+});
 ```
 
 ### Completion Reporting
 
-Workers emit `task:complete` when finished. The orchestrator receives it, marks the worker free, and drains the queue again:
+Workers emit `task:complete` when finished. The orchestrator persists the outcome and emits events for downstream consumers:
 
 ```javascript
 // worker/index.js — worker side
@@ -101,15 +94,18 @@ socket.on('task:assign', async ({ taskId, type, payload }) => {
   }
 });
 
-// orchestrator/taskDispatcher.js — orchestrator side
+// orchestrator/taskLifecycle.js — orchestrator side
 socket.on('task:complete', async ({ taskId, status, result, error }) => {
   const worker = registry.get(socket.id);
   if (worker) worker.busy = false;
 
-  await taskQueue.markDone(taskId, { status, result, error });
+  await db.query(`
+    UPDATE tasks SET status = $1, result = $2, error = $3, completed_at = NOW()
+    WHERE id = $4
+  `, [status, JSON.stringify(result), error, taskId]);
 
-  // Immediately pick up next queued task if any
-  drainQueue(socket.id);
+  internalBus.emit('task:completed', { taskId, status });
+  internalBus.emit('worker:available', { socketId: socket.id, capabilities: worker.capabilities });
 });
 ```
 
@@ -128,40 +124,45 @@ async function run(task) {
 
 ## Implications
 
-- Socket.io dispatch is real-time and push-based — the orchestrator does not poll; workers pull work the moment they register or finish a prior task
-- The `taskQueue.dequeue()` pattern decouples arrival from execution — tasks can accumulate during worker downtime and drain automatically on reconnect
+- The `internalBus` event aggregation decouples task creation from dispatch — any component can emit `task:created` and the bus routes it to the assignment logic
+- DB-persisted task state (with `FOR UPDATE SKIP LOCKED`) is the source of truth, surviving restarts and enabling horizontal scaling across multiple orchestrator instances
+- Socket.io remains the real-time transport for pushing assignments to workers and receiving completions, but it no longer owns task state
+- The event-driven `worker:available` pattern replaces explicit queue draining — when a worker registers or completes a task, the bus triggers assignment automatically
 - The GitHub CC fallback ensures no task is permanently stranded, but it is synchronous and slower than a live worker; it should be treated as a safety net, not a primary path
-- Worker availability is ephemeral — the registry is in-memory, so a restart clears it; the persistent queue is the source of truth for unprocessed work
-- `drainQueue` runs after both registration and task completion, so a single worker coming online can process a backlog without any external trigger
-- The `task:complete` event carries the full outcome (status, result, error), giving the orchestrator everything it needs to update persistence and notify downstream consumers in one step
+- The full lifecycle state machine (pending -> assigned -> running -> completed/failed/abandoned) provides richer observability than a simple pending/done model
 - Agent sessions still provide isolation between concurrent workers, preventing context bleed across tasks
 
 ## Code Example
 
 ```javascript
-// Full lifecycle: worker comes online, picks up queued task, reports completion
+// Full lifecycle: task created, worker comes online, event bus assigns, worker reports completion
 
 // --- Orchestrator side ---
 
 io.on('connection', (socket) => {
   socket.on('worker:register', ({ workerId, capabilities }) => {
     registry.set(socket.id, { socket, workerId, capabilities, busy: false });
-    drainQueue(socket.id); // immediately assign any waiting tasks
+    internalBus.emit('worker:available', { socketId: socket.id, capabilities });
   });
 
   socket.on('task:complete', async ({ taskId, status, result, error }) => {
     const worker = registry.get(socket.id);
     if (worker) worker.busy = false;
 
-    await taskQueue.markDone(taskId, { status, result, error });
-    drainQueue(socket.id); // pick up the next task without waiting
+    await db.query(
+      `UPDATE tasks SET status = $1, result = $2, error = $3, completed_at = NOW() WHERE id = $4`,
+      [status, JSON.stringify(result), error, taskId]
+    );
+
+    internalBus.emit('task:completed', { taskId, status });
+    internalBus.emit('worker:available', { socketId: socket.id, capabilities: worker.capabilities });
   });
 
   socket.on('disconnect', () => registry.delete(socket.id));
 });
 
-// Enqueue a new task — dispatch immediately if a worker is free
-await dispatch({ id: 'task-42', type: 'solve-issue', payload: { issueId: 99 } });
+// Create a new task — the event bus handles dispatch when a worker is available
+await createTask({ id: 'task-42', type: 'solve-issue', payload: { issueId: 99 } });
 
 // --- Worker side ---
 

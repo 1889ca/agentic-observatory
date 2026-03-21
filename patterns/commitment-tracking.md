@@ -1,229 +1,105 @@
-# Commitment Tracking and Extraction
+# Commitment Tracking
 
-> Automatic detection of commitments from natural language conversations, with task creation, fulfillment tracking, and overdue escalation to close the loop on stated intentions.
+> Monitoring and escalation of explicitly created commitments, with progressive overdue notifications to close the loop on stated intentions.
 
 ## Problem
 
-Agents and humans make commitments in natural language constantly — "I'll send that report by Friday", "Let's deploy after lunch", "I'll look into that bug". These commitments live only in conversation history, which nobody re-reads. Without extraction and tracking, commitments silently expire. The agent says it will do something, doesn't, and nobody notices until trust has already eroded. Multiply this across dozens of daily interactions and the agent becomes the colleague who always says "yeah, I'll get to that" and never does.
+Agents and humans make commitments constantly — "I'll send that report by Friday", "Let's deploy after lunch", "I'll look into that bug". These commitments live only in conversation history, which nobody re-reads. Without tracking, commitments silently expire. The agent says it will do something, doesn't, and nobody notices until trust has already eroded.
 
-The problem compounds with multi-party conversations. When an agent commits to actions on behalf of a user ("I'll set up that meeting with Sarah"), the user assumes it's handled. There's no mechanism to verify the commitment was fulfilled, no reminder when it wasn't, and no audit trail showing what was promised versus what was delivered.
+The challenge isn't just recording commitments — it's knowing when they've gone stale. A commitment made three days ago with no follow-up is a different problem than one made an hour ago. The system needs to apply increasing pressure as commitments age past their due dates, without becoming a relentless nag about items that were simply forgotten to be marked done.
 
 ## Context
 
 - A conversational AI agent that makes promises during interactions (task completion, follow-ups, scheduled actions)
-- Multiple conversation channels where commitments can be made (chat, email, Slack, voice transcripts)
-- Need to close the loop on stated intentions without requiring users to manually create tasks
-- Integration with an existing task management system for tracking and escalation
-- Commitments vary in specificity — some have explicit deadlines ("by 3pm"), others are vague ("soon", "later today")
-- The agent should be accountable for its own commitments, not just track human ones
+- Commitments are created explicitly — either by the agent flagging its own promises or by the user marking something as a commitment
+- No automated extraction pipeline exists; the system tracks commitments it's told about, not ones it infers
+- Integration with a document storage system where commitments live alongside other records
+- Progressive escalation is needed so that forgotten commitments don't silently disappear
 
 ## Solution
 
-### Commitment Extraction
+### Commitment Storage
 
-Every outgoing agent message and incoming human message passes through a commitment extractor. The first pass uses regex patterns to catch common commitment language, then an LLM pass disambiguates and enriches:
-
-```javascript
-// lib/commitments.js
-const COMMITMENT_PATTERNS = [
-  { pattern: /\bI'?ll\s+(?!just\b)(.+?)(?:\.|,|$)/gi, strength: 'strong' },
-  { pattern: /\bI'?m going to\s+(.+?)(?:\.|,|$)/gi, strength: 'strong' },
-  { pattern: /\bLet(?:'s| us)\s+(.+?)(?:\.|,|$)/gi, strength: 'moderate' },
-  { pattern: /\bI(?:'ll| will) make sure\s+(.+?)(?:\.|,|$)/gi, strength: 'strong' },
-  { pattern: /\bI can (?:do|handle|take care of)\s+(.+?)(?:\.|,|$)/gi, strength: 'moderate' },
-  { pattern: /\bWe should\s+(.+?)(?:\.|,|$)/gi, strength: 'weak' },
-];
-
-function extractCandidates(message) {
-  const candidates = [];
-
-  for (const { pattern, strength } of COMMITMENT_PATTERNS) {
-    let match;
-    while ((match = pattern.exec(message)) !== null) {
-      candidates.push({
-        raw: match[0].trim(),
-        action: match[1].trim(),
-        strength,
-        position: match.index,
-      });
-    }
-  }
-
-  return candidates;
-}
-```
-
-Regex alone produces too many false positives — "I'll think about it" is not a commitment, "I'll deploy the hotfix" is. An LLM pass filters and enriches the candidates:
+Commitments are stored as documents in the existing documents table, distinguished by an `isCommitment` flag rather than living in a dedicated commitments table. This piggybacks on the document system's existing metadata, search, and lifecycle infrastructure:
 
 ```javascript
-// lib/commitments.js
-async function classifyCommitments(candidates, conversationContext) {
-  if (candidates.length === 0) return [];
-
-  const result = await llm.structured({
-    prompt: `Given these potential commitments extracted from a conversation,
-classify each as a real commitment or not. For real commitments, extract:
-- action: what specifically was promised
-- owner: who made the commitment (agent or human)
-- deadline: explicit or inferred deadline (null if unclear)
-- confidence: 0-1 how confident this is a real commitment
-
-Candidates: ${JSON.stringify(candidates)}
-Conversation context: ${conversationContext}`,
-    schema: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          raw: { type: 'string' },
-          isCommitment: { type: 'boolean' },
-          action: { type: 'string' },
-          owner: { enum: ['agent', 'human'] },
-          deadline: { type: 'string', nullable: true },
-          confidence: { type: 'number' },
-        },
-      },
-    },
-  });
-
-  return result.filter(c => c.isCommitment && c.confidence > 0.6);
-}
-```
-
-### Commitment Lifecycle
-
-Extracted commitments flow through a state machine: `extracted → pending → fulfilled | overdue | dismissed`.
-
-```
-extracted ──→ pending ──→ fulfilled
-                │
-                ├──→ overdue ──→ escalated
-                │
-                └──→ dismissed (false positive)
-```
-
-Each commitment is stored with enough context to verify fulfillment later:
-
-```javascript
-// lib/commitments.js
-async function createCommitment({ action, owner, deadline, source, conversationId }) {
-  const dueAt = deadline
-    ? parseDeadline(deadline)
-    : inferDeadline(action);
-
+// Creating a commitment is just creating a document with the flag set
+async function createCommitment({ action, owner, dueAt, source }) {
   return db.query(`
-    INSERT INTO commitments (action, owner, due_at, status, source, conversation_id, created_at)
-    VALUES ($1, $2, $3, 'pending', $4, $5, NOW())
+    INSERT INTO documents (content, metadata, created_at)
+    VALUES ($1, $2, NOW())
     RETURNING *
-  `, [action, owner, dueAt, source, conversationId]);
-}
-
-function inferDeadline(action) {
-  // Time-suggestive language gets shorter deadlines
-  if (/\b(now|right away|immediately)\b/i.test(action)) {
-    return new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
-  }
-  if (/\b(today|this afternoon|this morning)\b/i.test(action)) {
-    return endOfDay();
-  }
-  if (/\b(tomorrow)\b/i.test(action)) {
-    return endOfDay(addDays(new Date(), 1));
-  }
-  if (/\b(this week)\b/i.test(action)) {
-    return endOfWeek();
-  }
-  // No temporal signal — default to 24 hours
-  return new Date(Date.now() + 24 * 60 * 60 * 1000);
+  `, [
+    action,
+    JSON.stringify({ isCommitment: true, owner, dueAt, source, status: 'pending' }),
+  ]);
 }
 ```
 
-### Fulfillment Detection
+### Monitoring: Active and Overdue Queries
 
-A periodic check runs against pending commitments, comparing them to completed actions in the task system. Fulfillment detection uses both exact matching (task IDs linked to commitments) and semantic matching (LLM comparison of commitment text against recent activity):
-
-```javascript
-// lib/task-lifecycle.js
-async function checkFulfillment() {
-  const pending = await db.query(`
-    SELECT * FROM commitments
-    WHERE status = 'pending'
-    ORDER BY due_at ASC
-  `);
-
-  for (const commitment of pending.rows) {
-    // Check 1: Was a linked task completed?
-    if (commitment.linked_task_id) {
-      const task = await getTask(commitment.linked_task_id);
-      if (task?.status === 'completed') {
-        await markFulfilled(commitment.id, { method: 'task_link', taskId: task.id });
-        continue;
-      }
-    }
-
-    // Check 2: Semantic match against recent completed actions
-    const recentActions = await getRecentActions(commitment.owner, {
-      since: commitment.created_at,
-      limit: 50,
-    });
-
-    const match = await llm.structured({
-      prompt: `Was this commitment fulfilled by any of these actions?
-Commitment: "${commitment.action}" (made ${commitment.created_at})
-Recent actions: ${JSON.stringify(recentActions.map(a => a.summary))}`,
-      schema: {
-        type: 'object',
-        properties: {
-          fulfilled: { type: 'boolean' },
-          matchedAction: { type: 'string', nullable: true },
-          confidence: { type: 'number' },
-        },
-      },
-    });
-
-    if (match.fulfilled && match.confidence > 0.75) {
-      await markFulfilled(commitment.id, {
-        method: 'semantic_match',
-        matchedAction: match.matchedAction,
-        confidence: match.confidence,
-      });
-    }
-  }
-}
-```
-
-### Overdue Escalation
-
-Commitments that pass their deadline without fulfillment escalate through the notification system. Escalation is progressive — a gentle reminder first, then a more urgent notification if still unresolved:
+The tracking system provides two core queries — active commitments and overdue commitments. These are the foundation for both user-facing status checks and the escalation system:
 
 ```javascript
 // lib/commitments.js
-async function escalateOverdue() {
-  const overdue = await db.query(`
-    SELECT * FROM commitments
-    WHERE status = 'pending' AND due_at < NOW()
-    ORDER BY due_at ASC
+async function getActive() {
+  return db.query(`
+    SELECT * FROM documents
+    WHERE metadata->>'isCommitment' = 'true'
+      AND metadata->>'status' = 'pending'
+    ORDER BY (metadata->>'dueAt')::timestamptz ASC
   `);
+}
+
+async function getOverdue() {
+  return db.query(`
+    SELECT * FROM documents
+    WHERE metadata->>'isCommitment' = 'true'
+      AND metadata->>'status' = 'pending'
+      AND (metadata->>'dueAt')::timestamptz < NOW()
+    ORDER BY (metadata->>'dueAt')::timestamptz ASC
+  `);
+}
+```
+
+### Progressive Escalation
+
+Overdue commitments escalate through three levels based on how long they've been past due. The escalation level drives notification priority and frequency:
+
+```javascript
+// lib/commitments.js
+function getEscalationLevel(commitment) {
+  const dueAt = new Date(commitment.metadata.dueAt);
+  const hoursOverdue = (Date.now() - dueAt) / (1000 * 60 * 60);
+
+  if (hoursOverdue < 2) return 1;   // Gentle reminder
+  if (hoursOverdue < 24) return 2;  // Elevated — needs attention
+  return 3;                          // Critical — something was dropped
+}
+
+async function escalateOverdue() {
+  const overdue = await getOverdue();
 
   for (const commitment of overdue.rows) {
-    const hoursOverdue = (Date.now() - new Date(commitment.due_at)) / (1000 * 60 * 60);
+    const level = getEscalationLevel(commitment);
 
-    if (hoursOverdue < 2 && !commitment.first_reminder_at) {
-      // Gentle nudge
-      await notify(commitment.owner, {
+    if (level === 1) {
+      await notify(commitment.metadata.owner, {
         type: 'commitment_reminder',
-        message: `Heads up — you committed to: "${commitment.action}" (due ${timeAgo(commitment.due_at)})`,
+        message: `Heads up — you committed to: "${commitment.content}" (due ${timeAgo(commitment.metadata.dueAt)})`,
         priority: 'low',
       });
-      await db.query(`UPDATE commitments SET first_reminder_at = NOW() WHERE id = $1`, [commitment.id]);
-
-    } else if (hoursOverdue >= 2) {
-      // Mark overdue, escalate
-      await db.query(`UPDATE commitments SET status = 'overdue' WHERE id = $1`, [commitment.id]);
-      await notify(commitment.owner, {
+    } else if (level === 2) {
+      await notify(commitment.metadata.owner, {
         type: 'commitment_overdue',
-        message: `Overdue commitment: "${commitment.action}" — due ${timeAgo(commitment.due_at)}. Should this be rescheduled or dismissed?`,
+        message: `Overdue: "${commitment.content}" — due ${timeAgo(commitment.metadata.dueAt)}. Reschedule or dismiss?`,
         priority: 'medium',
-        actions: ['reschedule', 'dismiss', 'mark_done'],
+      });
+    } else {
+      await notify(commitment.metadata.owner, {
+        type: 'commitment_critical',
+        message: `Dropped commitment: "${commitment.content}" — ${timeAgo(commitment.metadata.dueAt)} overdue. This needs resolution.`,
+        priority: 'high',
       });
     }
   }
@@ -232,50 +108,39 @@ async function escalateOverdue() {
 
 ## Implications
 
-- **False positives are the primary risk.** Not every "I'll" is a commitment — "I'll think about it" and "I'll be honest" are conversational filler. The confidence threshold (0.6) is deliberately permissive; production systems will need tuning per domain. Too aggressive and the system becomes a nag; too conservative and real commitments slip through.
-- **Due date inference is inherently fuzzy.** "After lunch" means different things to different people. The 24-hour default for unspecified deadlines is a compromise — short enough to catch forgotten items, long enough to avoid premature escalation. Vague commitments ("soon", "when I get a chance") are the hardest to deadline and may warrant a separate "soft commitment" category with no escalation.
-- **Creates accountability pressure on the agent.** Once the agent knows its commitments are tracked, the system design pressures the agent to either follow through or explicitly revise its commitments. This is the intended behavior — but it also means the agent may become conservative about making commitments, preferring hedged language to avoid tracking.
-- **Semantic fulfillment matching is expensive.** Each pending commitment requires an LLM call during the fulfillment check cycle. Batching commitments per check cycle and caching recent actions reduces cost, but this is still the most compute-intensive part of the pipeline.
-- **Commitment extraction adds latency to the message path.** Running extraction on every message slows the response pipeline. Running it asynchronously (fire-and-forget after the response is sent) avoids latency but means commitments from the most recent exchange aren't yet tracked if the user immediately asks "what did you commit to?"
+- **This is a partial implementation.** The system tracks and escalates commitments but does not automatically extract them from conversation. Commitments must be explicitly created — either by the agent recognizing its own promises and calling `createCommitment()`, or by the user flagging something. This means commitments can still slip through if nobody thinks to record them.
+- **Document-flag storage is pragmatic but queryable.** Storing commitments as documents with an `isCommitment` flag avoids schema migration and leverages existing document infrastructure. The trade-off is that commitment-specific queries rely on JSON metadata filtering rather than dedicated indexed columns, which could slow down at scale.
+- **Progressive escalation prevents notification fatigue.** Three escalation levels mean a commitment that's 30 minutes overdue gets a gentle nudge, not an alarm. This is important — most "overdue" commitments are just slightly late, and aggressive escalation would train users to ignore all notifications.
+- **No fulfillment detection exists.** The system cannot automatically determine whether a commitment was satisfied. Commitments must be manually marked as fulfilled or dismissed. This is the biggest gap — without fulfillment detection, the system is essentially a deadline tracker with escalating reminders.
+- **Escalation without extraction inverts the expected workflow.** Most commitment tracking systems start with "detect the commitment" and end with "remind if overdue." This implementation only has the tail end, which means the quality of tracking depends entirely on the discipline of whoever creates the commitment records.
 
 ## Code Example
 
 ```javascript
-// Integration: extract commitments from agent responses in the message pipeline
+// Integration: commitment monitoring in the cognitive loop or cron
 // lib/commitments.js
 
-async function processMessage(message, { role, conversationId }) {
-  // Extract commitment candidates via regex
-  const candidates = extractCandidates(message);
-  if (candidates.length === 0) return;
-
-  // Classify with LLM
-  const commitments = await classifyCommitments(candidates, message);
-
-  // Create commitment records
-  for (const commitment of commitments) {
-    await createCommitment({
-      action: commitment.action,
-      owner: role === 'assistant' ? 'agent' : 'human',
-      deadline: commitment.deadline,
-      source: 'conversation',
-      conversationId,
-    });
-  }
-}
-
-// Periodic fulfillment and escalation checks (called from cognitive loop or cron)
 async function commitmentCycle() {
-  await checkFulfillment();
+  // Escalate anything overdue
   await escalateOverdue();
 
-  const stats = await db.query(`
-    SELECT status, COUNT(*) as count FROM commitments
-    WHERE created_at > NOW() - INTERVAL '7 days'
-    GROUP BY status
-  `);
-  logger.info('Commitment cycle complete', Object.fromEntries(stats.rows.map(r => [r.status, r.count])));
+  // Log current state for observability
+  const active = await getActive();
+  const overdue = await getOverdue();
+
+  logger.info('Commitment cycle complete', {
+    active: active.rows.length,
+    overdue: overdue.rows.length,
+  });
 }
+
+// Creating a commitment explicitly (e.g., agent self-reporting)
+await createCommitment({
+  action: 'Deploy the hotfix to production',
+  owner: 'agent',
+  dueAt: new Date(Date.now() + 2 * 60 * 60 * 1000), // 2 hours
+  source: 'conversation',
+});
 ```
 
 ## Related Patterns
