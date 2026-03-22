@@ -1,224 +1,131 @@
 # Autonomy Boost and Approval Learning
 
-> Progressive auto-approval based on learned user behavior patterns, where repeated approval of similar actions teaches the system to skip confirmation for trusted action types.
+> Time-boxed autonomy boost presets that grant temporary elevated permissions for a specified duration, replacing approval-pattern learning with explicit user-controlled trust windows.
 
 ## Problem
 
-Agent systems that require approval for every action create friction that defeats the purpose of automation. Users end up clicking "approve" dozens of times for routine operations they always allow. But removing approvals entirely is dangerous — users need guardrails for unfamiliar or high-risk actions. The challenge is distinguishing between actions the user *always* approves (and would prefer to skip) and actions that genuinely need review.
+Agent systems that require approval for every action create friction that defeats the purpose of automation. But removing approvals entirely is dangerous. Users need a way to say "I trust you for the next couple hours while I'm watching" without permanently lowering safety guardrails. Learning from approval history is appealing in theory, but in practice it's brittle — user intent changes, contexts shift, and a pattern of approvals in one situation doesn't generalize to another.
 
 ## Context
 
-- An agent system with a human-in-the-loop approval step for tool execution
-- Users repeatedly approve the same types of actions (running tests, reading files, querying databases)
-- Different users have different approval patterns — what's routine for one may be risky for another
-- The system needs to be conservative by default and earn autonomy over time
-- A single denial should override accumulated trust — false positives are much worse than false negatives
+- An agent system with human-in-the-loop approval for tool execution
+- Users have work sessions where they want reduced friction for a known period
+- Permanent autonomy changes are risky — users want temporary trust windows
+- The boost should expire automatically without requiring the user to remember to revoke it
+- Different situations call for different boost durations
 
 ## Solution
 
-### Action Fingerprinting
+### Time-Boxed Boost Presets
 
-Each action is reduced to a fingerprint that captures its essential identity — the tool name, argument patterns (not exact values), and domain context. This allows the system to recognize "running npm test in project X" as a category, not just a single event:
+Instead of learning from approval patterns, the system offers explicit boost presets. The user grants a temporary autonomy boost for a specific duration — the system operates with elevated permissions until the timer expires:
 
 ```javascript
-// lib/agent/autonomy-boost/fingerprint.js
-function createFingerprint(toolName, args, context) {
-  const argPatterns = {};
+// autonomy/boost.js
+const activeBoosts = new Map();
 
-  for (const [key, value] of Object.entries(args)) {
-    // Capture shape, not exact values
-    if (typeof value === 'string' && value.length > 50) {
-      argPatterns[key] = 'long_string';
-    } else if (typeof value === 'string') {
-      argPatterns[key] = value; // Short strings are kept (e.g., command names)
-    } else {
-      argPatterns[key] = typeof value;
-    }
-  }
-
-  return {
-    toolName,
-    argPatterns,
-    domain: context.project || context.domain || 'global',
-    hash: hashObject({ toolName, argPatterns, domain: context.project }),
+function grantBoost(tenantId, preset) {
+  const durations = {
+    short: 2 * 60 * 60 * 1000,   // 2 hours
+    long: 4 * 60 * 60 * 1000,    // 4 hours
   };
-}
 
-function hashObject(obj) {
-  return crypto.createHash('sha256').update(JSON.stringify(obj)).digest('hex').slice(0, 16);
-}
-```
+  const duration = durations[preset] || durations.short;
+  const boost = {
+    tenantId,
+    preset,
+    grantedAt: Date.now(),
+    expiresAt: Date.now() + duration,
+  };
 
-### Approval History Tracking
-
-Every approval or denial is recorded against the action's fingerprint hash. The history provides the data for auto-approval decisions:
-
-```javascript
-// lib/agent/autonomy-boost/history.js
-async function recordApproval(fingerprintHash, approved) {
-  await db.query(
-    `INSERT INTO approval_history (fingerprint_hash, approved, timestamp)
-     VALUES ($1, $2, NOW())`,
-    [fingerprintHash, approved]
-  );
-
-  // If denied, reset the consecutive approval counter immediately
-  if (!approved) {
-    await db.query(
-      `UPDATE approval_counters SET consecutive_approvals = 0, last_denied_at = NOW()
-       WHERE fingerprint_hash = $1`,
-      [fingerprintHash]
-    );
-  } else {
-    await db.query(
-      `INSERT INTO approval_counters (fingerprint_hash, consecutive_approvals, last_approved_at)
-       VALUES ($1, 1, NOW())
-       ON CONFLICT (fingerprint_hash) DO UPDATE
-       SET consecutive_approvals = approval_counters.consecutive_approvals + 1,
-           last_approved_at = NOW()`,
-      [fingerprintHash]
-    );
-  }
+  activeBoosts.set(tenantId, boost);
+  return boost;
 }
 ```
 
-### Auto-Approval Decision
+### Boost Checking
 
-When an action is about to be executed, the system checks whether it qualifies for auto-approval. The threshold is configurable, and a single denial resets the counter:
+Before requesting approval for an action, the system checks whether an active boost exists. If boosted, actions that would normally require approval are auto-executed:
 
 ```javascript
-// lib/agent/autonomy-boost/decide.js
-const AUTO_APPROVE_THRESHOLD = parseInt(process.env.AUTO_APPROVE_THRESHOLD) || 5;
+function isBoosted(tenantId) {
+  const boost = activeBoosts.get(tenantId);
+  if (!boost) return false;
 
-async function shouldAutoApprove(fingerprint) {
-  const counter = await db.query(
-    'SELECT consecutive_approvals, last_denied_at FROM approval_counters WHERE fingerprint_hash = $1',
-    [fingerprint.hash]
-  );
-
-  if (counter.rows.length === 0) return false;
-
-  const { consecutive_approvals, last_denied_at } = counter.rows[0];
-
-  // Must meet threshold
-  if (consecutive_approvals < AUTO_APPROVE_THRESHOLD) return false;
-
-  // If there's a recent denial, require more consecutive approvals to rebuild trust
-  if (last_denied_at) {
-    const approvalsSinceDenial = await db.query(
-      `SELECT COUNT(*) as count FROM approval_history
-       WHERE fingerprint_hash = $1 AND approved = true AND timestamp > $2`,
-      [fingerprint.hash, last_denied_at]
-    );
-
-    if (parseInt(approvalsSinceDenial.rows[0].count) < AUTO_APPROVE_THRESHOLD) return false;
+  if (Date.now() > boost.expiresAt) {
+    activeBoosts.delete(tenantId);
+    return false;
   }
 
   return true;
 }
-```
 
-### Integration with Tool Execution
-
-The approval check sits in the tool execution pipeline, between action planning and execution. If auto-approved, the user sees a brief notification instead of a blocking prompt:
-
-```javascript
-// lib/agent/execute-with-approval.js
 async function executeWithApproval(tool, args, context) {
-  const fingerprint = createFingerprint(tool.name, args, context);
-  const autoApproved = await shouldAutoApprove(fingerprint);
-
-  if (autoApproved) {
-    context.notify(`Auto-approved: ${tool.name} (based on your history)`);
-    const result = await tool.execute(args);
-    await recordApproval(fingerprint.hash, true);
-    return result;
+  if (isBoosted(context.tenantId)) {
+    context.notify(`Boost active: auto-executing ${tool.name}`);
+    return tool.execute(args);
   }
 
-  // Requires explicit approval
-  const approved = await context.requestApproval({
-    tool: tool.name,
-    args,
-    fingerprint,
-  });
-
-  await recordApproval(fingerprint.hash, approved);
-
-  if (!approved) {
-    return { rejected: true, tool: tool.name };
-  }
-
+  const approved = await context.requestApproval({ tool: tool.name, args });
+  if (!approved) return { rejected: true };
   return tool.execute(args);
 }
 ```
 
-### Batch Approval
+### Boost Revocation
 
-When multiple pending actions share similar fingerprints, they are grouped for bulk approve/deny. This reduces friction for repetitive workflows:
+Users can manually revoke a boost at any time. Boosts also self-expire when the duration elapses:
 
 ```javascript
-// lib/agent/batch-approval.js
-function groupForBatchApproval(pendingActions) {
-  const groups = new Map();
-
-  for (const action of pendingActions) {
-    const fingerprint = createFingerprint(action.tool, action.args, action.context);
-    const key = fingerprint.hash;
-
-    if (!groups.has(key)) {
-      groups.set(key, {
-        fingerprint,
-        description: `${action.tool} (${fingerprint.domain})`,
-        actions: [],
-      });
-    }
-    groups.get(key).actions.push(action);
-  }
-
-  return Array.from(groups.values());
+function revokeBoost(tenantId) {
+  activeBoosts.delete(tenantId);
 }
 
-async function batchApprove(group, approved) {
-  for (const action of group.actions) {
-    await recordApproval(group.fingerprint.hash, approved);
+function getBoostStatus(tenantId) {
+  const boost = activeBoosts.get(tenantId);
+  if (!boost) return { active: false };
 
-    if (approved) {
-      await action.tool.execute(action.args);
-    }
+  const remaining = boost.expiresAt - Date.now();
+  if (remaining <= 0) {
+    activeBoosts.delete(tenantId);
+    return { active: false };
   }
+
+  return {
+    active: true,
+    preset: boost.preset,
+    remainingMs: remaining,
+  };
 }
 ```
 
 ## Implications
 
-- Conservative by default — new action types always require explicit approval until the threshold is met
-- A single denial resets the counter, making the system strongly biased toward safety over convenience
-- Fingerprinting by argument patterns (not exact values) allows generalization — approving `npm test` once in a project teaches the system about `npm test` in that project, not just that specific invocation
-- The `domain` field in fingerprints means approval learning is project-scoped — approving `rm` in a test project doesn't auto-approve `rm` in production
-- Auto-approval notifications are important UX — users must know when the system acts on their behalf, even if they don't need to confirm
-- Batch approval reduces friction for bulk operations but requires careful grouping to avoid accidentally approving unrelated actions
-- This pattern is distinct from confidence-based autonomy gating, which operates at the domain level. This is action-pattern-level learning that adapts to individual user behavior
+- Time-boxed boosts are explicit and predictable — users know exactly when elevated autonomy expires
+- No learning complexity — the system doesn't need to track approval history, fingerprint actions, or maintain consecutive counters
+- Boost expiry is automatic, eliminating the risk of permanently elevated permissions from forgotten settings
+- The preset model (2h/4h) is simple but inflexible — users can't specify arbitrary durations without extending the presets
+- Boosts apply to all actions equally during the window — there's no per-action granularity during a boost
+- Boost state is in-memory, so process restarts clear active boosts (fail-safe: permissions drop to default)
+- This pattern is complementary to domain confidence — confidence provides long-term earned trust, boosts provide short-term explicit trust
 
 ## Code Example
 
 ```javascript
-// Typical flow: user approves "npm test" in project riley 5 times, then it auto-approves
+// User grants a 2-hour boost via chat
+// "Give yourself a boost for a couple hours"
+const boost = grantBoost(tenantId, 'short');
+// → { preset: 'short', expiresAt: <now + 2h> }
 
-// First 5 times: explicit approval prompt
-// User: "run the tests"
-// Agent: [Requesting approval] Run npm test in /projects/riley
-// User: [Approve]
+// During the boost window, actions auto-execute
+// User: "run the tests and deploy if they pass"
+// Agent: Boost active: auto-executing run_tests
+// Agent: Boost active: auto-executing deploy
+// (no approval prompts)
 
-// 6th time onwards: auto-approved
-// User: "run the tests"
-// Agent: Auto-approved: npm_test (based on your history)
-// [tests run immediately]
-
-// If user ever denies:
-// User: "run the tests" (but they changed their mind about auto-approving)
-// Agent: [Requesting approval] Run npm test in /projects/riley
-// User: [Deny]
-// Counter resets — next 5 approvals needed to re-earn auto-approval
+// After 2 hours, boost expires automatically
+// User: "deploy to staging"
+// Agent: [Requesting approval] Deploy to staging?
 ```
 
 ## Related Patterns

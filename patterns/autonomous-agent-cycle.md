@@ -1,278 +1,133 @@
 # Autonomous Agent Cycle
 
-> Two-tier autonomous cycle: a fast 5-second cognitive processor tick (event-driven with backpressure) and a slow 2-hour objectives review cycle for high-level goal management.
+> Queue-based cognitive processor with rule matching for continuous autonomous event processing, paired with a periodic objectives review loop for goal tracking.
 
 ## Problem
 
-An AI orchestrator that only responds to user messages is reactive — it waits idle between interactions. But a capable system should proactively process events, triage incoming work, and maintain situational awareness. A continuous scan-strategy-execute loop wastes compute when idle and can't adapt to load. What's needed is an event-driven system with backpressure that processes autonomously while staying responsive. Additionally, the system needs a slower strategic cycle that periodically reviews high-level objectives, evaluates progress, and generates new goals — operating on a completely different timescale from the fast event processor.
+An AI orchestrator that only responds to user messages is reactive — it waits idle between interactions. But a capable system should proactively process events, triage incoming work, and maintain situational awareness. A continuous scan-strategy-execute loop wastes compute when idle and can't adapt to load. What's needed is a queue-based system that processes events through rule matching while staying responsive to interactive requests.
 
 ## Context
 
 - An orchestrator with access to project state, event queues, and external services
 - Events arrive at variable rates — bursty during work hours, quiet overnight
-- Processing must respect per-tenant fairness and avoid starvation
-- Autonomous processing must not interfere with interactive user requests
-- Need for notification-mode awareness (silent mode should only process critical items)
+- Processing must not interfere with interactive user requests
+- Rules define how events are matched and what actions to dispatch
+- A separate, slower loop periodically reviews high-level objectives
 
 ## Solution
 
-There are two distinct autonomous cycles operating at different timescales:
+### Queue-Based Cognitive Processor
 
-1. **Cognitive Processor Tick** (5-second interval, `cognitive/processor.js`): The fast event-driven loop that processes pending cognitive events, applies backpressure, and manages the outbound queue. This handles the operational tempo.
-2. **Autonomous Objectives Review** (2-hour interval, `agent/cycle.js`): A slower cycle that reviews high-level objectives, evaluates progress against goals, and generates new tasks or adjusts priorities. This handles the strategic tempo.
-
-The sections below primarily document the cognitive processor tick. The objectives review cycle is described in its own section further down.
-
-### Event-Driven Tick System (Cognitive Processor)
-
-Instead of continuously scanning for work, the cognitive processor runs on a configurable tick interval (default 5 seconds). Each tick processes a batch of pending events from a database-backed queue:
+The cognitive processor runs on a configurable tick interval (default 5 seconds). Each tick pulls pending events from a DB-backed queue and matches them against loaded rules:
 
 ```javascript
 // cognitive/processor.js
 let isProcessing = false;
 
-async function tick(options = {}) {
-  if (isProcessing) {
-    // Backpressure: skip this tick if previous is still running
-    return;
-  }
+async function tick() {
+  if (isProcessing) return; // Backpressure: skip if previous tick is running
 
   isProcessing = true;
-  const tickStart = Date.now();
-
   try {
-    const mode = await contextBehaviors.getNotificationMode();
+    const events = await db.query(`
+      SELECT * FROM cognitive_events
+      WHERE status = 'pending'
+      ORDER BY priority DESC
+      LIMIT $1
+    `, [batchSize]);
 
-    if (mode === 'silent') {
-      // Silent mode: only process high-priority events (priority >= 8)
-      await processEvents({ ...options, minPriority: 8 });
-    } else {
-      await processEvents(options);
+    for (const event of events) {
+      const rule = matchRule(event);
+      if (rule) await rule.action(event);
+      await markProcessed(event.id);
     }
   } finally {
     isProcessing = false;
-    const tickDuration = Date.now() - tickStart;
-    if (tickDuration > 1000) {
-      logger.debug({ tickDurationMs: tickDuration }, 'Tick slow');
-    }
   }
 }
 ```
 
-### Adaptive Backpressure
+### Rule Matching
 
-When ticks consistently exceed their time budget, the system reduces batch size to maintain throughput:
+Rules are seeded at startup from configuration. Each rule declares a condition function and an action to execute when matched. Events are tested against rules in priority order:
 
 ```javascript
-let batchSize = 10;
-let consecutiveSlowTicks = 0;
+// cognitive/rules.js
+const rules = [];
 
-function adjustBackpressure(tickDuration) {
-  if (tickDuration > 1000) {
-    consecutiveSlowTicks++;
-    if (consecutiveSlowTicks >= 3) {
-      // Reduce batch size by half, minimum 5
-      batchSize = Math.max(5, Math.floor(batchSize * 0.5));
-      consecutiveSlowTicks = 0;
-    }
-  } else {
-    consecutiveSlowTicks = 0;
-    // Gradually recover batch size
-    batchSize = Math.min(10, batchSize + 1);
-  }
+function seedRules() {
+  rules.push(
+    { name: 'commitment-overdue', test: e => e.type === 'commitment:overdue', action: notifyOverdue },
+    { name: 'task-stalled', test: e => e.type === 'task:stalled', action: escalateTask },
+    { name: 'webhook-received', test: e => e.type.startsWith('webhook:'), action: routeWebhook },
+  );
+}
+
+function matchRule(event) {
+  return rules.find(r => r.test(event));
 }
 ```
 
-### DB-Backed Event Queue with Atomic Claiming
+### Periodic Objectives Review
 
-Events are stored in a database table. Processing uses `FOR UPDATE SKIP LOCKED` to prevent duplicate processing across instances:
-
-```javascript
-async function processEvents(options = {}) {
-  const { minPriority = 0 } = options;
-
-  // Atomic claim: lock rows to prevent duplicate processing
-  const events = await db.query(`
-    SELECT * FROM cognitive_events
-    WHERE status = 'pending'
-      AND priority >= $1
-    ORDER BY priority DESC
-    LIMIT $2
-    FOR UPDATE SKIP LOCKED
-  `, [minPriority, batchSize]);
-
-  for (const event of events) {
-    await processEvent(event);
-    await db.query(
-      `UPDATE cognitive_events SET status = 'processed' WHERE id = $1`,
-      [event.id]
-    );
-  }
-}
-```
-
-### Per-Tenant Fairness
-
-A per-tenant limit prevents one noisy tenant from starving others in multi-tenant deployments:
-
-```javascript
-const perTenantLimit = Math.max(3, Math.floor(batchSize / tenantCount));
-
-// Group events by tenant, cap each tenant's batch
-const byTenant = groupBy(events, 'tenant_id');
-const fairBatch = Object.values(byTenant)
-  .flatMap(tenantEvents => tenantEvents.slice(0, perTenantLimit));
-```
-
-### DB-Backed Outbound Queue
-
-Autonomous actions that produce messages (notifications, alerts, follow-ups) go through a persistent outbound queue rather than sending directly:
-
-```javascript
-// outbound-queue.js
-async function enqueue(channel, content, options = {}) {
-  await db.query(`
-    INSERT INTO outbound_queue (channel, content, status, priority, deliver_at)
-    VALUES ($1, $2, 'pending', $3, $4)
-  `, [channel, content, options.priority || 5, options.deliverAt || new Date()]);
-}
-
-async function process() {
-  const pending = await db.query(`
-    SELECT * FROM outbound_queue
-    WHERE status = 'pending' AND deliver_at <= NOW()
-    FOR UPDATE SKIP LOCKED
-    LIMIT 10
-  `);
-
-  for (const item of pending) {
-    if (!isChannelConnected(item.channel)) {
-      // Channel offline — restore to pending, don't lose the message
-      continue;
-    }
-    await sendViaChannel(item.channel, item.content);
-    await markSent(item.id);
-  }
-}
-```
-
-### Autonomous Objectives Review (2-Hour Cycle)
-
-Separate from the fast cognitive tick, a slower objectives review cycle runs every 2 hours. This cycle operates at the strategic level — reviewing high-level goals, evaluating progress, and generating new tasks that feed into the cognitive processor's event queue:
+Separate from the fast cognitive tick, a simpler periodic loop checks active objectives. This runs on a longer interval (e.g., every 2 hours) and generates cognitive events if objectives are stalled or completed:
 
 ```javascript
 // agent/cycle.js
-const OBJECTIVES_INTERVAL = 2 * 60 * 60 * 1000; // 2 hours
-
 async function objectivesReview() {
-  // 1. Load current objectives and their progress
-  const objectives = await db.query(`
-    SELECT * FROM objectives WHERE status = 'active'
-    ORDER BY priority DESC
-  `);
+  const objectives = await db.query(
+    `SELECT * FROM objectives WHERE status = 'active'`
+  );
 
-  for (const objective of objectives) {
-    // 2. Evaluate progress against each objective
-    const progress = await evaluateProgress(objective);
-
-    // 3. Generate new tasks or adjust priorities based on progress
-    if (progress.stalled) {
-      await createCognitiveEvent({
-        type: 'objective:stalled',
-        priority: 7,
-        payload: { objectiveId: objective.id, reason: progress.reason },
-      });
+  for (const obj of objectives) {
+    if (isStalled(obj)) {
+      await insertCognitiveEvent('objective:stalled', { objectiveId: obj.id });
     }
-
-    if (progress.complete) {
-      await db.query(
-        `UPDATE objectives SET status = 'completed', completed_at = NOW() WHERE id = $1`,
-        [objective.id]
-      );
-    }
-
-    // 4. Optionally generate new sub-goals
-    const newGoals = await deriveSubGoals(objective, progress);
-    for (const goal of newGoals) {
-      await createCognitiveEvent({
-        type: 'goal:proposed',
-        priority: 5,
-        payload: goal,
-      });
+    if (isComplete(obj)) {
+      await db.query(`UPDATE objectives SET status = 'completed' WHERE id = $1`, [obj.id]);
     }
   }
 }
-
-// Runs on its own interval, independent of the cognitive tick
-let objectivesTimer;
-function startObjectivesReview() {
-  objectivesTimer = setInterval(objectivesReview, OBJECTIVES_INTERVAL);
-}
 ```
 
-The objectives review feeds work into the cognitive processor's event queue via `createCognitiveEvent`. The two cycles are decoupled -- the fast tick processes events regardless of their origin, and the slow review generates strategic events at its own pace.
+### Startup and Shutdown
 
-### Startup Sequence
-
-The cognitive system starts in a specific order — producers seed initial events, then the processor begins ticking:
+The cognitive system starts in a specific order — rules are seeded first, then both loops begin:
 
 ```javascript
-// Contract: startAll() seeds rules, starts both cycles, then producers
-async function startAll({ tickInterval = 5000, timezone }) {
-  await seedRules();                    // Load cognitive rules
-  startProcessor(tickInterval);         // Begin 5-second cognitive tick loop
-  startObjectivesReview();              // Begin 2-hour objectives review cycle
-  await startProducers();               // Begin event generation
-}
+async function startAll({ tickInterval = 5000 }) {
+  await seedRules();
+  const tickTimer = setInterval(() => tick(), tickInterval);
+  const reviewTimer = setInterval(objectivesReview, 2 * 60 * 60 * 1000);
 
-// Shutdown reverses the order
-async function stopAll() {
-  stopProcessor();                      // Stop consuming first
-  clearInterval(objectivesTimer);       // Stop objectives review
-  await stopProducers();                // Then stop producing
+  return {
+    stop() {
+      clearInterval(tickTimer);
+      clearInterval(reviewTimer);
+    }
+  };
 }
 ```
 
 ## Implications
 
 - The tick-based model has bounded latency (worst case = tick interval) unlike continuous loops that can spin
-- `FOR UPDATE SKIP LOCKED` enables horizontal scaling — multiple processor instances can safely share the queue
-- Backpressure prevents cascading slowdowns — the system gracefully degrades under load instead of falling behind
-- Silent mode filtering means the user can mute non-critical autonomous behavior without stopping the system
-- Per-tenant fairness adds slight overhead but prevents pathological starvation in multi-tenant scenarios
-- The outbound queue decouples message generation from delivery, surviving channel disconnections
+- Backpressure prevents cascading slowdowns — the system skips ticks rather than falling behind
+- Rule matching is simple function evaluation, keeping per-event overhead low
+- Events that match no rule are still marked processed — unmatched events don't accumulate
+- The objectives review is intentionally simple: check status, emit events. Strategic planning happens elsewhere
+- Adding new autonomous behaviors means adding rules, not modifying the processor
 
 ## Code Example
 
 ```javascript
 // Complete cognitive system lifecycle
-const cognitive = {
-  async startAll({ tickInterval = 5000 }) {
-    // 1. Seed cognitive rules from config
-    await seedRules();
-
-    // 2. Start the processor tick loop
-    this.timer = setInterval(() => tick(), tickInterval);
-
-    // 3. Start producers (event generators)
-    await Promise.allSettled(
-      producers.map(p => p.start())
-    );
-  },
-
-  async stopAll() {
-    clearInterval(this.timer);
-    await Promise.allSettled(
-      producers.map(p => p.stop())
-    );
-  },
-};
-
-// Usage in main application startup
-if (RUN_COGNITIVE) {
-  await cognitive.startAll({
+if (process.env.RUN_COGNITIVE) {
+  const system = await startAll({
     tickInterval: parseInt(process.env.COGNITIVE_TICK_INTERVAL || '5000'),
   });
+
+  process.on('SIGTERM', () => system.stop());
 }
 ```
 

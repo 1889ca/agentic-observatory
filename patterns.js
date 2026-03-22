@@ -12,7 +12,7 @@ const PATTERNS = [
   {
     slug: "satellite-permission-escalation",
     title: "Worker Permission Escalation",
-    summary: "Multi-model voting mechanism for escalating worker actions in the borderline autonomy band, using deliberative alignment for EXECUTE/QUEUE consensus.",
+    summary: "Static string-based autonomy tiers (AUTO/NOTIFY/ASK/NEVER) per capability for deterministic worker permission routing.",
     status: "published",
   },
   {
@@ -66,7 +66,7 @@ const PATTERNS = [
   {
     slug: "unified-event-system",
     title: "Unified Event System",
-    summary: "Dual-mode event bus with debounced entity events and immediate system events for reactive UI.",
+    summary: "Dual-mode event bus with unified.entity/unified.system API, debounced entity events, and immediate system events for reactive UI.",
     status: "published",
   },
   {
@@ -108,31 +108,31 @@ const PATTERNS = [
   {
     slug: "skill-extraction-and-fast-path-routing",
     title: "Skill Extraction and Fast-Path Routing",
-    summary: "Embeddings-based skill matching via skills_v2 table with normalized JSON hashing for pipeline signatures and designed (not yet operational) reflex promotion.",
+    summary: "File-based YAML skill discovery with frontmatter trigger matching for fast-path dispatch and designed (not yet operational) reflex promotion.",
     status: "published",
   },
   {
     slug: "autonomous-agent-cycle",
     title: "Autonomous Agent Cycle",
-    summary: "Dual-cycle autonomous system: 5-second cognitive tick for event processing with backpressure, and 2-hour objectives review for strategic goal management.",
+    summary: "Queue-based cognitive processor with rule matching on a 5-second tick, paired with a periodic objectives review loop for goal tracking.",
     status: "published",
   },
   {
     slug: "dynamic-system-prompt-composition",
     title: "Dynamic System Prompt Composition",
-    summary: "Runtime assembly of system prompts from persona, capabilities, behavioral rules, and contextual signals.",
+    summary: "Hardcoded persona and behaviors with capability manifest and anti-patterns appended at dispatch time.",
     status: "published",
   },
   {
     slug: "knowledge-graph-and-relationship-discovery",
     title: "Knowledge Graph and Relationship Discovery",
-    summary: "Entity extraction, relationship scoring, and multi-hop graph traversal for enriching agent context.",
+    summary: "Domain-specific (gigs/venues/performers) entity relationships stored in the documents table with relationship scoring and multi-hop traversal.",
     status: "published",
   },
   {
     slug: "anticipation-engine",
     title: "Anticipation Engine",
-    summary: "Reactive vibe subsystem that tracks action outcomes, auto-resolves follow-ups, and adjusts domain confidence.",
+    summary: "Domain-level confidence tracking with asymmetric scoring where successes slowly build confidence and failures rapidly reduce it via 1.25x correction multiplier.",
     status: "published",
   },
   {
@@ -144,7 +144,7 @@ const PATTERNS = [
   {
     slug: "unified-trigger-system",
     title: "Unified Trigger System",
-    summary: "Polymorphic trigger registry unifying notifications, tool calls, job dispatch, and approval workflows.",
+    summary: "Plain EventEmitter-style event bus with namespaced events and subscriber management for decoupled inter-module communication.",
     status: "published",
   },
   {
@@ -162,13 +162,13 @@ const PATTERNS = [
   {
     slug: "connector-registry-and-capability-discovery",
     title: "Connector Registry and Capability Discovery",
-    summary: "Generic connector pattern for external services with type registry, instance caching, and priority-based capability resolution.",
+    summary: "Aspirational pattern for unified service integration with capability discovery. Currently uses direct per-service modules without a shared registry.",
     status: "published",
   },
   {
     slug: "confidence-based-autonomy-gating",
     title: "Confidence-Based Autonomy Gating",
-    summary: "Multi-signal weighted confidence scoring (tool success, parameter completeness, context alignment, recency, time-of-day) with context affinities for earned autonomy.",
+    summary: "Multi-signal weighted confidence scoring with context affinities for earned autonomy. Independent from vibe/anticipation system.",
     status: "published",
   },
   {
@@ -192,7 +192,7 @@ const PATTERNS = [
   {
     slug: "graceful-degradation-and-optional-init",
     title: "Graceful Degradation and Optional Init",
-    summary: "Non-blocking startup with Promise.allSettled(), multi-provider LLM fallback chains, and optional service initialization.",
+    summary: "Non-blocking startup with per-service .catch() handlers, multi-provider LLM fallback chains, and optional service initialization.",
     status: "published",
   },
   {
@@ -204,7 +204,7 @@ const PATTERNS = [
   {
     slug: "deliberative-alignment",
     title: "Deliberative Alignment",
-    summary: "Multi-model voting system for borderline autonomy decisions, dispatching to multiple agents for EXECUTE/QUEUE consensus in the notify band.",
+    summary: "Standalone multi-model voting module invoked explicitly for high-stakes decisions, not tied to autonomy band thresholds.",
     status: "published",
   },
   {
@@ -258,7 +258,7 @@ const PATTERNS = [
   {
     slug: "autonomy-boost-and-approval-learning",
     title: "Autonomy Boost and Approval Learning",
-    summary: "Action fingerprinting with consecutive approval tracking for progressive auto-approval of repeatedly-authorized agent actions.",
+    summary: "Time-boxed autonomy boost presets (2h/4h) granting temporary elevated permissions that auto-expire, replacing approval-pattern learning.",
     status: "published",
   },
   {
@@ -276,7 +276,7 @@ const PATTERNS = [
   {
     slug: "webhook-event-bridge",
     title: "Webhook Event Bridge",
-    summary: "Unified inbound webhook receiver with per-source signature verification, payload normalization to internal events, and outbound webhook dispatch with retry.",
+    summary: "Outbound webhook dispatch with HMAC signing, delivery tracking, and retry. Inbound webhook receiving not yet implemented.",
     status: "published",
   },
   {
@@ -319,6 +319,30 @@ const PATTERNS = [
     slug: "task-lifecycle-and-state-machine",
     title: "Task Lifecycle and State Machine",
     summary: "Strict state machine for task transitions (todo/in_progress/done/blocked/cancelled) with transient failure auto-retry and progressive backoff.",
+    status: "published",
+  },
+  {
+    slug: "task-deduplication",
+    title: "Task Deduplication",
+    summary: "Keyed deduplication preventing duplicate agent work using compound unique indexes and atomic INSERT ON CONFLICT resolution.",
+    status: "published",
+  },
+  {
+    slug: "model-selection-and-llm-fallback",
+    title: "Model Selection and LLM Fallback",
+    summary: "Primary/fallback LLM provider chain with lazy initialization, concurrent init prevention via mutex flag, and timeout protection.",
+    status: "published",
+  },
+  {
+    slug: "graceful-shutdown-ordering",
+    title: "Graceful Shutdown Ordering",
+    summary: "Ordered SIGINT/SIGTERM teardown sequence with per-phase timeouts and double-signal force exit for safe process termination.",
+    status: "published",
+  },
+  {
+    slug: "document-type-system",
+    title: "Document Type System",
+    summary: "Type-based document handling with property validation, cross-type properties, and bidirectional task-document relationships.",
     status: "published",
   },
 ];

@@ -23,28 +23,22 @@ The event system provides two distinct delivery semantics:
 **Entity Events** (debounced, batched) — Created, updated, deleted, archived events for data entities. These are debounced at 50ms to collapse rapid successive updates (e.g., a flow step that creates 5 entities) into a single notification batch.
 
 ```javascript
-// Entity event with batching
-function emitEntityEvent(action, entityType, entityId, data) {
-  pendingEvents.push({
-    action,       // 'created' | 'updated' | 'deleted' | 'archived'
-    entityType,   // 'task' | 'note' | 'project' | ...
-    entityId,
-    data,
-    source: currentContext(),
-    timestamp: Date.now()
-  });
-  scheduleBatchFlush(50); // Debounce 50ms
-}
+// Entity events via unified API
+unified.entity.created('task', entityId, data);
+unified.entity.updated('task', entityId, data);
+unified.entity.deleted('task', entityId);
+unified.entity.archived('task', entityId);
+// Each call pushes to a pending batch, flushed after 50ms debounce
 ```
 
 **System Events** (immediate, pub/sub) — Job lifecycle, model dispatch, capability execution, and other infrastructure events. These fire immediately with no batching.
 
 ```javascript
-// System event — fires immediately
-function emitSystemEvent(channel, event) {
-  // channel: 'job.started', 'model.error', 'capability.executed'
-  subscribers.get(channel)?.forEach(handler => handler(event));
-}
+// System events also go through the unified API
+unified.system.emit('job.started', event);
+unified.system.emit('model.error', event);
+// Fires immediately — no debouncing
+```
 ```
 
 ### Event Payload Structure
@@ -71,7 +65,7 @@ UI widgets register interest in specific entity types or invalidation keys. When
 
 ```javascript
 // Widget subscribes to task changes
-subscribe('entity:updated', (event) => {
+unified.entity.on('updated', (event) => {
   if (event.invalidationKeys.includes(myWidgetKey)) {
     refreshWidget();
   }
@@ -105,9 +99,9 @@ function flushBatch() {
     deduped.set(`${event.entityType}:${event.entityId}`, event);
   }
 
-  // Deliver to local subscribers
+  // Deliver to local subscribers via unified API
   for (const event of deduped.values()) {
-    emitSystemEvent(`entity:${event.action}`, event);
+    unified.system.emit(`entity:${event.action}`, event);
   }
 
   // Broadcast to connected clients

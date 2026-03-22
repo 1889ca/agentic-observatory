@@ -71,8 +71,29 @@
       const lines = md.split("\n");
       let html = "";
       let inCode = false;
-      let inList = false;
       let buf = "";
+      // Stack of open list tags: [{tag: "ul"|"ol", indent: number}]
+      let listStack = [];
+
+      function closeListsTo(indent) {
+        while (listStack.length && listStack[listStack.length - 1].indent >= indent) {
+          html += `</${listStack.pop().tag}>`;
+        }
+      }
+
+      function closeAllLists() {
+        while (listStack.length) {
+          html += `</${listStack.pop().tag}>`;
+        }
+      }
+
+      function parseListItem(line) {
+        const ulMatch = line.match(/^(\s*)- (.*)$/);
+        if (ulMatch) return { indent: ulMatch[1].length, tag: "ul", text: ulMatch[2] };
+        const olMatch = line.match(/^(\s*)\d+\. (.*)$/);
+        if (olMatch) return { indent: olMatch[1].length, tag: "ol", text: olMatch[2] };
+        return null;
+      }
 
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
@@ -84,7 +105,7 @@
             buf = "";
             inCode = false;
           } else {
-            if (inList) { html += "</ul>"; inList = false; }
+            closeAllLists();
             inCode = true;
             html += "<pre><code>";
           }
@@ -95,10 +116,11 @@
           continue;
         }
 
-        // Close list if non-list line
-        if (inList && !line.startsWith("- ")) {
-          html += "</ul>";
-          inList = false;
+        const listItem = parseListItem(line);
+
+        // Close lists if non-list line
+        if (!listItem && listStack.length) {
+          closeAllLists();
         }
 
         // Headings
@@ -113,10 +135,30 @@
         else if (line.startsWith("> ")) {
           html += `<p class="summary">${inline(line.slice(2))}</p>`;
         }
-        // List item
-        else if (line.startsWith("- ")) {
-          if (!inList) { html += "<ul>"; inList = true; }
-          html += `<li>${inline(line.slice(2))}</li>`;
+        // List item (unordered or ordered, with nesting)
+        else if (listItem) {
+          const { indent, tag, text } = listItem;
+          if (!listStack.length) {
+            html += `<${tag}>`;
+            listStack.push({ tag, indent });
+          } else {
+            const top = listStack[listStack.length - 1];
+            if (indent > top.indent) {
+              html += `<${tag}>`;
+              listStack.push({ tag, indent });
+            } else if (indent < top.indent) {
+              closeListsTo(indent + 1);
+              // If tag type changed at same level, close and reopen
+              if (listStack.length && listStack[listStack.length - 1].tag !== tag) {
+                html += `</${listStack.pop().tag}><${tag}>`;
+                listStack.push({ tag, indent });
+              }
+            } else if (top.tag !== tag) {
+              html += `</${listStack.pop().tag}><${tag}>`;
+              listStack.push({ tag, indent });
+            }
+          }
+          html += `<li>${inline(text)}</li>`;
         }
         // HTML comment (skip)
         else if (line.trim().startsWith("<!--")) {
@@ -132,7 +174,7 @@
         }
       }
 
-      if (inList) html += "</ul>";
+      closeAllLists();
       return html;
     }
 

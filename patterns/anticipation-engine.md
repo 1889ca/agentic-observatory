@@ -1,187 +1,118 @@
 # Anticipation Engine
 
-> Reactive vibe subsystem that tracks action outcomes, auto-resolves follow-ups from observed events, and adjusts domain confidence — replacing speculative prediction with evidence-based reactivity.
+> Domain-level confidence tracking with asymmetric scoring — successes slowly build confidence while failures rapidly reduce it.
 
 ## Problem
 
-A purely reactive agent forgets what it did the moment a conversation ends. It can't verify whether an action it took actually succeeded — did that PR get merged? Did the email get a reply? Did the scheduled task complete? Without outcome tracking, the agent has no feedback loop: it can't learn which actions succeed, adjust its confidence, or proactively surface stalled work.
+An agent that treats every action as equally trustworthy never learns from its mistakes. If it sends a poorly-formatted email, it should become more cautious about future emails. If it consistently creates good PRs, it should need less oversight for code operations. Without outcome-based confidence tracking, the agent either stays permanently cautious (frustrating) or permanently permissive (dangerous).
 
 ## Context
 
-- An agent that takes actions with delayed outcomes (PRs, emails, deployments, scheduled tasks)
-- Outcomes arrive asynchronously through external events (GitHub webhooks, task completions)
-- Need to close the loop between "action taken" and "outcome observed"
-- Confidence in specific domains should adjust based on actual success/failure rates
-- The system should be reactive (respond to observed events) rather than speculative (predict based on temporal patterns)
+- An agent that takes actions across multiple domains (code, email, scheduling, project management)
+- Some domains have higher success rates than others for a given deployment
+- Confidence should inform autonomy decisions — high confidence in a domain allows more autonomous operation
+- The system should be biased toward caution: failures must reduce confidence faster than successes build it
+- Confidence is tracked per domain, not per individual operation type
 
 ## Solution
 
-### Follow-Up Scheduling
+### Asymmetric Confidence Formula
 
-When the agent takes a significant action, it schedules a follow-up check — a record of what was done, what outcome is expected, and when to verify:
-
-```javascript
-// vibe/follow-ups.js
-async function schedule({ action, expectedOutcome, checkAfter, context }) {
-  await db.query(`
-    INSERT INTO follow_ups (action, expected_outcome, check_after, context, status)
-    VALUES ($1, $2, $3, $4, 'pending')
-  `, [action, expectedOutcome, checkAfter, JSON.stringify(context)]);
-}
-
-// Retrieve follow-ups that are past their check time
-async function getDue() {
-  return db.query(`
-    SELECT * FROM follow_ups
-    WHERE status = 'pending' AND check_after <= NOW()
-    ORDER BY check_after ASC
-  `);
-}
-```
-
-Follow-up delays are configured per action type:
+Domain confidence uses an asymmetric update formula where corrections (failures) carry a 1.25x multiplier relative to successes. This means the system loses confidence faster than it gains it — a deliberate safety bias:
 
 ```javascript
-const FOLLOW_UP_DELAYS = {
-  entity: 60 * 60 * 1000,        // 1 hour
-  send_email: 24 * 60 * 60 * 1000, // 24 hours
-  create_event: 2 * 60 * 60 * 1000, // 2 hours
-  create_pr: 4 * 60 * 60 * 1000,   // 4 hours
-};
-```
-
-### Outcome Reactor
-
-Instead of polling for outcomes, the system subscribes to events and auto-resolves matching follow-ups when outcomes are observed:
-
-```javascript
-// vibe/outcome-reactor.js
-function init() {
-  events.on('github.pr_merged', onPrMerged);
-  events.on('github.pr_closed', onPrClosed);
-  events.on('task.completed', onTaskCompleted);
-  events.on('worker_task.completed', onWorkerTaskCompleted);
-}
-
-async function onPrMerged(event) {
-  // Find follow-ups related to this PR
-  const related = await findRelatedFollowUps('create_pr', event.pr);
-  for (const followUp of related) {
-    await resolve(followUp.id, {
-      outcome: 'success',
-      event: 'pr_merged',
-      details: event,
-    });
-    // Positive signal → increase domain confidence
-    confidence.record(followUp.context.tenantId, 'code_review', true);
-  }
-}
-
-async function onPrClosed(event) {
-  const related = await findRelatedFollowUps('create_pr', event.pr);
-  for (const followUp of related) {
-    await resolve(followUp.id, {
-      outcome: 'closed_without_merge',
-      event: 'pr_closed',
-    });
-    // Negative signal → decrease domain confidence
-    confidence.record(followUp.context.tenantId, 'code_review', false);
-  }
-}
-```
-
-### Domain Confidence Tracking
-
-Confidence scores are maintained per domain (not per operation type), using an asymmetric formula where corrections weigh 1.25x more than successes:
-
-```javascript
-// vibe/confidence.js
+// confidence.js
 async function record(tenantId, domain, positive, weight = 1) {
   const successInc = positive ? weight : 0;
   const correctionInc = positive ? 0 : weight;
 
   await db.query(`
-    INSERT INTO domain_confidence (tenant_id, domain, total_actions, successful_actions, corrections, confidence_score)
-    VALUES ($1, $2, $3, $4, $5,
-      GREATEST(0, LEAST(1, ($4::real - $5::real * 1.25) / NULLIF($3::real, 0)))
+    INSERT INTO domain_confidence
+      (tenant_id, domain, total_actions, successful_actions, corrections, confidence_score)
+    VALUES ($1, $2, 1, $3, $4,
+      GREATEST(0, LEAST(1, ($3::real - $4::real * 1.25) / NULLIF(1::real, 0)))
     )
     ON CONFLICT (tenant_id, domain) DO UPDATE SET
-      total_actions = domain_confidence.total_actions + $3,
-      successful_actions = domain_confidence.successful_actions + $4,
-      corrections = domain_confidence.corrections + $5,
+      total_actions = domain_confidence.total_actions + 1,
+      successful_actions = domain_confidence.successful_actions + $3,
+      corrections = domain_confidence.corrections + $4,
       confidence_score = GREATEST(0, LEAST(1,
-        (domain_confidence.successful_actions + $4 - (domain_confidence.corrections + $5) * 1.25)::real
-        / NULLIF((domain_confidence.total_actions + $3)::real, 0)
+        (domain_confidence.successful_actions + $3
+         - (domain_confidence.corrections + $4) * 1.25)::real
+        / NULLIF((domain_confidence.total_actions + 1)::real, 0)
       ))
-  `, [tenantId, domain, 1, successInc, correctionInc]);
+  `, [tenantId, domain, successInc, correctionInc]);
 }
 ```
 
-The 1.25x correction weight means 5 corrections cancel ~6 successes — biasing the system toward caution without being overly punitive.
+### Score Interpretation
 
-### Vibe Subsystem Coordination
+The formula produces a score between 0 and 1, clamped at both ends:
 
-The vibe engine coordinates five subsystems, each handling a different aspect of the feedback loop:
+- **1.0** — All actions successful, no corrections
+- **0.7-0.9** — Mostly successful, occasional corrections
+- **0.4-0.6** — Mixed results, significant correction history
+- **0.0** — Corrections dominate, domain effectively untrusted
+
+The 1.25x multiplier means 5 corrections cancel approximately 6 successes — biasing toward caution without being overly punitive.
+
+### Reading Confidence
+
+Domain confidence is queried when making autonomy decisions. A high score in a domain may allow auto-execution; a low score may require explicit approval:
 
 ```javascript
-// vibe/index.js
-const subsystems = {
-  followUps,        // Schedule and track action outcome checks
-  outcomeReactor,   // Auto-resolve follow-ups from events
-  knowledgeGaps,    // Detect missing knowledge, generate questions
-  synthesizer,      // Infer preferences from behavior patterns
-  confidence,       // Domain-level confidence tracking
-};
+async function getConfidence(tenantId, domain) {
+  const row = await db.query(
+    `SELECT confidence_score, total_actions FROM domain_confidence
+     WHERE tenant_id = $1 AND domain = $2`,
+    [tenantId, domain]
+  );
 
-function init() {
-  // Only outcome reactor needs explicit init (event subscriptions)
-  outcomeReactor.init();
+  if (!row) return { score: 0.5, actions: 0 }; // Default: neutral
+  return { score: row.confidence_score, actions: row.total_actions };
 }
 ```
 
-The synthesizer mines corrections and tool parameter patterns to infer user preferences:
+### Fire-and-Forget Recording
+
+Confidence updates are non-blocking. The recording call does not gate the response path — if it fails, the action still proceeds:
 
 ```javascript
-// Correction mining: "user corrected date format 4 times → learn preference"
-// Tool param analysis: "user always passes format='iso' → default to iso"
-// Response pattern mining: "user prefers bullet points over prose"
+// In the action execution path
+await executeAction(action);
+record(tenantId, action.domain, true).catch(() => {});
 ```
 
 ## Implications
 
-- Reactive outcome tracking is more reliable than temporal prediction — it responds to what actually happened, not what might happen
-- The 1.25x correction multiplier is configurable, allowing tuning per deployment risk tolerance
-- Fire-and-forget confidence recording (`record().catch(() => {})`) means tracking never blocks the response path
-- Follow-up delays are deliberately generous — checking too early wastes effort on in-progress work
-- Event subscriptions create coupling to specific event sources — adding a new event type requires an outcome reactor handler
-- Domain-level confidence (not per-operation) means a bad email experience affects all email operations, which may be too coarse for some use cases
+- The asymmetric multiplier (1.25x) is configurable per deployment, allowing tuning for different risk tolerances
+- Domain-level granularity means a bad email experience affects all email operations — this may be too coarse for some use cases, but avoids the complexity of per-operation tracking
+- Fire-and-forget recording means confidence tracking never blocks the response path, but also means updates can be lost under database pressure
+- New domains start at a neutral default (0.5), not zero — the system doesn't penalize unfamiliarity
+- Confidence scores are per-tenant, so one user's correction history doesn't affect another's
+- The score naturally converges as `total_actions` grows — early corrections have outsized impact, which is intentional for safety
 
 ## Code Example
 
 ```javascript
-// Complete feedback loop: action → follow-up → event → confidence update
-// 1. Agent creates a PR
-const pr = await tools.execute('create_pr', { repo, title, branch });
+// Domain confidence influencing autonomy decisions
+const { score } = await getConfidence(tenantId, 'code_review');
 
-// 2. Schedule follow-up to verify outcome
-await followUps.schedule({
-  action: 'create_pr',
-  expectedOutcome: 'merged',
-  checkAfter: new Date(Date.now() + 4 * 60 * 60 * 1000), // 4 hours
-  context: { tenantId, repo, prNumber: pr.number },
-});
-
-// 3. Hours later, GitHub webhook fires → outcome reactor resolves
-// events.emit('github.pr_merged', { pr: { number: pr.number, repo } })
-// → onPrMerged() → resolve follow-up → confidence.record(tenantId, 'code_review', true)
-
-// 4. Confidence score for 'code_review' domain increases
-// Future PR actions may auto-execute without approval if confidence > threshold
+if (score > 0.8) {
+  // High confidence: auto-execute
+  await executeAction(action);
+} else if (score > 0.5) {
+  // Medium confidence: notify user but proceed
+  await notify(user, `Executing: ${action.description}`);
+  await executeAction(action);
+} else {
+  // Low confidence: require explicit approval
+  await requestApproval(user, action);
+}
 ```
 
 ## Related Patterns
 
 - [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)
-- [Commitment Tracking and Extraction](./commitment-tracking.md)
+- [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
 - [Evolution and Self-Improvement](./evolution-and-self-improvement.md)
-- [Unified Event System](./unified-event-system.md)

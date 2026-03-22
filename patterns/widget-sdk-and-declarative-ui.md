@@ -1,6 +1,6 @@
 # Widget SDK and Declarative UI
 
-> JSON-based UI primitive system where agents emit pure data structures instead of markup, and the host runtime resolves, binds, and renders them.
+> JSON-based UI primitive system where agents emit pure data structures instead of markup. Current implementation focuses on widget type suggestions and entity highlighting; the full primitive rendering pipeline described here is aspirational.
 
 ## Problem
 
@@ -15,6 +15,8 @@ When agents generate user-facing interfaces, the naive approach is to have them 
 - Widget types need to be extensible without modifying every agent
 
 ## Solution
+
+> **Implementation note:** Riley's current implementation is minimal — primarily widget type suggestions (recommending which widget type fits an entity) and entity highlighting (marking up entities in responses). The full primitive registry, template binding, and multi-renderer pipeline described below is the designed target architecture, not the current state.
 
 ### UI Primitive Registry
 

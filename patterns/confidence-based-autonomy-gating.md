@@ -213,13 +213,12 @@ const score = computeConfidence(signals, 'code_review');
 
 ## Relationship to Other Autonomy Patterns
 
-This pattern sits between [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md) and [Deliberative Alignment](./deliberative-alignment.md) in the autonomy stack:
+This pattern sits alongside [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md) in the autonomy system:
 
 - **Decision Gating** sets the static baseline (AUTO/NOTIFY/ASK per decision type)
 - **Confidence-Based Gating (this pattern)** modulates that baseline using multi-signal weighted scoring — a NOTIFY-tier action with high composite confidence (>0.8) can auto-execute
-- **Deliberative Alignment** resolves ambiguity when confidence lands in the notify band (0.60-0.85) via multi-model voting
 
-The confidence score from this pattern is the input signal that triggers deliberative alignment. Without it, the system has no continuous measure of trust.
+**Note:** Confidence scoring and the vibe/anticipation system are two separate systems that coexist but are not integrated. The confidence score feeds autonomy gating independently — it does not interact with the anticipation engine or vibe detection. They run in parallel without cross-feeding signals.
 
 ## Related Patterns
 

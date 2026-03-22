@@ -1,6 +1,6 @@
 # Cognitive Processing Loop
 
-> Background event-driven processing loop with rule matching and autonomous action dispatch for continuous agent awareness.
+> DB-backed queue processing loop with rule matching and autonomous action dispatch for continuous agent awareness.
 
 ## Problem
 
@@ -9,99 +9,55 @@ Agents built on a request-response model only think when a user sends a message.
 ## Context
 
 - An AI agent or orchestrator that needs continuous awareness beyond user-initiated conversations
-- Multiple event sources: system events (file changes, process signals), activity feeds (user behavior, satellite reports), scheduled triggers (cron, timers), external webhooks (GitHub, Slack, monitoring)
+- A DB-backed queue accumulates work items (events, scheduled triggers, webhook payloads) for periodic pulling
 - Actions that should fire autonomously when conditions are met, without waiting for user prompting
-- Event bursts are common (deploys, batch operations) and must not trigger action storms
+- Debounce happens implicitly through queue polling intervals rather than an explicit buffering layer
 - Rules for what constitutes a meaningful signal evolve over time as the agent learns usage patterns
 
 ## Solution
 
 ### The Cognitive Loop
 
-A background processing loop runs independently of the message-handling path. It continuously ingests events from multiple sources, evaluates them against a rule engine, and dispatches autonomous actions when rules fire.
+A background processing loop runs independently of the message-handling path. It periodically pulls items from a DB-backed queue, evaluates them against a rule engine, and dispatches autonomous actions when rules fire. Debounce happens implicitly — the polling interval naturally collapses rapid bursts since multiple events arriving between polls are processed as a single batch.
 
 ```
 ┌──────────────────────────────────────────────┐
 │            COGNITIVE LOOP                     │
 │                                               │
-│  Ingest Events → Buffer → Rule Match →        │
+│  Poll DB Queue → Rule Match →                 │
 │  Action Dispatch → Observe Outcomes → (loop)  │
 │                                               │
-│  ┌─ Event sources: system, activity,          │
-│  │  scheduled, webhook                        │
+│  ┌─ Queue sources: events, scheduled,         │
+│  │  webhooks                                  │
 │  ├─ Rule engine: static + learned rules       │
-│  └─ Debounce layer: collapse bursty signals   │
+│  └─ Implicit debounce via polling interval    │
 └──────────────────────────────────────────────┘
 ```
 
-### Event Ingestion
+### Queue Pulling
 
-The loop pulls from a unified event queue fed by multiple producers. Each event has a type, source, and payload:
-
-```javascript
-const eventSources = new Map();
-
-function registerSource(name, stream) {
-  eventSources.set(name, stream);
-  stream.on('event', (event) => {
-    eventQueue.push({
-      type: event.type,
-      source: name,
-      payload: event.data,
-      timestamp: Date.now()
-    });
-  });
-}
-
-// Register diverse event sources
-registerSource('system', systemEventStream);       // Process signals, health checks
-registerSource('activity', activityFeed);           // User behavior, satellite reports
-registerSource('scheduler', schedulerStream);       // Cron triggers, timer expirations
-registerSource('webhooks', webhookIngress);          // External service callbacks
-```
-
-### Debounce Layer
-
-A debounce layer sits between ingestion and rule matching. It collapses rapid event bursts into single signals, preventing action storms during high-activity periods like deploys or batch imports:
+The loop polls a DB-backed queue at regular intervals. Producers (event emitters, schedulers, webhook receivers) insert rows; the cognitive loop pulls and processes them in batches:
 
 ```javascript
-const debounceWindows = new Map();
+async function pullQueue(db, batchSize = 50) {
+  // Pull unprocessed items, mark as in-progress
+  const items = await db.query(`
+    UPDATE cognitive_queue
+    SET status = 'processing', picked_at = NOW()
+    WHERE id IN (
+      SELECT id FROM cognitive_queue
+      WHERE status = 'pending'
+      ORDER BY created_at ASC
+      LIMIT $1
+    )
+    RETURNING *
+  `, [batchSize]);
 
-function debounceEvent(event) {
-  const key = `${event.type}:${event.source}`;
-  const window = debounceWindows.get(key);
-
-  if (window && Date.now() - window.firstSeen < DEBOUNCE_MS) {
-    window.count++;
-    window.latest = event;
-    return null; // Suppress — will fire when window expires
-  }
-
-  // Start new debounce window
-  debounceWindows.set(key, {
-    firstSeen: Date.now(),
-    count: 1,
-    latest: event
-  });
-
-  // Schedule flush at window expiry
-  setTimeout(() => flushDebounceWindow(key), DEBOUNCE_MS);
-  return null; // Will fire on flush
-}
-
-function flushDebounceWindow(key) {
-  const window = debounceWindows.get(key);
-  debounceWindows.delete(key);
-  if (!window) return;
-
-  // Emit collapsed event with burst metadata
-  ruleEngine.evaluate({
-    ...window.latest,
-    burstCount: window.count,
-    burstDuration: Date.now() - window.firstSeen
-  });
+  return items.rows;
 }
 ```
+
+The polling interval (typically 5 seconds) provides implicit debounce — events that arrive in rapid succession between polls are pulled together as a batch, naturally collapsing burst activity without an explicit buffering layer.
 
 ### Rule Engine
 
@@ -219,8 +175,8 @@ function analyzePatterns(actionLog) {
 
 ## Implications
 
-- The cognitive loop consumes resources continuously — rate limiting and sleep intervals are essential to control compute cost
-- Debounce windows introduce latency between event occurrence and rule evaluation — time-critical events may need a bypass path
+- The cognitive loop consumes resources continuously — polling intervals are essential to control compute cost and DB load
+- Queue polling introduces latency between event occurrence and rule evaluation — time-critical events may need a bypass path
 - Learned rules can drift if behavior patterns change — periodic review and pruning is necessary
 - Rule priority ordering means lower-priority rules may never fire during high-activity periods
 - Multiple rules matching the same event can produce conflicting actions — conflict resolution logic is needed
@@ -231,31 +187,32 @@ function analyzePatterns(actionLog) {
 ## Code Example
 
 ```javascript
-// Main cognitive processing loop
-async function cognitiveLoop(engine, eventQueue) {
-  const CYCLE_INTERVAL = 5_000; // 5 seconds between cycles
+// Main cognitive processing loop — DB queue polling
+async function cognitiveLoop(engine, db) {
+  const POLL_INTERVAL = 5_000; // 5 seconds between polls
 
   while (running) {
-    // Drain the event queue
-    const events = eventQueue.drain();
+    // Pull batch from DB queue
+    const items = await pullQueue(db);
 
-    if (events.length === 0) {
-      await sleep(CYCLE_INTERVAL);
+    if (items.length === 0) {
+      await sleep(POLL_INTERVAL);
       continue;
     }
 
-    // Pass each event through debounce, then evaluate
-    for (const event of events) {
-      debounceEvent(event); // Debounced events reach engine via flush
+    // Evaluate each item against rules
+    for (const item of items) {
+      engine.evaluate(item);
+      await db.query('UPDATE cognitive_queue SET status = $1 WHERE id = $2', ['done', item.id]);
     }
 
     // Log cycle stats
     const activeRules = engine.rules.filter(r =>
       r.lastFired && Date.now() - r.lastFired < 60_000
     );
-    logger.debug(`Cognitive cycle: ${events.length} events, ${activeRules.length} active rules`);
+    logger.debug(`Cognitive cycle: ${items.length} items, ${activeRules.length} active rules`);
 
-    await sleep(CYCLE_INTERVAL);
+    await sleep(POLL_INTERVAL);
   }
 }
 

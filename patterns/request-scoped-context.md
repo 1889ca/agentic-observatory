@@ -1,6 +1,6 @@
 # Request-Scoped Context Propagation
 
-> AsyncLocalStorage-based per-request context (correlation IDs, embedding caches, tenant isolation) avoiding parameter drilling through async chains.
+> AsyncLocalStorage-based per-request context (correlation IDs, embedding caches, tenant isolation stub) avoiding parameter drilling through async chains.
 
 ## Problem
 
@@ -9,7 +9,7 @@ In a multi-tenant orchestrator handling concurrent requests, deeply nested async
 ## Context
 
 - Node.js async operations (HTTP handlers, WebSocket messages, job dispatchers)
-- Multi-tenant system where tenant isolation must be guaranteed per request
+- Multi-tenant system where tenant isolation is structurally prepared (currently a stub hardcoded to tenant 1)
 - Correlation IDs needed in every log line for distributed tracing
 - Per-request embedding caches that must not leak between requests
 - Middleware-based request lifecycle (Express, Fastify, or custom)
@@ -103,9 +103,9 @@ function createLogger(module) {
 
 Every log line across every module in the async chain includes the same correlation ID. No parameter drilling needed. Grep a single ID in your log aggregator and you get the full request trace.
 
-### Tenant Isolation
+### Tenant Isolation (Structural Stub)
 
-Services that interact with tenant-scoped data read the tenant ID directly from context rather than accepting it as a parameter:
+The tenant isolation infrastructure is in place but currently operates as a structural stub — `tenantId` is hardcoded to tenant 1. The AsyncLocalStorage pattern is real and functional for correlation IDs and embedding caches, but multi-tenancy is not active. The code below shows the prepared abstraction that will activate when multi-tenancy is enabled:
 
 ```javascript
 // lib/tenant-context.ts
@@ -128,7 +128,7 @@ export function scopeKey(key: string): string {
 }
 ```
 
-Database queries, cache keys, and external API calls all use `getTenantId()` to enforce isolation. The throw-on-missing pattern catches cases where code runs outside a request context (background jobs that forgot to set up tenant scope).
+Database queries, cache keys, and external API calls all use `getTenantId()` to enforce isolation. The throw-on-missing pattern catches cases where code runs outside a request context (background jobs that forgot to set up tenant scope). Note: currently this always returns tenant 1 since multi-tenancy is not yet active — the isolation plumbing exists but only serves a single tenant.
 
 ### Per-Request Embedding Cache
 
