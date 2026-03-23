@@ -1,16 +1,16 @@
 # Knowledge Graph and Relationship Discovery
 
-> Domain-specific entity relationships for gigs, venues, and performers stored in the documents table with relationship scoring and multi-hop traversal.
+> Generic entity relationships stored in the documents table with relationship scoring and multi-hop traversal.
 
 ## Problem
 
-An orchestrator managing a music/entertainment domain processes conversations containing references to gigs, venues, performers, and the relationships between them. Without structured storage, these connections are lost after the conversation ends. The agent can't answer "which performers have played at this venue?" or "what gigs are coming up at venues near downtown?" because it never captured those relationships.
+An orchestrator processes conversations containing references to entities and the relationships between them. Without structured storage, these connections are lost after the conversation ends. The agent can't answer "what is related to this entity?" or "what depends on this?" because it never captured those relationships.
 
 ## Context
 
-- A domain-specific agent focused on gigs, venues, and performers
+- A general-purpose agent that discovers and stores arbitrary entities from conversations
 - Entities appear repeatedly across conversations but aren't explicitly linked
-- Users expect the agent to know relationships between performers, venues, and gigs
+- Users expect the agent to know relationships between entities it has encountered
 - The agent needs to surface relevant connections when assembling context for a new interaction
 - Knowledge documents already exist with embeddings for semantic search — the graph layer augments rather than replaces them
 
@@ -27,7 +27,7 @@ CREATE TABLE documents (
   title TEXT NOT NULL,
   content TEXT NOT NULL,
   embedding VECTOR(1536),
-  metadata JSONB DEFAULT '{}', -- { entity_type: 'venue', domain: 'music', ... }
+  metadata JSONB DEFAULT '{}', -- { entity_type: 'generic', tags: [...], ... }
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -36,7 +36,7 @@ CREATE TABLE document_relationships (
   id SERIAL PRIMARY KEY,
   source_id INTEGER REFERENCES documents(id),
   target_id INTEGER REFERENCES documents(id),
-  relationship TEXT NOT NULL,   -- performs-at, booked-for, managed-by
+  relationship TEXT NOT NULL,   -- related-to, part-of, depends-on
   strength FLOAT DEFAULT 1.0,
   metadata JSONB DEFAULT '{}',
   created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -45,30 +45,26 @@ CREATE TABLE document_relationships (
 );
 ```
 
-### Domain-Specific Entity Types
+### Generic Entity and Relationship Types
 
-The entity types are domain-specific, not generic:
+The system stores arbitrary entities and relationships with no domain-specific type constraints. Entity types and relationship labels are freeform strings determined at extraction time:
 
 ```javascript
-const ENTITY_TYPES = {
-  PERFORMER: 'performer',  // Bands, solo artists, DJs
-  VENUE: 'venue',          // Clubs, bars, concert halls
-  GIG: 'gig',             // Specific performances / bookings
-  PROMOTER: 'promoter',   // Event organizers
-};
+// No fixed entity type enum — entities are stored with whatever type
+// the extraction prompt identifies (e.g., 'person', 'project', 'concept')
 
 const RELATIONSHIP_TYPES = {
-  PERFORMS_AT: 'performs-at',     // performer -> venue
-  BOOKED_FOR: 'booked-for',     // performer -> gig
-  HOSTED_AT: 'hosted-at',       // gig -> venue
-  PROMOTED_BY: 'promoted-by',   // gig -> promoter
-  MANAGED_BY: 'managed-by',     // performer -> promoter
+  RELATED_TO: 'related-to',     // general association
+  PART_OF: 'part-of',           // containment / membership
+  DEPENDS_ON: 'depends-on',     // dependency
+  CREATED_BY: 'created-by',     // authorship / origin
+  REFERENCES: 'references',     // citation / mention
 };
 ```
 
 ### Entity Extraction and Storage
 
-Extraction is tuned for the music/entertainment domain:
+Extraction uses a generic prompt that discovers entities and relationships without domain-specific constraints:
 
 ```javascript
 async function extractAndStore(message, conversationId) {
@@ -76,8 +72,8 @@ async function extractAndStore(message, conversationId) {
     Extract from this message:
     1. entities: [{ name, type, description }]
     2. relationships: [{ from, to, type }]
-    Entity types: performer, venue, gig, promoter
-    Relationship types: performs-at, booked-for, hosted-at, promoted-by, managed-by
+    Use descriptive entity types (person, project, concept, tool, etc.).
+    Use descriptive relationship types (related-to, part-of, depends-on, created-by, references, etc.).
   `, { content: message });
 
   const parsed = JSON.parse(extraction);
@@ -113,7 +109,7 @@ async function upsertRelationship(sourceId, targetId, type) {
 
 ### Multi-Hop Traversal
 
-To discover indirect connections (e.g., "which performers share venues?"), traverse relationships multiple hops:
+To discover indirect connections (e.g., "what entities are two hops away from this one?"), traverse relationships multiple hops:
 
 ```javascript
 async function expandGraph(documentId, maxHops = 2, minStrength = 0.3) {
@@ -184,7 +180,7 @@ async function enrichWithGraph(message, contextBudget) {
 
 - Entity extraction is imperfect — the model will miss entities or create duplicates with slightly different names (requires normalization)
 - Storing entities in the `documents` table means they participate in semantic search, but also means the table grows with every new entity
-- Domain-specific entity types (performer, venue, gig) make extraction more accurate but limit reuse outside the entertainment domain
+- Generic entity types maximize reuse across domains but rely on the LLM to produce consistent type labels — normalization may be needed
 - No separate fact/triple store — all knowledge is captured through document relationships, keeping the schema simpler
 - Graph queries add latency to context assembly; cache frequently-accessed subgraphs
 - Multi-hop traversal can grow combinatorially; depth and breadth limits are essential

@@ -1,10 +1,10 @@
 # Message Processing Pipeline
 
-> Modular seven-stage pipeline from user input through context assembly, planning, tool execution, and verified response delivery.
+> Modular six-stage pipeline from user input through context assembly, planning, tool execution, and response delivery.
 
 ## Problem
 
-Processing a user message in an AI orchestrator isn't a single LLM call. It requires session management, command routing, context assembly, optional planning, iterative tool execution with caching and recovery, response verification, and post-processing. Without a structured pipeline, this logic becomes a monolith that's impossible to debug or extend.
+Processing a user message in an AI orchestrator isn't a single LLM call. It requires session management, command routing, context assembly, optional planning, iterative tool execution with caching and recovery, and post-processing. Without a structured pipeline, this logic becomes a monolith that's impossible to debug or extend.
 
 ## Context
 
@@ -12,17 +12,17 @@ Processing a user message in an AI orchestrator isn't a single LLM call. It requ
 - Each message needs context from memory, entities, and conversation history
 - The LLM may request multiple tool calls before producing a final response
 - Tool calls need deduplication, interception, caching, and autonomy checks
-- Responses need correction, verification against execution plans, and post-processing
+- Responses need correction and post-processing
 - Errors at any stage need graceful handling without losing the conversation
 
 ## Solution
 
 ### Pipeline Stages
 
-The message processor follows seven stages with a modular tool execution subsystem:
+The message processor follows six stages with a modular tool execution subsystem:
 
 ```
-Input → Session → Route → Context → Plan → [Tool Loop] → Verify → Respond
+Input → Session → Route → Context → Plan → [Tool Loop] → Respond
 ```
 
 ### Stage 1: Session and Thinking Setup
@@ -157,20 +157,7 @@ async function executeSingleTool(call, userId, correlationId) {
 }
 ```
 
-### Stage 6: Response Verification
-
-After the tool loop completes, responses are corrected and verified against the execution plan:
-
-```javascript
-text = applyResponseCorrections(text, executionStatus);
-
-if (planResult?.shouldVerify) {
-  const verification = await planning.verifyExecution(planResult, toolCallsLog, text);
-  // Inject corrections if verification finds discrepancies
-}
-```
-
-### Stage 7: Delivery and Post-Processing
+### Stage 6: Delivery and Post-Processing
 
 The response is sent immediately; post-processing runs in the background:
 
@@ -189,7 +176,7 @@ handlePostProcessing(userId, textContent, text, toolCallsLog, correlationId)
 - Recovery hints enable self-correction without human intervention — the LLM learns from tool failures within the same conversation
 - Text collection across all iterations prevents truncation when the LLM provides partial text between tool calls
 - Cache TTL of 30 seconds balances freshness with cost — read-only tools like search benefit most
-- Planning verification catches cases where the LLM claims success but tool execution actually failed
+- Response corrections (applied inline after the tool loop) catch surface-level issues without a separate verification stage
 
 ## Code Example
 
@@ -217,10 +204,8 @@ async function processMessage(ctx) {
     chat, initialResponse, userId, correlationId
   );
 
-  // Stage 6: Verify
-  let text = applyResponseCorrections(response.text, executionStatus);
-
-  // Stage 7: Deliver + post-process
+  // Stage 6: Deliver + post-process
+  const text = applyResponseCorrections(response.text, executionStatus);
   await sendParsedResponse(ctx, text);
   handlePostProcessing(userId, message, text, toolCallsLog).catch(logError);
 }

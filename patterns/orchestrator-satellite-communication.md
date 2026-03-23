@@ -1,6 +1,6 @@
 # Orchestrator-Worker Communication
 
-> Event-bus-driven task dispatch with DB-persisted task lifecycle, worker registration via Socket.io, and GitHub CC fallback when workers are offline.
+> Dispatcher-driven task dispatch to on-demand Claude Code satellite processes, with DB-persisted task lifecycle, priority kanban queuing, and GitHub CC fallback when local dispatch fails.
 
 ## Problem
 
@@ -8,174 +8,155 @@ An orchestrator needs to dispatch heterogeneous work (code generation, issue sol
 
 ## Context
 
-- A central orchestrator dispatching work to connected Socket.io workers
-- Workers register dynamically at runtime — availability is not guaranteed
-- Tasks queue in a persistent taskQueue when no worker is available
-- GitHub CC (Claude Code) serves as a fallback executor when all workers are offline
+- A central orchestrator dispatching work to Claude Code CLI processes spawned on demand
+- Workers are not pre-registered — they are created when work needs to be done and destroyed when it completes
+- A priority kanban queue governs dispatch ordering, not a real-time event bus
+- GitHub CC (Claude Code) serves as a fallback executor when local dispatch fails
 - Workers can produce multiple outcome types: successful completion, failure, PR creation, or voluntary abandonment
-- Isolated execution contexts via agent sessions to prevent cross-task contamination
+- Isolated execution contexts via git worktrees to prevent cross-task contamination
 
 ## Solution
 
 ### Architecture Overview
 
-Task dispatch uses an internal event bus (`internalBus`) for event aggregation rather than direct Socket.io dequeue. Tasks are persisted in the database with a full lifecycle state machine (pending -> assigned -> running -> completed/failed/abandoned). The Socket.io layer still exists for real-time worker communication, but task state management has moved to DB-backed persistence with event-driven transitions.
+Task dispatch flows through a dispatcher module (`lib/worker/dispatcher.js`) that spawns Claude Code CLI processes with specific prompts and working directories. There is no Socket.io worker registry — workers are ephemeral processes, not persistent connections. The dispatcher manages a concurrency pool, tracks active workers, and routes incoming work through a priority kanban queue. Task state is DB-persisted with a full lifecycle state machine (pending -> dispatched -> running -> completed/failed/abandoned).
 
-### Worker Registration via Socket.io
+### Dispatcher-Based Worker Spawning
 
-Workers announce themselves to the orchestrator on connect using a `worker:register` event. The orchestrator maintains an in-memory registry of available workers keyed by socket ID:
-
-```javascript
-// orchestrator/workerRegistry.js
-io.on('connection', (socket) => {
-  socket.on('worker:register', ({ capabilities, workerId }) => {
-    registry.set(socket.id, { socket, capabilities, workerId, busy: false });
-
-    // Notify the event bus that a worker is available
-    internalBus.emit('worker:available', { socketId: socket.id, capabilities });
-  });
-
-  socket.on('disconnect', () => {
-    registry.delete(socket.id);
-  });
-});
-```
-
-### DB-Persisted Task Lifecycle
-
-Tasks are persisted in the database with a state machine governing transitions. The `internalBus` listens for events and triggers state transitions:
+The dispatcher spawns Claude Code CLI processes on demand. Each worker is a standalone process with a defined prompt, model, and working directory. The dispatcher tracks active workers against a concurrency limit:
 
 ```javascript
-// orchestrator/taskLifecycle.js
-const TASK_STATES = ['pending', 'assigned', 'running', 'completed', 'failed', 'abandoned'];
+// lib/worker/dispatcher.js (illustrative)
+async function dispatch(task) {
+  if (activeWorkers.size >= maxConcurrency) {
+    queue.enqueue(task);  // Back-pressure into the kanban queue
+    return;
+  }
 
-async function createTask(task) {
-  const record = await db.query(`
-    INSERT INTO tasks (id, type, payload, status, created_at)
-    VALUES ($1, $2, $3, 'pending', NOW()) RETURNING *
-  `, [task.id, task.type, JSON.stringify(task.payload)]);
+  await db.query(
+    `UPDATE tasks SET status = 'dispatched', dispatched_at = NOW() WHERE id = $1`,
+    [task.id]
+  );
 
-  internalBus.emit('task:created', record);
-  return record;
+  const worktree = await prepareWorktree(task.project);
+  const worker = spawn('claude', [
+    '--prompt', task.prompt,
+    '--model', task.model || 'sonnet',
+    '--cwd', worktree.path,
+  ]);
+
+  activeWorkers.set(task.id, { process: worker, worktree, startedAt: Date.now() });
+
+  worker.on('exit', (code) => handleWorkerExit(task.id, code));
 }
-
-// Event-driven dispatch: when a worker becomes available, assign pending tasks
-internalBus.on('worker:available', async ({ socketId, capabilities }) => {
-  const task = await db.query(`
-    UPDATE tasks SET status = 'assigned', assigned_to = $1, assigned_at = NOW()
-    WHERE id = (
-      SELECT id FROM tasks WHERE status = 'pending' AND type = ANY($2)
-      ORDER BY created_at ASC LIMIT 1
-      FOR UPDATE SKIP LOCKED
-    ) RETURNING *
-  `, [socketId, capabilities]);
-
-  if (task) {
-    const worker = registry.get(socketId);
-    worker.socket.emit('task:assign', {
-      taskId: task.id, type: task.type, payload: task.payload,
-    });
-  }
-});
 ```
 
-### Completion Reporting
+### Worktree Isolation
 
-Workers emit `task:complete` when finished. The orchestrator persists the outcome and emits events for downstream consumers:
+Each dispatched task gets its own git worktree to prevent cross-task contamination. When two tasks target the same repository, they operate on independent working copies:
 
 ```javascript
-// worker/index.js — worker side
-socket.on('task:assign', async ({ taskId, type, payload }) => {
-  try {
-    const result = await runTask(type, payload);
-    socket.emit('task:complete', { taskId, status: 'completed', result });
-  } catch (err) {
-    socket.emit('task:complete', { taskId, status: 'failed', error: err.message });
-  }
-});
+// lib/worker/worktree.js (illustrative)
+async function prepareWorktree(project) {
+  const worktreePath = path.join(WORKTREES_DIR, `${project}-${Date.now()}`);
+  await exec(`git worktree add ${worktreePath} -b work/${project}-${Date.now()}`);
+  return { path: worktreePath, cleanup: () => exec(`git worktree remove ${worktreePath}`) };
+}
+```
 
-// orchestrator/taskLifecycle.js — orchestrator side
-socket.on('task:complete', async ({ taskId, status, result, error }) => {
-  const worker = registry.get(socket.id);
-  if (worker) worker.busy = false;
+### Priority Kanban Queue
 
-  await db.query(`
-    UPDATE tasks SET status = $1, result = $2, error = $3, completed_at = NOW()
-    WHERE id = $4
-  `, [status, JSON.stringify(result), error, taskId]);
+Work enters the system through a kanban queue that respects priority lanes. The dispatcher pulls from this queue whenever a worker slot opens up:
 
-  internalBus.emit('task:completed', { taskId, status });
-  internalBus.emit('worker:available', { socketId: socket.id, capabilities: worker.capabilities });
-});
+```
+Task created → kanban queue (prioritized) → dispatcher picks up → CC process spawned → process exits → result captured
+```
+
+Higher-priority lanes (e.g., urgent fixes) are drained before lower-priority ones (e.g., routine maintenance). The queue is the single entry point for all work — scheduled tasks, manual triggers, and agent-initiated work all flow through it.
+
+### Completion via Process Exit
+
+Results come back when the Claude Code process exits, not via event callbacks. The dispatcher inspects the exit code and any artifacts (commits, PRs) produced during execution:
+
+```javascript
+// lib/worker/dispatcher.js (illustrative)
+async function handleWorkerExit(taskId, exitCode) {
+  const worker = activeWorkers.get(taskId);
+  activeWorkers.delete(taskId);
+
+  const status = exitCode === 0 ? 'completed' : 'failed';
+  await db.query(
+    `UPDATE tasks SET status = $1, completed_at = NOW(), exit_code = $2 WHERE id = $3`,
+    [status, exitCode, taskId]
+  );
+
+  // Clean up the worktree
+  await worker.worktree.cleanup();
+
+  // Pull next task from the queue if one is waiting
+  const next = queue.dequeue();
+  if (next) await dispatch(next);
+}
 ```
 
 ### GitHub CC Fallback
 
-When the worker registry is empty, the orchestrator spawns a GitHub CC (Claude Code) process as a synchronous fallback. This ensures tasks are never stranded when no persistent workers are online:
+When local dispatch fails (e.g., CLI not available, system resource exhaustion), the dispatcher can fall back to GitHub-hosted Claude Code. This is a safety net, not the primary execution path:
 
 ```javascript
-// orchestrator/githubCCFallback.js
-async function run(task) {
-  const prompt = buildPrompt(task);
-  await spawnCC({ prompt, workdir: task.workdir });
-  // CC exits when done — result is captured via git push / PR creation
+// lib/worker/fallback.js (illustrative)
+async function dispatchToGitHub(task) {
+  // Trigger a GitHub Actions workflow that runs CC in the cloud
+  await octokit.actions.createWorkflowDispatch({
+    owner, repo,
+    workflow_id: 'cc-task.yml',
+    inputs: { prompt: task.prompt, taskId: task.id },
+  });
 }
 ```
 
 ## Implications
 
-- The `internalBus` event aggregation decouples task creation from dispatch — any component can emit `task:created` and the bus routes it to the assignment logic
-- DB-persisted task state (with `FOR UPDATE SKIP LOCKED`) is the source of truth, surviving restarts and enabling horizontal scaling across multiple orchestrator instances
-- Socket.io remains the real-time transport for pushing assignments to workers and receiving completions, but it no longer owns task state
-- The event-driven `worker:available` pattern replaces explicit queue draining — when a worker registers or completes a task, the bus triggers assignment automatically
-- The GitHub CC fallback ensures no task is permanently stranded, but it is synchronous and slower than a live worker; it should be treated as a safety net, not a primary path
-- The full lifecycle state machine (pending -> assigned -> running -> completed/failed/abandoned) provides richer observability than a simple pending/done model
-- Agent sessions still provide isolation between concurrent workers, preventing context bleed across tasks
+- Workers are stateless, ephemeral processes — there is no registry to maintain, no heartbeats to monitor, and no reconnection logic to handle
+- The kanban queue is the single choke point for all work dispatch, making it easy to observe system load and enforce back-pressure
+- DB-persisted task state (with proper locking) is the source of truth, surviving restarts and enabling the orchestrator to resume in-flight work
+- Git worktree isolation means concurrent tasks on the same repo do not conflict, but worktree cleanup is critical to avoid disk exhaustion
+- The GitHub CC fallback ensures no task is permanently stranded, but it is slower and less observable than local dispatch — it should be treated as a safety net
+- The full lifecycle state machine (pending -> dispatched -> running -> completed/failed/abandoned) provides richer observability than a simple pending/done model
+- Concurrency limits in the dispatcher prevent resource exhaustion — the queue absorbs overflow naturally
 
 ## Code Example
 
 ```javascript
-// Full lifecycle: task created, worker comes online, event bus assigns, worker reports completion
+// Full lifecycle: task created, queued, dispatched, worker exits, result persisted
 
-// --- Orchestrator side ---
-
-io.on('connection', (socket) => {
-  socket.on('worker:register', ({ workerId, capabilities }) => {
-    registry.set(socket.id, { socket, workerId, capabilities, busy: false });
-    internalBus.emit('worker:available', { socketId: socket.id, capabilities });
-  });
-
-  socket.on('task:complete', async ({ taskId, status, result, error }) => {
-    const worker = registry.get(socket.id);
-    if (worker) worker.busy = false;
-
-    await db.query(
-      `UPDATE tasks SET status = $1, result = $2, error = $3, completed_at = NOW() WHERE id = $4`,
-      [status, JSON.stringify(result), error, taskId]
-    );
-
-    internalBus.emit('task:completed', { taskId, status });
-    internalBus.emit('worker:available', { socketId: socket.id, capabilities: worker.capabilities });
-  });
-
-  socket.on('disconnect', () => registry.delete(socket.id));
+// --- Task enters the system ---
+const task = await createTask({
+  id: 'task-42',
+  type: 'solve-issue',
+  prompt: 'Fix the pagination bug in /api/users. See issue #99.',
+  project: 'billing-api',
+  model: 'sonnet',
+  priority: 'high',
 });
 
-// Create a new task — the event bus handles dispatch when a worker is available
-await createTask({ id: 'task-42', type: 'solve-issue', payload: { issueId: 99 } });
+// --- Kanban queue orders by priority ---
+// queue: [task-42 (high), task-38 (normal), task-35 (low)]
 
-// --- Worker side ---
+// --- Dispatcher picks up task-42 when a slot is available ---
+// 1. Prepares a git worktree for billing-api
+// 2. Spawns: claude --prompt "Fix the pagination bug..." --model sonnet --cwd /worktrees/billing-api-1234
+// 3. Tracks the process in activeWorkers
 
-socket.emit('worker:register', { workerId: 'cc-worker-1', capabilities: ['solve-issue', 'coding'] });
+// --- CC process runs, makes commits, opens a PR, exits with code 0 ---
 
-socket.on('task:assign', async ({ taskId, type, payload }) => {
-  try {
-    const result = await runTask(type, payload);
-    socket.emit('task:complete', { taskId, status: 'completed', result });
-  } catch (err) {
-    socket.emit('task:complete', { taskId, status: 'failed', error: err.message });
-  }
-});
+// --- Dispatcher handles exit ---
+// 1. Updates DB: status = 'completed', exit_code = 0
+// 2. Cleans up the worktree
+// 3. Pulls task-38 from the queue and dispatches it
+
+// --- If local dispatch had failed ---
+// dispatchToGitHub(task) triggers a GitHub Actions workflow as fallback
 ```
 
 ## Related Patterns

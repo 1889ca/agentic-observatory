@@ -1,6 +1,6 @@
 # Request-Scoped Context Propagation
 
-> AsyncLocalStorage-based per-request context (correlation IDs, embedding caches, tenant isolation stub) avoiding parameter drilling through async chains.
+> AsyncLocalStorage-based per-request context (correlation IDs, embedding caches, tenant isolation stub) avoiding parameter drilling through async chains. Note: multi-tenancy is completely inactive — `tenantId` is hardcoded to `1` in `unified-events.ts`, meaning all data shares a single tenant namespace.
 
 ## Problem
 
@@ -103,9 +103,9 @@ function createLogger(module) {
 
 Every log line across every module in the async chain includes the same correlation ID. No parameter drilling needed. Grep a single ID in your log aggregator and you get the full request trace.
 
-### Tenant Isolation (Structural Stub)
+### Tenant Isolation (Completely Inactive)
 
-The tenant isolation infrastructure is in place but currently operates as a structural stub — `tenantId` is hardcoded to tenant 1. The AsyncLocalStorage pattern is real and functional for correlation IDs and embedding caches, but multi-tenancy is not active. The code below shows the prepared abstraction that will activate when multi-tenancy is enabled:
+The tenant isolation infrastructure exists in code but is completely inactive. In `unified-events.ts`, `tenantId` is hardcoded to `1` — there is no runtime tenant resolution, no per-tenant data separation, and all data shares a single tenant namespace. The AsyncLocalStorage pattern is real and functional for correlation IDs and embedding caches, but multi-tenancy is a dead code path. The code below shows the prepared abstraction, but none of it is exercised with real multi-tenant data today:
 
 ```javascript
 // lib/tenant-context.ts
@@ -128,7 +128,7 @@ export function scopeKey(key: string): string {
 }
 ```
 
-Database queries, cache keys, and external API calls all use `getTenantId()` to enforce isolation. The throw-on-missing pattern catches cases where code runs outside a request context (background jobs that forgot to set up tenant scope). Note: currently this always returns tenant 1 since multi-tenancy is not yet active — the isolation plumbing exists but only serves a single tenant.
+Database queries, cache keys, and external API calls all use `getTenantId()` to enforce isolation in theory. In practice, `tenantId` is always `1` (hardcoded in `unified-events.ts`), so the isolation plumbing is never exercised with real multi-tenant data. The throw-on-missing pattern catches cases where code runs outside a request context, but with the hardcoded tenant ID, this is effectively a no-op safety net.
 
 ### Per-Request Embedding Cache
 

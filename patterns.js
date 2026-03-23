@@ -6,7 +6,7 @@ const PATTERNS = [
   {
     slug: "orchestrator-satellite-communication",
     title: "Orchestrator-Worker Communication",
-    summary: "Event-bus-driven task dispatch with DB-persisted lifecycle, dynamic worker registration, and GitHub CC fallback for offline workers.",
+    summary: "Dispatcher-based task dispatch to ephemeral Claude Code CLI processes with priority kanban queue, worktree isolation, and GitHub CC fallback.",
     status: "published",
   },
   {
@@ -66,13 +66,13 @@ const PATTERNS = [
   {
     slug: "unified-event-system",
     title: "Unified Event System",
-    summary: "Dual-mode event bus with unified.entity/unified.system API, debounced entity events, and immediate system events for reactive UI.",
+    summary: "Dual-mode TypeScript event bus with internal entity.invalidated emission, debounced entity events, and immediate system events.",
     status: "published",
   },
   {
     slug: "message-processing-pipeline",
     title: "Message Processing Pipeline",
-    summary: "Modular seven-stage pipeline with parallel context assembly, planning, deduplicated tool execution, and response verification.",
+    summary: "Modular six-stage pipeline with parallel context assembly, planning, deduplicated tool execution, and post-processing.",
     status: "published",
   },
   {
@@ -84,7 +84,7 @@ const PATTERNS = [
   {
     slug: "intent-driven-self-scheduling",
     title: "Intent-Driven Self-Scheduling",
-    summary: "Agents create and manage scheduled tasks via REST API with cron dispatch through a priority kanban queue.",
+    summary: "Cron-based scheduling dispatching through /api/workers/:workerType/dispatch with priority kanban queue integration and agent self-scheduling.",
     status: "published",
   },
   {
@@ -102,7 +102,7 @@ const PATTERNS = [
   {
     slug: "plugin-system-and-hot-reload",
     title: "Plugin System and Hot-Reload",
-    summary: "Manifest-based plugin architecture with fs.watch hot-reload, lifecycle states, and dual discovery from local directories and npm packages.",
+    summary: "Module-based plugin loading via lib/plugins/loader.js with fs.watch hot-reload, lifecycle states, and code-exported capability contributions.",
     status: "published",
   },
   {
@@ -126,7 +126,7 @@ const PATTERNS = [
   {
     slug: "knowledge-graph-and-relationship-discovery",
     title: "Knowledge Graph and Relationship Discovery",
-    summary: "Domain-specific (gigs/venues/performers) entity relationships stored in the documents table with relationship scoring and multi-hop traversal.",
+    summary: "Generic entity relationships stored in the documents table with relationship scoring and multi-hop traversal for context enrichment.",
     status: "published",
   },
   {
@@ -168,7 +168,7 @@ const PATTERNS = [
   {
     slug: "confidence-based-autonomy-gating",
     title: "Confidence-Based Autonomy Gating",
-    summary: "Multi-signal weighted confidence scoring with context affinities for earned autonomy. Independent from vibe/anticipation system.",
+    summary: "Multi-signal weighted confidence scoring with fixed weights and post-calculation adjustments for earned autonomy. Independent from vibe/anticipation system.",
     status: "published",
   },
   {
@@ -264,7 +264,7 @@ const PATTERNS = [
   {
     slug: "request-scoped-context",
     title: "Request-Scoped Context Propagation",
-    summary: "AsyncLocalStorage-based per-request context carrying correlation IDs, tenant isolation, and embedding caches through async chains without parameter drilling.",
+    summary: "AsyncLocalStorage-based per-request context carrying correlation IDs and embedding caches through async chains. Multi-tenancy hardcoded to tenant 1.",
     status: "published",
   },
   {
@@ -343,6 +343,30 @@ const PATTERNS = [
     slug: "document-type-system",
     title: "Document Type System",
     summary: "Type-based document handling with property validation, cross-type properties, and bidirectional task-document relationships.",
+    status: "published",
+  },
+  {
+    slug: "database-abstraction-and-schema-management",
+    title: "Database Abstraction and Schema Management",
+    summary: "PostgreSQL abstraction with lazy pool initialization, advisory-lock-protected schema migrations, connection pooling, and dual read/write API.",
+    status: "published",
+  },
+  {
+    slug: "redis-optional-caching-and-clustering",
+    title: "Redis Optional Caching and Clustering",
+    summary: "Optional Redis layer with exponential backoff reconnection, in-memory fallback, Socket.io adapter for multi-instance pub/sub, and health checks.",
+    status: "published",
+  },
+  {
+    slug: "rate-limiting-and-api-protection",
+    title: "Rate Limiting and API Protection",
+    summary: "Sliding-window rate limiter on /api/* routes with per-endpoint configurable limits, custom key extraction, and Redis or in-memory backends.",
+    status: "published",
+  },
+  {
+    slug: "structured-logging-with-child-loggers",
+    title: "Structured Logging with Child Loggers",
+    summary: "Pino-based JSON logging with per-module child loggers, configurable levels, PID/env metadata, and AsyncLocalStorage correlation ID integration.",
     status: "published",
   },
 ];

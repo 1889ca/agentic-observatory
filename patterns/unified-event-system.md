@@ -22,7 +22,7 @@ The event system provides two distinct delivery semantics:
 
 **Entity Events** (debounced, batched) — Created, updated, deleted, archived events for data entities. These are debounced at 50ms to collapse rapid successive updates (e.g., a flow step that creates 5 entities) into a single notification batch.
 
-```javascript
+```typescript
 // Entity events via unified API
 unified.entity.created('task', entityId, data);
 unified.entity.updated('task', entityId, data);
@@ -33,19 +33,18 @@ unified.entity.archived('task', entityId);
 
 **System Events** (immediate, pub/sub) — Job lifecycle, model dispatch, capability execution, and other infrastructure events. These fire immediately with no batching.
 
-```javascript
+```typescript
 // System events also go through the unified API
 unified.system.emit('job.started', event);
 unified.system.emit('model.error', event);
 // Fires immediately — no debouncing
-```
 ```
 
 ### Event Payload Structure
 
 All events share a common envelope:
 
-```javascript
+```typescript
 {
   entityType: 'task',
   action: 'updated',
@@ -63,7 +62,7 @@ The `invalidationKeys` field allows widgets to subscribe to specific cache inval
 
 UI widgets register interest in specific entity types or invalidation keys. When a matching event fires, the widget receives a refresh signal:
 
-```javascript
+```typescript
 // Widget subscribes to task changes
 unified.entity.on('updated', (event) => {
   if (event.invalidationKeys.includes(myWidgetKey)) {
@@ -72,9 +71,9 @@ unified.entity.on('updated', (event) => {
 });
 ```
 
-### Event Fan-Out via WebSocket
+### Internal Event Fan-Out
 
-Entity events are broadcast to connected clients over Socket.io for real-time UI updates. The gateway bridges events from the brain process to client connections, ensuring UI reactivity survives brain restarts.
+Entity events are emitted internally rather than broadcast over Socket.io. When the debounce window flushes, the system emits `entity.invalidated` events that local subscribers (widgets, audit logging, reflex triggers) consume directly within the process.
 
 ## Implications
 
@@ -87,25 +86,22 @@ Entity events are broadcast to connected clients over Socket.io for real-time UI
 
 ## Code Example
 
-```javascript
+```typescript
 // Batch flush — collapses rapid updates
-function flushBatch() {
+function flushBatch(): void {
   const batch = pendingEvents.splice(0);
   if (batch.length === 0) return;
 
   // Deduplicate: keep last event per entityId
-  const deduped = new Map();
+  const deduped = new Map<string, EntityEvent>();
   for (const event of batch) {
     deduped.set(`${event.entityType}:${event.entityId}`, event);
   }
 
-  // Deliver to local subscribers via unified API
+  // Emit internal invalidation events to local subscribers
   for (const event of deduped.values()) {
-    unified.system.emit(`entity:${event.action}`, event);
+    emit('entity.invalidated', event);
   }
-
-  // Broadcast to connected clients
-  io.emit('entity:batch', Array.from(deduped.values()));
 }
 ```
 

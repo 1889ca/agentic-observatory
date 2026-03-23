@@ -1,6 +1,6 @@
 # Intent-Driven Self-Scheduling
 
-> Agents create and manage their own scheduled tasks via API, with cron-based dispatch through a priority kanban queue rather than direct satellite execution.
+> Agents dispatch their own work and schedule future tasks via the worker dispatch system, with cron-based triggers flowing through the same priority kanban queue as all other work.
 
 ## Problem
 
@@ -13,157 +13,155 @@ Traditional scheduling for AI agents uses fixed cron jobs defined by humans. The
 - Systems where scheduling requirements change dynamically based on what the agent learns
 - Multiple worker models with different cost profiles
 - Tasks need to flow through the same priority system as all other work
+- A unified dispatch endpoint that handles both immediate and scheduled work
 
 ## Solution
 
-### API-Based Task Management
+### Worker-Type Dispatch Endpoint
 
-The orchestrator exposes REST endpoints as part of its own HTTP API for creating, listing, triggering, and deleting scheduled tasks. These endpoints are called by agents running within the orchestrator context (e.g., satellites executing tasks), not as a standalone external service:
+Work is dispatched through a single endpoint scoped by worker type. The worker type determines which execution backend handles the task — local Claude Code, GitHub CC, or other backends:
 
 ```javascript
-// routes.js
-'POST /api/tasks': async (req, res) => {
+// routes.js (illustrative)
+'POST /api/workers/:workerType/dispatch': async (req, res) => {
+  const { workerType } = req.params;
   const body = await parseBody(req);
-  if (!body.id || !body.schedule || !body.prompt) {
-    return json(res, { error: 'id, schedule, and prompt required' }, 400);
-  }
-  json(res, createTask(body.id, body.schedule, body.prompt, body));
-},
 
-'GET /api/tasks': async (req, res) => {
-  json(res, listTasks());
-},
+  const task = await dispatchToWorker(workerType, {
+    prompt: body.prompt,
+    model: body.model || 'sonnet',
+    workdir: body.workdir,
+    priority: body.priority || 'normal',
+    metadata: body.metadata,
+  });
 
-'POST /api/tasks/:id/run': async (req, res) => {
-  const result = await runTaskNow(req.params.id);
-  json(res, result);
+  json(res, task);
 },
 ```
 
-### Cron-Based Dispatch
+This is the only entry point for dispatching work. There is no separate task CRUD API — tasks are created by dispatching them, and the dispatch system handles queuing, persistence, and execution.
 
-Tasks are registered with `node-cron` for time-based triggering. When a task fires, it enqueues work into the kanban queue rather than dispatching directly to a satellite:
+### Cron-Based Scheduling into the Dispatch System
+
+Scheduled tasks are registered with `node-cron`, but when a cron fires, it dispatches through the worker system rather than executing directly. This means scheduled work flows through the same priority kanban queue as everything else:
 
 ```javascript
-// tasks.js
-function createTask(id, schedule, prompt, opts = {}) {
+// lib/scheduler.js (illustrative)
+function registerSchedule(id, schedule, config) {
   if (!cron.validate(schedule)) {
     throw new Error(`Invalid cron schedule: ${schedule}`);
   }
 
-  tasksDb.add(id, schedule, prompt, opts);
-  const task = tasksDb.get(id);
-  registerJob(task);
-  return task;
-}
+  // Persist to DB so schedules survive restarts
+  schedulesDb.upsert(id, { schedule, ...config });
 
-function registerJob(task) {
-  if (activeCrons.has(task.id)) {
-    activeCrons.get(task.id).stop();
-  }
-
-  const job = cron.schedule(task.schedule, async () => {
-    // Enqueue to kanban — NOT direct satellite dispatch
-    dispatch({
-      lane: 'task',
-      description: `Scheduled: ${task.id}`,
-      prompt: task.prompt,
-      scheduled_task_id: task.id,
-      result_handler: 'task',
+  const job = cron.schedule(schedule, async () => {
+    // Fire into the dispatch system — NOT direct execution
+    await dispatchToWorker(config.workerType || 'local', {
+      prompt: config.prompt,
+      model: config.model || 'sonnet',
+      workdir: config.workdir,
+      priority: config.priority || 'normal',
+      metadata: { scheduled_task_id: id },
     });
   });
 
-  activeCrons.set(task.id, job);
+  activeJobs.set(id, job);
+}
+
+// On startup, re-register all persisted schedules
+async function restoreSchedules() {
+  const schedules = await schedulesDb.getAll({ enabled: true });
+  for (const s of schedules) {
+    registerSchedule(s.id, s.schedule, s);
+  }
 }
 ```
 
 ### Kanban Integration
 
-Scheduled tasks flow through the same kanban priority queue as all other work. This means they respect concurrency limits, per-project locks, and priority ordering:
+Scheduled tasks enter the same kanban priority queue as manually triggered and agent-initiated work. This means they respect concurrency limits, per-project locks, and priority ordering:
 
 ```
-Cron fires → dispatch({ lane: 'task' }) → kanban queue → satellite worker
+Cron fires → dispatchToWorker() → kanban queue (prioritized) → dispatcher spawns CC process
 ```
 
-The `result_handler: 'task'` field routes completion results back to the task system for logging and error handling.
+There is no fast path that bypasses the queue. A low-priority scheduled task will wait behind high-priority manual work, which prevents scheduled maintenance from starving urgent fixes.
 
-### Dynamic Self-Scheduling During Execution
+### Self-Scheduling During Execution
 
-Agents running as orchestrator satellites can create follow-up tasks during their own execution by calling back to the orchestrator's API. A morning review task might discover a failing build and schedule a follow-up check:
+Agents running as Claude Code satellites can dispatch follow-up work during their own execution by calling back to the orchestrator's dispatch endpoint. A morning review task might discover a failing build and schedule a follow-up check:
 
 ```javascript
-// Agent creates a follow-up task via REST API
-await fetch('http://localhost:3847/api/tasks', {
+// During agent execution — agent dispatches immediate follow-up work
+await fetch('http://localhost:3847/api/workers/local/dispatch', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
-    id: 'followup-build-check',
-    schedule: '30 10 * * *',  // check at 10:30am
-    prompt: 'The billing-api build failed at 9am. Check if the fix PR was merged.',
+    prompt: 'The billing-api build failed. Check if the fix PR was merged and the build is green.',
     model: 'haiku',
     workdir: '/projects/billing-api',
+    priority: 'high',
   }),
-});
-
-// Once the follow-up is resolved, the agent deletes the task
-await fetch('http://localhost:3847/api/tasks/followup-build-check', {
-  method: 'DELETE',
 });
 ```
 
+For recurring self-scheduled work, the agent can register a cron schedule through the orchestrator's internal API or by including scheduling instructions in its output that the result handler interprets.
+
 ### Model Selection for Cost Control
 
-Different tasks warrant different model capabilities:
+Different tasks warrant different model capabilities. The dispatch endpoint accepts a model parameter that the dispatcher passes through to the spawned CC process:
 
 - **haiku**: Health checks, status polls, simple verifications
 - **sonnet**: Code reviews, planning, multi-step reasoning (default)
 - **opus**: Architecture decisions, complex debugging (used sparingly)
 
+Cost-conscious scheduling means routine daily checks use haiku, while weekly deep reviews use sonnet or opus.
+
 ## Implications
 
-- Tasks enqueue to kanban rather than dispatching directly, so they respect the same concurrency limits and priority ordering as all other work
+- All work — scheduled, manual, and agent-initiated — flows through the same dispatch endpoint and kanban queue, making the system's workload fully observable from a single point
 - Cron expressions provide minute-level granularity but not sub-minute precision
-- Tasks persist in the database, surviving orchestrator restarts. The cron scheduler re-registers all enabled tasks on startup
-- Self-scheduled tasks are indistinguishable from human-created ones — the same orchestrator API serves both
-- One-shot tasks require the agent to clean up after itself by calling `DELETE /api/tasks/:id`
+- Schedules persist in the database, surviving orchestrator restarts. The scheduler re-registers all enabled schedules on startup
+- Self-dispatched work is indistinguishable from human-triggered work once it enters the queue — the same priority and concurrency rules apply
+- The worker type parameter in the dispatch endpoint allows routing to different backends (local CC, GitHub CC) without changing the caller's interface
+- There is no separate task management API to maintain — the dispatch endpoint is the single interface for all work creation
 
 ## Code Example
 
 ```javascript
-// Complete lifecycle: create, fire, execute, clean up
+// Complete lifecycle: schedule registered, cron fires, work dispatched, agent self-schedules follow-up
 
-// 1. Human or agent creates a recurring task via the orchestrator's API
-await fetch('http://localhost:3847/api/tasks', {
+// 1. On startup, the orchestrator registers persistent schedules
+registerSchedule('daily-dependency-check', '0 14 * * 1-5', {
+  prompt: 'Check all projects for outdated dependencies. Open PRs for critical updates.',
+  model: 'sonnet',
+  workerType: 'local',
+  priority: 'normal',
+});
+
+// 2. At 2pm on Monday, cron fires → dispatches to worker system
+// dispatchToWorker('local', { prompt: '...', model: 'sonnet', metadata: { scheduled_task_id: 'daily-dependency-check' } })
+
+// 3. Kanban queue orders it among other pending work
+// queue: [urgent-fix (high), daily-dependency-check (normal), cleanup-logs (low)]
+
+// 4. Dispatcher spawns a CC process when a slot opens
+// claude --prompt "Check all projects for outdated dependencies..." --model sonnet
+
+// 5. During execution, the agent discovers a critical update and dispatches immediate follow-up
+await fetch('http://localhost:3847/api/workers/local/dispatch', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
-    id: 'daily-dependency-check',
-    schedule: '0 14 * * 1-5',  // 2pm on weekdays
-    prompt: 'Check all projects for outdated dependencies. Open PRs for critical updates.',
+    prompt: 'Critical: express 4.x has a security vulnerability. Upgrade to 5.x in billing-api and open a PR.',
     model: 'sonnet',
+    workdir: '/projects/billing-api',
+    priority: 'high',
   }),
 });
 
-// 2. At 2pm on Monday, cron fires → task enqueues to kanban
-// dispatch({ lane: 'task', prompt: '...', scheduled_task_id: 'daily-dependency-check' })
-
-// 3. Kanban worker picks it up when a satellite slot is available
-// sendRun({ prompt, model, cwd }) → satellite executes
-
-// 4. Result routes back via result_handler: 'task'
-// Task system logs completion, tracks success/failure
-
-// 5. If the agent discovers a one-time follow-up during execution:
-await fetch('http://localhost:3847/api/tasks', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    id: `followup-${Date.now()}`,
-    schedule: '*/30 * * * *',
-    prompt: 'Check if PR #142 was reviewed. If approved, merge and delete this task.',
-    model: 'haiku',
-  }),
-});
+// 6. The follow-up enters the kanban queue at high priority and is dispatched next
 ```
 
 ## Related Patterns
