@@ -6,7 +6,7 @@ const PATTERNS = [
   {
     slug: "orchestrator-satellite-communication",
     title: "Orchestrator-Worker Communication",
-    summary: "Dispatcher-based task dispatch to ephemeral Claude Code CLI processes with priority kanban queue, worktree isolation, and GitHub CC fallback.",
+    summary: "Multi-strategy task dispatch where work sources feed a priority queue and a central dispatcher selects between runner-based, async, or direct execution strategies based on task type.",
     status: "published",
   },
   {
@@ -66,7 +66,7 @@ const PATTERNS = [
   {
     slug: "unified-event-system",
     title: "Unified Event System",
-    summary: "Dual-mode TypeScript event bus with internal entity.invalidated emission, debounced entity events, and immediate system events.",
+    summary: "TypeScript event bus with namespaced emit/on pub/sub, wildcard subscriptions, and immediate delivery for both entity and system events.",
     status: "published",
   },
   {
@@ -102,7 +102,7 @@ const PATTERNS = [
   {
     slug: "plugin-system-and-hot-reload",
     title: "Plugin System and Hot-Reload",
-    summary: "Module-based plugin loading via lib/plugins/loader.js with fs.watch hot-reload, lifecycle states, and code-exported capability contributions.",
+    summary: "Manifest-driven plugin loading via plugin.json declarations with fs.watch hot-reload, lifecycle states, and capability registration.",
     status: "published",
   },
   {
@@ -210,7 +210,7 @@ const PATTERNS = [
   {
     slug: "agent-recovery-and-escalation",
     title: "Agent Recovery and Escalation",
-    summary: "Strategy-based recovery from tool failures with clarification workflows, batch approval grouping, and action buffering.",
+    summary: "Approval-flow-based recovery with retryable/non-retryable failure classification, user escalation, and autonomy tier integration.",
     status: "published",
   },
   {
@@ -330,7 +330,7 @@ const PATTERNS = [
   {
     slug: "model-selection-and-llm-fallback",
     title: "Model Selection and LLM Fallback",
-    summary: "Primary/fallback LLM provider chain with lazy initialization, concurrent init prevention via mutex flag, and timeout protection.",
+    summary: "Task-aware model routing via config/models.js definitions and lib/llm/router.js selection with provider-level fallback and lazy client initialization.",
     status: "published",
   },
   {
@@ -367,6 +367,30 @@ const PATTERNS = [
     slug: "structured-logging-with-child-loggers",
     title: "Structured Logging with Child Loggers",
     summary: "Pino-based JSON logging with per-module child loggers, configurable levels, PID/env metadata, and AsyncLocalStorage correlation ID integration.",
+    status: "published",
+  },
+  {
+    slug: "llm-adapter-facade",
+    title: "LLM Adapter Facade",
+    summary: "Type normalization layer converting between Gemini and Claude message formats, enabling seamless model switching without changing the message processor.",
+    status: "published",
+  },
+  {
+    slug: "semantic-query-routing",
+    title: "Semantic Query Routing",
+    summary: "Three-tier confidence-based routing: reflexes (>0.90, auto-execute), skills (>0.85, pattern-matched), and novel composition (<0.85, LLM-generated).",
+    status: "published",
+  },
+  {
+    slug: "multi-dispatch-strategy",
+    title: "Multi-Dispatch Strategy",
+    summary: "Multiple dispatch runners (synchronous, runner-based, async) with work-source abstraction for supporting different execution modes from a single dispatcher.",
+    status: "published",
+  },
+  {
+    slug: "ops-metrics-and-health-monitoring",
+    title: "Ops Metrics and Health Monitoring",
+    summary: "Express middleware collecting event loop lag, p50/p95/p99 latency histograms, vector operation counters, and per-endpoint metrics with health check aggregation.",
     status: "published",
   },
 ];

@@ -1,294 +1,183 @@
 # Agent Recovery and Escalation
 
-> Strategy-based recovery from tool failures with clarification workflows, batch approval grouping, and action buffering.
+> Classify failures as retryable or non-retryable, apply exponential backoff for transient errors, and route permanent failures through an approval flow tied to the autonomy tier system.
 
 ## Problem
 
-Agents fail. Tools time out, APIs return errors, file systems run out of space, and permissions get revoked. A naive agent either crashes on the first failure or retries blindly until it hits a rate limit. Meanwhile, some failures aren't errors at all — they're ambiguity. The user said "deploy the app" but there are three apps and two environments. The agent needs to ask, but asking for every small clarification fragments the user's attention. And when multiple actions need approval, presenting them one at a time is exhausting. Without structured recovery, escalation, and batching, autonomous agents become either fragile or annoying.
+Agents fail. Tools time out, APIs return errors, permissions get revoked, and resources go missing. A naive agent either crashes on the first failure or retries blindly until it hits a rate limit. Permanent failures are a different problem entirely — the agent needs to surface them to the user without losing track of what it was doing. Without a clear split between "try again" and "ask a human," agents become either fragile or they silently swallow errors that needed attention.
 
 ## Context
 
 - An agent executing multi-step plans with heterogeneous tool calls
-- Failures that range from transient (network timeout) to permanent (missing permission)
-- Ambiguous instructions that require user clarification
-- Multiple pending actions that individually require approval
-- A user who is not always immediately available to respond
-- A need to continue useful work even when some operations are blocked
+- Failures that range from transient (network timeout, rate limit) to permanent (missing permission, resource not found)
+- A user who may not be immediately available, but who must be consulted for non-retryable failures
+- An autonomy tier system (AUTO / NOTIFY / ASK) that governs whether actions proceed silently, are reported, or require explicit approval
+- An approval flow module that handles the mechanics of presenting decisions to the user and recording responses
 
 ## Solution
 
 ### Failure Classification
 
-Every tool failure is classified to determine the appropriate recovery strategy:
+Every tool failure is classified into one of two categories, which determines the recovery path:
 
 ```javascript
-function classifyFailure(error, toolCall) {
-  if (error.code === 'ETIMEDOUT' || error.code === 'ECONNRESET') {
-    return { type: 'transient', strategy: 'retry', maxAttempts: 3, backoff: 'exponential' };
+// illustrative — actual classification lives in the tool execution wrapper
+function classifyFailure(error) {
+  // Retryable: transient infrastructure errors
+  if (
+    error.code === 'ETIMEDOUT' ||
+    error.code === 'ECONNRESET' ||
+    error.status === 429 ||
+    error.status === 503
+  ) {
+    return { retryable: true };
   }
 
+  // Non-retryable: permanent errors that require human input
   if (error.status === 401 || error.status === 403) {
-    return { type: 'permission', strategy: 'escalate', message: `Missing permission for ${toolCall.tool}` };
+    return { retryable: false, reason: 'permission', message: error.message };
   }
 
   if (error.status === 404) {
-    return { type: 'not_found', strategy: 'clarify', question: `Resource not found: ${toolCall.params.target}. Did you mean one of these?` };
+    return { retryable: false, reason: 'not_found', message: error.message };
   }
 
-  if (error.status === 429) {
-    const retryAfter = parseInt(error.headers?.['retry-after'] || '60', 10);
-    return { type: 'rate_limit', strategy: 'buffer', delayMs: retryAfter * 1000 };
-  }
-
-  if (error.message?.includes('ambiguous')) {
-    return { type: 'ambiguous', strategy: 'clarify' };
-  }
-
-  return { type: 'unknown', strategy: 'decompose', fallback: 'escalate' };
+  // Default: treat unknown errors as non-retryable to avoid blind looping
+  return { retryable: false, reason: 'unknown', message: error.message };
 }
 ```
 
-### Strategy Execution
+### Retryable Errors: Exponential Backoff
 
-Each strategy has a dedicated handler:
+Transient failures are retried with exponential backoff and a hard ceiling on attempts. If all retries are exhausted, the failure is re-classified as non-retryable and routed to the approval flow.
 
 ```javascript
-const recoveryStrategies = {
-  async retry(toolCall, classification) {
-    for (let attempt = 1; attempt <= classification.maxAttempts; attempt++) {
-      const delay = classification.backoff === 'exponential'
-        ? Math.min(1000 * Math.pow(2, attempt - 1), 30000)
-        : 1000;
+// illustrative — retry logic wraps individual tool calls
+async function retryWithBackoff(toolCall, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const delay = Math.min(1000 * Math.pow(2, attempt - 1), 30000);
+    await sleep(delay);
 
-      await sleep(delay);
+    try {
+      return await executeTool(toolCall.tool, toolCall.params);
+    } catch (error) {
+      const classification = classifyFailure(error);
 
-      try {
-        return await executeTool(toolCall.tool, toolCall.params);
-      } catch (error) {
-        if (attempt === classification.maxAttempts) {
-          return recoveryStrategies.escalate(toolCall, {
-            message: `Failed after ${attempt} retries: ${error.message}`
-          });
-        }
+      if (!classification.retryable || attempt === maxAttempts) {
+        // Escalate after exhausting retries
+        return escalateToApprovalFlow({
+          tool: toolCall.tool,
+          params: toolCall.params,
+          reason: classification.reason || 'retry_exhausted',
+          message: `Failed after ${attempt} attempt(s): ${error.message}`
+        });
       }
     }
-  },
-
-  async decompose(toolCall, classification) {
-    // Break the failing operation into smaller steps
-    const subtasks = await llm.complete({
-      system: `The tool call failed. Break this operation into smaller,
-        more specific steps that might succeed individually.`,
-      messages: [{
-        role: 'user',
-        content: JSON.stringify({ tool: toolCall.tool, params: toolCall.params, error: classification.type })
-      }],
-      response_format: { type: 'json_object' }
-    });
-
-    const results = [];
-    for (const subtask of subtasks.steps) {
-      try {
-        results.push(await executeTool(subtask.tool, subtask.params));
-      } catch (subError) {
-        results.push({ error: subError.message, step: subtask });
-      }
-    }
-    return results;
-  },
-
-  async escalate(toolCall, classification) {
-    return escalationQueue.add({
-      type: 'failure',
-      tool: toolCall.tool,
-      message: classification.message,
-      context: toolCall,
-      timestamp: Date.now()
-    });
   }
-};
+}
 ```
 
-### Clarification Workflows
+### Non-Retryable Errors: Approval Flow Escalation
 
-When the agent encounters ambiguity, it constructs a targeted clarification request with options derived from context:
+`approval-flow.js` handles the user-facing side of escalation. It receives a failure record, checks the current autonomy tier, and either notifies the user or blocks until they respond.
 
 ```javascript
-async function requestClarification(toolCall, ambiguity) {
-  // Gather candidate options from context
-  const candidates = await findCandidates(toolCall, ambiguity);
+// illustrative — approval-flow.js integration
+async function escalateToApprovalFlow({ tool, params, reason, message }) {
+  const tier = await getAutonomyTier();  // AUTO | NOTIFY | ASK
 
-  const clarification = {
+  const escalation = {
     id: crypto.randomUUID(),
-    question: ambiguity.question || `Which did you mean?`,
-    options: candidates.map((c, i) => ({
-      key: String(i + 1),
-      label: c.name,
-      description: c.summary,
-      value: c
-    })),
-    allowFreeform: true,
-    timeout: 5 * 60 * 1000,  // 5 minutes before auto-escalating
-    pendingAction: toolCall
+    tool,
+    params,
+    reason,
+    message,
+    timestamp: Date.now()
   };
 
-  clarificationStore.set(clarification.id, clarification);
+  if (tier === 'AUTO') {
+    // AUTO tier: log the failure and abort the action without user interruption
+    await logEscalation(escalation);
+    return { status: 'aborted', reason };
+  }
+
+  if (tier === 'NOTIFY') {
+    // NOTIFY tier: inform the user but do not block for a response
+    await notifyUser({ type: 'failure', ...escalation });
+    return { status: 'aborted', reason };
+  }
+
+  // ASK tier: block until the user responds
+  await notifyUser({ type: 'approval_required', ...escalation });
+  const response = await waitForApproval(escalation.id);
+
+  return response.approved
+    ? await executeTool(tool, { ...params, ...response.overrides })
+    : { status: 'rejected', reason };
+}
+```
+
+### Clarification Requests
+
+When the agent encounters ambiguity rather than an error — for example, an instruction that references a resource that could match multiple things — it asks the user a direct question through the same approval flow channel. There is no candidate-selection UI; the question is freeform and the user responds in plain text.
+
+```javascript
+// illustrative — clarification goes through the same approval flow channel
+async function requestClarification({ question, context }) {
+  const id = crypto.randomUUID();
 
   await notifyUser({
     type: 'clarification_needed',
-    id: clarification.id,
-    question: clarification.question,
-    options: clarification.options
+    id,
+    question,
+    context
   });
 
-  return { status: 'awaiting_clarification', clarificationId: clarification.id };
-}
-
-async function handleClarificationResponse(clarificationId, response) {
-  const clarification = clarificationStore.get(clarificationId);
-  if (!clarification) throw new Error('Clarification expired');
-
-  const selected = clarification.options.find(o => o.key === response.selection);
-  const resolvedParams = {
-    ...clarification.pendingAction.params,
-    target: selected?.value || response.freeformInput
-  };
-
-  clarificationStore.delete(clarificationId);
-  return await executeTool(clarification.pendingAction.tool, resolvedParams);
+  const response = await waitForApproval(id);
+  return response.answer;  // plain text from user
 }
 ```
 
-### Batch Approval Grouping
+### Autonomy Tier Integration
 
-Instead of interrupting the user for each approval, the system groups pending approvals and presents them together:
+The approval flow checks the current tier at escalation time rather than at planning time, so a tier change mid-run takes effect immediately. The tier governs three behaviors:
 
-```javascript
-class ApprovalBatcher {
-  constructor({ flushInterval = 30000, maxBatchSize = 10 }) {
-    this.pending = [];
-    this.flushInterval = flushInterval;
-    this.maxBatchSize = maxBatchSize;
-    this.timer = null;
-  }
+| Tier | Retryable failure | Non-retryable failure | Clarification request |
+|------|-------------------|-----------------------|-----------------------|
+| AUTO | Retry, then abort silently | Abort and log | Ask (unavoidable) |
+| NOTIFY | Retry, then abort with notification | Abort with notification | Ask |
+| ASK | Retry, then escalate for approval | Escalate for approval | Ask |
 
-  add(action) {
-    this.pending.push({
-      id: crypto.randomUUID(),
-      action,
-      addedAt: Date.now()
-    });
-
-    if (this.pending.length >= this.maxBatchSize) {
-      return this.flush();
-    }
-
-    if (!this.timer) {
-      this.timer = setTimeout(() => this.flush(), this.flushInterval);
-    }
-
-    return { status: 'queued', position: this.pending.length };
-  }
-
-  async flush() {
-    clearTimeout(this.timer);
-    this.timer = null;
-
-    if (this.pending.length === 0) return;
-
-    const batch = this.pending.splice(0);
-    const summary = batch.map(item => ({
-      id: item.id,
-      tool: item.action.tool,
-      description: item.action.description,
-      impact: item.action.impact
-    }));
-
-    const response = await notifyUser({
-      type: 'batch_approval',
-      actions: summary,
-      message: `${batch.length} actions pending approval`
-    });
-
-    for (const item of batch) {
-      const approved = response.approved?.includes(item.id);
-      if (approved) {
-        await executeTool(item.action.tool, item.action.params);
-      }
-    }
-  }
-}
-```
-
-### Action Buffer
-
-Non-urgent actions are buffered and executed in scheduled windows to reduce noise and group related operations:
-
-```javascript
-class ActionBuffer {
-  constructor() {
-    this.buffers = new Map();  // category -> action[]
-  }
-
-  add(action, category = 'default') {
-    if (!this.buffers.has(category)) {
-      this.buffers.set(category, []);
-    }
-    this.buffers.get(category).push({
-      action,
-      bufferedAt: Date.now()
-    });
-  }
-
-  async flushCategory(category) {
-    const items = this.buffers.get(category) || [];
-    this.buffers.set(category, []);
-
-    // Deduplicate and merge where possible
-    const merged = mergeActions(items.map(i => i.action));
-
-    const results = [];
-    for (const action of merged) {
-      try {
-        results.push(await executeTool(action.tool, action.params));
-      } catch (error) {
-        const classification = classifyFailure(error, action);
-        results.push(await recoveryStrategies[classification.strategy](action, classification));
-      }
-    }
-
-    return results;
-  }
-}
-```
+Approvals are handled individually as they arise. There is no batching or queuing — each escalation produces one notification and waits for one response.
 
 ## Implications
 
-- Retry strategies must have hard ceilings — unbounded retries can amplify cascading failures
-- Decomposition via LLM is non-deterministic; the subtasks may not actually solve the original problem
-- Clarification timeouts mean the agent must have a fallback when the user doesn't respond
-- Batch approval reduces interruptions but adds latency — urgent actions should bypass the batcher
-- Action buffering risks stale data; a buffered write based on a stale read may corrupt state
-- The classification function is a critical single point of failure — misclassification leads to wrong recovery
+- Retry ceilings must be hard — unbounded retries amplify cascading failures and can exhaust downstream rate limits
+- Defaulting unknown errors to non-retryable is conservative but correct; retrying an unknown error risks repeating a destructive operation
+- The AUTO tier suppresses escalation noise at the cost of visibility; operators should review escalation logs regularly
+- Clarification responses are unstructured text, so the agent must be able to interpret partial or ambiguous answers gracefully
+- The approval flow is a synchronous blocker in ASK mode; long user response times stall the agent's task queue
 
 ## Code Example
 
 ```javascript
-// Integration: wrap every tool call with recovery
+// illustrative — safe tool execution with recovery
 async function safeExecute(toolCall) {
   try {
     return await executeTool(toolCall.tool, toolCall.params);
   } catch (error) {
-    const classification = classifyFailure(error, toolCall);
-    const strategy = recoveryStrategies[classification.strategy];
+    const classification = classifyFailure(error);
 
-    if (!strategy) {
-      return recoveryStrategies.escalate(toolCall, {
-        message: `No recovery strategy for failure type: ${classification.type}`
-      });
+    if (classification.retryable) {
+      return await retryWithBackoff(toolCall);
     }
 
-    return await strategy(toolCall, classification);
+    return await escalateToApprovalFlow({
+      tool: toolCall.tool,
+      params: toolCall.params,
+      reason: classification.reason,
+      message: classification.message
+    });
   }
 }
 ```

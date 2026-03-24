@@ -190,7 +190,7 @@
         .replace(/\*([^*]+)\*/g, "<em>$1</em>")
         // links — rewrite .md hrefs to pattern.html?p=slug
         .replace(/\[([^\]]+)\]\(\.\/([^)]+)\.md\)/g, (_, label, file) => {
-          return `<a href="pattern.html?p=${encodeURI(file)}">${label}</a>`;
+          return `<a href="pattern.html?p=${encodeURIComponent(file)}">${label}</a>`;
         })
         // external links (only allow http/https)
         .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" rel="noopener noreferrer" target="_blank">$1</a>');

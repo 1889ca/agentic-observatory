@@ -1,105 +1,150 @@
 # Model Selection and LLM Fallback
 
-> Primary/fallback LLM provider chain with lazy initialization, concurrent init prevention, and timeout protection.
+> Route requests to the best-fit model based on task requirements, with provider-level fallback when a provider is unavailable.
 
 ## Problem
 
-Relying on a single LLM provider means any outage, rate limit, or timeout takes the entire agent offline. Eagerly initializing all providers wastes resources and slows startup for providers that may never be needed. And when multiple requests arrive during initialization, concurrent init attempts can create duplicate clients, race conditions, or wasted API calls.
+Relying on a single LLM model for all tasks is wasteful and brittle. Simple tasks don't need the most capable (and expensive) model; complex tasks may produce poor results on a cheaper one. Selecting models by rote — always primary, then fallback — ignores the actual requirements of each request. And eagerly initializing all provider clients wastes resources for providers that may never be called.
 
 ## Context
 
-- Multiple LLM providers available (OpenAI, Anthropic, Google, local models)
-- Primary provider handles most traffic; fallback activates only on failure
-- Provider initialization is expensive (API key validation, model listing, connection setup)
-- High-concurrency environments where multiple requests may trigger init simultaneously
-- Model calls need timeout protection to prevent hanging requests
+- Multiple LLM providers and models available (Anthropic, OpenAI, etc.)
+- Tasks vary widely in complexity, latency requirements, and cost sensitivity
+- Provider initialization is expensive and should be deferred to first use
+- Fallback is needed at the provider level (if Anthropic is unreachable, try OpenAI), not the model level
+- A central config defines what models exist; a router decides which one to use
 
 ## Solution
 
-A model manager maintains a provider chain with lazy initialization. Each provider is initialized on first use, not at startup. A mutex flag prevents concurrent initialization — if init is already in progress, subsequent callers wait for the same Promise rather than starting a second init. Model calls are wrapped in timeout protection to prevent indefinite hangs.
+Split model management into two layers. A config module declares the catalog of available models — each entry specifies provider, capability tier, cost tier, context window, and any other properties the router needs to reason about. A router module accepts a task descriptor and selects the best model from the catalog based on those requirements. Provider clients are initialized lazily on first use with a simple flag-based guard to avoid duplicate initialization — no mutex-promise chain needed.
 
 ```javascript
-// model-manager.js
-class ModelManager {
-  constructor(providerConfigs) {
-    this.providers = providerConfigs.map(cfg => ({
-      name: cfg.name,
-      factory: cfg.factory,
-      timeout: cfg.timeout || 30_000,
-      client: null,
-      initializing: null, // Mutex: Promise while init in progress
-    }));
-  }
+// config/models.js — illustrative
+// Defines the catalog; does not initialize any clients
+const MODELS = [
+  {
+    id: 'claude-opus',
+    provider: 'anthropic',
+    capabilities: ['reasoning', 'long-context', 'code'],
+    costTier: 'high',
+    contextWindow: 200_000,
+  },
+  {
+    id: 'claude-haiku',
+    provider: 'anthropic',
+    capabilities: ['summarization', 'classification', 'fast'],
+    costTier: 'low',
+    contextWindow: 48_000,
+  },
+  {
+    id: 'gpt-4o',
+    provider: 'openai',
+    capabilities: ['reasoning', 'code', 'vision'],
+    costTier: 'high',
+    contextWindow: 128_000,
+  },
+  {
+    id: 'gpt-4o-mini',
+    provider: 'openai',
+    capabilities: ['summarization', 'classification', 'fast'],
+    costTier: 'low',
+    contextWindow: 128_000,
+  },
+];
 
-  async getProvider(name) {
-    const provider = this.providers.find(p => p.name === name);
-    if (!provider) throw new Error(`Unknown provider: ${name}`);
+module.exports = { MODELS };
+```
 
-    if (provider.client) return provider.client;
+```javascript
+// lib/llm/router.js — illustrative
+const { MODELS } = require('../../config/models');
 
-    // Concurrent init prevention — reuse in-flight init Promise
-    if (provider.initializing) return provider.initializing;
+// Lazy-initialized provider clients — keyed by provider name
+const clients = {};
+const initializing = {};
 
-    provider.initializing = provider.factory()
-      .then(client => { provider.client = client; return client; })
-      .finally(() => { provider.initializing = null; });
+async function getClient(provider) {
+  if (clients[provider]) return clients[provider];
 
-    return provider.initializing;
-  }
+  // Flag-based guard: if init is already in progress, wait for it
+  if (initializing[provider]) return initializing[provider];
 
-  async complete(prompt, options = {}) {
-    for (const provider of this.providers) {
-      try {
-        const client = await this.getProvider(provider.name);
-        return await withTimeout(
-          client.complete(prompt, options),
-          provider.timeout
-        );
-      } catch (err) {
-        logger.warn(`Provider ${provider.name} failed, trying next`, { error: err.message });
-        provider.client = null; // Reset for re-init on next attempt
-        continue;
-      }
-    }
-    throw new Error('All LLM providers exhausted');
-  }
-}
-
-async function withTimeout(promise, ms) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`LLM call timed out after ${ms}ms`)), ms);
+  initializing[provider] = initProvider(provider).then(client => {
+    clients[provider] = client;
+    delete initializing[provider];
+    return client;
   });
+
+  return initializing[provider];
+}
+
+function selectModel(task) {
+  // task: { complexity, costSensitive, speedRequired, contextLength }
+  const candidates = MODELS.filter(m => {
+    if (task.contextLength && m.contextWindow < task.contextLength) return false;
+    if (task.speedRequired && !m.capabilities.includes('fast')) return false;
+    return true;
+  });
+
+  if (task.costSensitive) {
+    // Prefer low-cost models that meet requirements
+    const cheap = candidates.filter(m => m.costTier === 'low');
+    if (cheap.length) return cheap[0];
+  }
+
+  if (task.complexity === 'high') {
+    return candidates.find(m => m.capabilities.includes('reasoning')) ?? candidates[0];
+  }
+
+  return candidates[0];
+}
+
+async function complete(task, prompt, options = {}) {
+  const model = selectModel(task);
+
   try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(timer);
+    const client = await getClient(model.provider);
+    return await client.complete(model.id, prompt, options);
+  } catch (err) {
+    // Provider-level fallback: try the same task requirements on a different provider
+    const fallbackModel = MODELS.find(
+      m => m.provider !== model.provider && m.capabilities.includes('reasoning')
+    );
+    if (!fallbackModel) throw err;
+
+    logger.warn(`Provider ${model.provider} failed, falling back to ${fallbackModel.provider}`);
+    const fallbackClient = await getClient(fallbackModel.provider);
+    return fallbackClient.complete(fallbackModel.id, prompt, options);
   }
 }
+
+module.exports = { complete, selectModel };
 ```
 
 ## Implications
 
-- Lazy init means the first request to a provider pays the init cost — cold start latency is shifted from startup to first use
-- The mutex flag prevents duplicate clients but means concurrent callers share the same init failure if it occurs
-- Resetting `client` to null on failure forces re-initialization on the next attempt, which handles transient init failures but adds latency
-- Timeout values need tuning per provider — local models respond faster than remote APIs, streaming responses need longer timeouts than single completions
-- The fallback chain is ordered by preference, not by latency — a slow primary will be tried (and timed out) before a fast fallback
+- The config/router split means adding a new model requires only a catalog entry — routing logic does not change
+- Task-based selection means callers must describe what they need (complexity, cost, speed), not which model to use — this is intentional and forces callers to stay decoupled from model identities
+- Provider-level fallback is coarser than model-level fallback: the entire provider must fail before the fallback activates, which is appropriate for infrastructure-level outages but won't help if a specific model is rate-limited
+- Lazy init shifts cold-start cost to first use; the flag-based guard prevents duplicate inits without the complexity of a mutex-promise chain
+- Model capability declarations in config must be kept accurate — stale entries will cause the router to make poor selections silently
 
 ## Code Example
 
 ```javascript
-// Setup with primary and fallback providers
-const models = new ModelManager([
-  { name: 'anthropic', factory: () => initAnthropic(process.env.ANTHROPIC_KEY), timeout: 30_000 },
-  { name: 'openai', factory: () => initOpenAI(process.env.OPENAI_KEY), timeout: 25_000 },
-]);
+// Caller describes the task, not the model — illustrative
+const result = await router.complete(
+  { complexity: 'high', costSensitive: false, contextLength: 50_000 },
+  'Analyze this codebase and identify architectural risks',
+  { maxTokens: 2048 }
+);
 
-// Usage — automatically falls back on failure
-const response = await models.complete('Summarize this document', {
-  maxTokens: 1024,
-  temperature: 0.3,
-});
+// Low-stakes task — router picks a fast, cheap model
+const summary = await router.complete(
+  { complexity: 'low', costSensitive: true, speedRequired: true },
+  'Summarize this support ticket in one sentence',
+  { maxTokens: 128 }
+);
 ```
 
 ## Related Patterns
