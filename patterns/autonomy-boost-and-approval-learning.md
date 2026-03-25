@@ -1,6 +1,6 @@
 # Autonomy Boost and Approval Learning
 
-> Time-boxed autonomy boost presets that grant temporary elevated permissions for a specified duration, replacing approval-pattern learning with explicit user-controlled trust windows.
+> Named autonomy boost presets (quick/focus/meeting/commute/deep_work/away) granting temporary elevated permissions for 30 minutes to 8 hours, replacing approval-pattern learning with explicit user-controlled trust windows.
 
 ## Problem
 
@@ -16,9 +16,9 @@ Agent systems that require approval for every action create friction that defeat
 
 ## Solution
 
-### Time-Boxed Boost Presets
+### Named Boost Presets
 
-Instead of learning from approval patterns, the system offers explicit boost presets. The user grants a temporary autonomy boost for a specific duration — the system operates with elevated permissions until the timer expires:
+Instead of learning from approval patterns, the system offers named boost presets mapped to situational durations. The user grants a temporary autonomy boost matching their current activity — the system operates with elevated permissions until the timer expires:
 
 ```javascript
 // autonomy/boost.js
@@ -26,11 +26,15 @@ const activeBoosts = new Map();
 
 function grantBoost(tenantId, preset) {
   const durations = {
-    short: 2 * 60 * 60 * 1000,   // 2 hours
-    long: 4 * 60 * 60 * 1000,    // 4 hours
+    quick:     30 * 60 * 1000,        // 30 minutes
+    focus:     1 * 60 * 60 * 1000,    // 1 hour
+    commute:   1 * 60 * 60 * 1000,    // 1 hour
+    meeting:   2 * 60 * 60 * 1000,    // 2 hours
+    deep_work: 4 * 60 * 60 * 1000,    // 4 hours
+    away:      8 * 60 * 60 * 1000,    // 8 hours
   };
 
-  const duration = durations[preset] || durations.short;
+  const duration = durations[preset] || durations.focus;
   const boost = {
     tenantId,
     preset,
@@ -104,7 +108,7 @@ function getBoostStatus(tenantId) {
 - Time-boxed boosts are explicit and predictable — users know exactly when elevated autonomy expires
 - No learning complexity — the system doesn't need to track approval history, fingerprint actions, or maintain consecutive counters
 - Boost expiry is automatic, eliminating the risk of permanently elevated permissions from forgotten settings
-- The preset model (2h/4h) is simple but inflexible — users can't specify arbitrary durations without extending the presets
+- The preset model (six named presets from 30min to 8h) covers common scenarios but users can't specify arbitrary durations without extending the presets
 - Boosts apply to all actions equally during the window — there's no per-action granularity during a boost
 - Boost state is in-memory, so process restarts clear active boosts (fail-safe: permissions drop to default)
 - This pattern is complementary to domain confidence — confidence provides long-term earned trust, boosts provide short-term explicit trust
@@ -112,10 +116,10 @@ function getBoostStatus(tenantId) {
 ## Code Example
 
 ```javascript
-// User grants a 2-hour boost via chat
-// "Give yourself a boost for a couple hours"
-const boost = grantBoost(tenantId, 'short');
-// → { preset: 'short', expiresAt: <now + 2h> }
+// User grants a boost for a meeting
+// "I'm in a meeting for the next couple hours"
+const boost = grantBoost(tenantId, 'meeting');
+// → { preset: 'meeting', expiresAt: <now + 2h> }
 
 // During the boost window, actions auto-execute
 // User: "run the tests and deploy if they pass"
@@ -123,7 +127,11 @@ const boost = grantBoost(tenantId, 'short');
 // Agent: Boost active: auto-executing deploy
 // (no approval prompts)
 
-// After 2 hours, boost expires automatically
+// User going away for a long period
+const longBoost = grantBoost(tenantId, 'away');
+// → { preset: 'away', expiresAt: <now + 8h> }
+
+// After expiry, boost clears automatically
 // User: "deploy to staging"
 // Agent: [Requesting approval] Deploy to staging?
 ```

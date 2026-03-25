@@ -1,15 +1,17 @@
 # Dynamic System Prompt Composition
 
-> System prompt assembled from hardcoded persona and behaviors, with capability manifest and anti-patterns appended at dispatch time.
+> Multi-layer system prompt assembled from hardcoded persona, dynamic vibe context with preference synthesis, skill injection based on message content, capability manifest, and anti-patterns — all composed at dispatch time.
 
 ## Problem
 
-A static system prompt becomes stale as the orchestrator evolves. New capabilities and learned anti-patterns need to influence how the LLM behaves — but a monolithic prompt file can't adapt at runtime. Manually updating it for every new tool or behavioral correction doesn't scale and introduces drift between what the prompt says and what the system actually does.
+A static system prompt becomes stale as the orchestrator evolves. New capabilities and learned anti-patterns need to influence how the LLM behaves — but a monolithic prompt file can't adapt at runtime. Beyond tools, the agent's conversational style should adapt to the user's preferences and communication patterns, and relevant skills should be surfaced based on what the user is asking about.
 
 ## Context
 
 - An orchestrator with a growing set of capabilities and integrations
-- Persona and behavioral guidelines that are stable and hardcoded
+- Persona and behavioral guidelines that form a stable base
+- A vibe detection layer that synthesizes user preferences, domain confidence levels, and knowledge gaps
+- Dynamic skill injection that surfaces relevant skills based on message content
 - Anti-patterns learned from operational mistakes that should prevent recurrence
 - A capability manifest that grows as tools are added
 
@@ -17,15 +19,15 @@ A static system prompt becomes stale as the orchestrator evolves. New capabiliti
 
 ### Prompt Structure
 
-The system prompt is assembled from a small number of fixed sections, not a dynamic multi-layer pipeline:
+The system prompt is assembled from multiple layers, some static and some dynamically composed per-message:
 
 ```
-Hardcoded Persona + Behaviors → Capability Manifest → Anti-Patterns → Final Prompt
+Hardcoded Persona → Vibe Context (dynamic) → Skill Injection (dynamic) → Capability Manifest → Anti-Patterns → Final Prompt
 ```
 
-### Persona and Behavioral Rules (Hardcoded)
+### Persona and Behavioral Rules (Base Layer)
 
-The base personality, role definition, and behavioral rules are hardcoded strings — not fetched from a database or dynamically composed:
+The base personality and role definition are hardcoded strings that form the stable foundation:
 
 ```javascript
 const PERSONA = `# Identity
@@ -38,28 +40,50 @@ Riley — orchestrator and project manager
 - When unsure, ask rather than guess`;
 ```
 
-These change only when the code changes. There is no dynamic skill injection or vibe detection layer — the persona is stable.
+### Vibe Context (Dynamic Layer)
 
-### Capability Manifest (Appended)
-
-A summary of available capability categories is appended so the LLM knows what tools exist:
+`getVibeContext()` synthesizes a preference profile from the user's communication patterns, builds domain confidence levels from operational history, and generates knowledge gap questions for areas where confidence is low:
 
 ```javascript
-function buildCapabilitySummary() {
-  const categories = toolRegistry.getCategories();
+function getVibeContext(conversation) {
+  const preferenceProfile = synthesizePreferences(conversation);
+  const domainConfidence = getDomainConfidenceLevels();
+  const knowledgeGaps = identifyKnowledgeGaps(domainConfidence);
 
-  return `# Available Capabilities
-${categories.map(c =>
-  `## ${c.name} (${c.tools.length} tools)\n${c.description}`
-).join('\n\n')}
+  return `# Communication Style
+${preferenceProfile.summary}
 
-Individual tool schemas are provided separately via function declarations.`;
+# Domain Confidence
+${Object.entries(domainConfidence)
+  .map(([domain, level]) => `- ${domain}: ${level.toFixed(2)}`)
+  .join('\n')}
+
+# Knowledge Gaps — Ask About
+${knowledgeGaps.map(g => `- ${g.question} (domain: ${g.domain})`).join('\n')}`;
 }
 ```
 
-### Anti-Patterns (Appended)
+This layer adapts the agent's tone, detail level, and proactive behavior based on who it's talking to and what it knows well.
 
-Learned mistakes are appended to prevent recurrence:
+### Skill Injection (Dynamic Layer)
+
+Before composing the final prompt, the system searches for skills relevant to the current user message and injects their descriptions so the LLM knows they're available:
+
+```javascript
+async function getSkillContext(userMessage) {
+  const relevant = await skills.findRelevantSkills(userMessage);
+  if (relevant.length === 0) return '';
+
+  return `# Relevant Skills
+${relevant.map(s => `## ${s.name}\n${s.description}\nTrigger: ${s.trigger}`).join('\n\n')}`;
+}
+```
+
+This means the prompt is not the same for every message — different user queries surface different skill sets.
+
+### Capability Manifest and Anti-Patterns (Appended)
+
+These work the same as the base layers — capability categories summarize available tools, and learned anti-patterns are appended to prevent recurrence:
 
 ```javascript
 async function buildAntiPatterns() {
@@ -74,11 +98,13 @@ ${patterns.map(p => `- ${p.description} → Instead: ${p.correction}`).join('\n'
 ### Final Assembly
 
 ```javascript
-async function composeSystemPrompt() {
+async function composeSystemPrompt(userMessage, conversation) {
+  const vibeContext = getVibeContext(conversation);
+  const skillContext = await getSkillContext(userMessage);
   const capabilities = buildCapabilitySummary();
   const antiPatternSection = await buildAntiPatterns();
 
-  const sections = [PERSONA, capabilities, antiPatternSection];
+  const sections = [PERSONA, vibeContext, skillContext, capabilities, antiPatternSection];
 
   return sections.filter(Boolean).join('\n\n---\n\n');
 }
@@ -86,19 +112,20 @@ async function composeSystemPrompt() {
 
 ## Implications
 
-- The prompt is simpler and more predictable than a multi-layer dynamic composition — fewer moving parts means fewer surprises
+- The prompt varies per message — vibe context adapts to conversation history, skill injection adapts to message content
+- Preference synthesis means the agent's communication style drifts over time as it observes user patterns
+- Domain confidence levels create a feedback loop: the agent is more autonomous in high-confidence areas and more cautious (asking questions) in low-confidence ones
+- Skill injection adds relevant context but increases token usage — the skill search must be fast and selective
 - Anti-patterns still grow over time and need periodic pruning to stay within token budgets
-- No per-user customization or vibe detection — the same prompt serves all contexts
-- Capability manifest is the only truly dynamic section; persona and behaviors are stable
-- Changes to persona or behavioral rules require a code change, not a database update
-- The prompt is rebuilt on every dispatch — but only the anti-patterns section requires an async fetch
+- The prompt is rebuilt on every dispatch with multiple async fetches (skills, anti-patterns)
+- More dynamic layers means more potential for unexpected interactions between sections
 
 ## Code Example
 
 ```javascript
-// Dispatch with prompt composition
+// Dispatch with full dynamic composition
 async function dispatch(message, conversation) {
-  const systemPrompt = await composeSystemPrompt();
+  const systemPrompt = await composeSystemPrompt(message, conversation);
 
   const response = await model.generate({
     systemInstruction: systemPrompt,
@@ -116,3 +143,4 @@ async function dispatch(message, conversation) {
 - [Declarative Capability System](./declarative-capability-system.md)
 - [Anti-Pattern Learning Loop](./anti-pattern-learning-loop.md)
 - [Message Processing Pipeline](./message-processing-pipeline.md)
+- [Skill Extraction and Fast-Path Routing](./skill-extraction-and-fast-path-routing.md)

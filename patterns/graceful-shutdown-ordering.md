@@ -1,6 +1,6 @@
 # Graceful Shutdown Ordering
 
-> Ordered teardown sequence on SIGINT/SIGTERM ensuring data integrity, with per-phase timeouts and double-signal force exit.
+> Ordered teardown sequence on SIGINT/SIGTERM ensuring data integrity, with sequential phase execution and per-phase error isolation.
 
 ## Problem
 
@@ -16,53 +16,34 @@ A process that handles background jobs, plugin lifecycle, web connections, and c
 
 ## Solution
 
-SIGINT and SIGTERM handlers trigger the same ordered teardown sequence. Each phase runs in order with its own timeout — if a phase hangs, the next phase proceeds after the timeout expires. A second signal during shutdown forces immediate exit.
+SIGINT and SIGTERM handlers trigger the same ordered teardown sequence. Each phase runs sequentially using `await` with a `.catch()` handler — if a phase throws, the error is logged and the next phase proceeds. There are no explicit per-phase timeout wrappers; phases are expected to complete or fail on their own. The signal handler is registered with `process.once()`, meaning a second signal uses the default OS behavior rather than a custom force-exit handler.
 
 ```javascript
 // shutdown.js
 const PHASES = [
-  { name: 'flush-evolution', fn: () => evolutionStore.flush(), timeout: 5_000 },
-  { name: 'stop-plugins',    fn: () => pluginManager.stopAll(), timeout: 10_000 },
-  { name: 'stop-jobs',       fn: () => jobRunner.drain(),       timeout: 15_000 },
-  { name: 'stop-server',     fn: () => httpServer.close(),      timeout: 5_000 },
-  { name: 'stop-cognitive',  fn: () => cognitiveLoop.stop(),    timeout: 5_000 },
+  { name: 'flush-evolution', fn: () => evolutionStore.flush() },
+  { name: 'stop-plugins',    fn: () => pluginManager.stopAll() },
+  { name: 'stop-jobs',       fn: () => jobRunner.drain() },
+  { name: 'stop-server',     fn: () => httpServer.close() },
+  { name: 'stop-cognitive',  fn: () => cognitiveLoop.stop() },
 ];
 
-let shuttingDown = false;
-
 async function gracefulShutdown(signal) {
-  if (shuttingDown) {
-    logger.warn('Double signal received, forcing exit');
-    process.exit(1);
-  }
-
-  shuttingDown = true;
   logger.info(`${signal} received, starting graceful shutdown`);
 
   for (const phase of PHASES) {
-    try {
-      await withTimeout(phase.fn(), phase.timeout);
-      logger.info(`Phase ${phase.name} complete`);
-    } catch (err) {
-      logger.error(`Phase ${phase.name} failed or timed out`, { error: err.message });
-    }
+    await phase.fn().catch(err => {
+      logger.error(`Phase ${phase.name} failed`, { error: err.message });
+    });
+    logger.info(`Phase ${phase.name} complete`);
   }
 
   logger.info('Shutdown complete');
   process.exit(0);
 }
 
-function withTimeout(promise, ms) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms)
-    ),
-  ]);
-}
-
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
 ```
 
 The phase order matters: evolution data is flushed first (highest data-loss risk), plugins stop before jobs (plugins may depend on job infrastructure), the web server stops before the cognitive processor (no new requests should arrive during final processing).
@@ -70,10 +51,11 @@ The phase order matters: evolution data is flushed first (highest data-loss risk
 ## Implications
 
 - Phase ordering must reflect dependency relationships — stopping the web server before flushing data would lose in-flight request metrics
-- Per-phase timeouts prevent a single hung subsystem from blocking the entire shutdown; but skipping a phase means that subsystem's cleanup is incomplete
-- Double-signal force exit is a safety valve for operators, but it skips all remaining phases — use only when graceful shutdown is truly stuck
-- The `shuttingDown` flag must be checked by subsystems that create new work (job dispatchers, queue consumers) to stop accepting work during teardown
-- Container orchestrators (Docker, k8s) send SIGTERM then force-kill after a grace period — total phase timeouts should fit within that window
+- No per-phase timeouts means a hung subsystem blocks all subsequent phases — the container orchestrator's kill timeout is the only backstop
+- `process.once()` means a second signal falls through to the OS default (typically immediate termination) rather than a custom force-exit handler
+- The sequential `.catch()` pattern means phase failures are isolated but not timed — a phase that hangs indefinitely will block shutdown
+- The `shuttingDown` flag is not used; subsystems that create new work should check their own state or rely on the sequential teardown to prevent new work during shutdown
+- Container orchestrators (Docker, k8s) send SIGTERM then force-kill after a grace period — if any phase hangs, the force-kill is the only escape
 
 ## Code Example
 

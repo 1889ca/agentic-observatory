@@ -66,7 +66,7 @@ const PATTERNS = [
   {
     slug: "unified-event-system",
     title: "Unified Event System",
-    summary: "TypeScript event bus with namespaced emit/on pub/sub, wildcard subscriptions, and immediate delivery for both entity and system events.",
+    summary: "TypeScript event bus with namespaced emit/on pub/sub, wildcard subscriptions, 50ms debounced entity batching with key-based deduplication, and immediate system event delivery.",
     status: "published",
   },
   {
@@ -120,7 +120,7 @@ const PATTERNS = [
   {
     slug: "dynamic-system-prompt-composition",
     title: "Dynamic System Prompt Composition",
-    summary: "Hardcoded persona and behaviors with capability manifest and anti-patterns appended at dispatch time.",
+    summary: "Multi-layer prompt with hardcoded persona, dynamic vibe context and preference synthesis, per-message skill injection, capability manifest, and anti-patterns composed at dispatch time.",
     status: "published",
   },
   {
@@ -258,7 +258,7 @@ const PATTERNS = [
   {
     slug: "autonomy-boost-and-approval-learning",
     title: "Autonomy Boost and Approval Learning",
-    summary: "Time-boxed autonomy boost presets (2h/4h) granting temporary elevated permissions that auto-expire, replacing approval-pattern learning.",
+    summary: "Named autonomy boost presets (quick/focus/meeting/commute/deep_work/away, 30min–8h) granting temporary elevated permissions that auto-expire.",
     status: "published",
   },
   {
@@ -330,13 +330,13 @@ const PATTERNS = [
   {
     slug: "model-selection-and-llm-fallback",
     title: "Model Selection and LLM Fallback",
-    summary: "Task-aware model routing via config/models.js definitions and lib/llm/router.js selection with provider-level fallback and lazy client initialization.",
+    summary: "Task-aware model routing across Claude + Gemini stack with Gemini Flash-lite as cost fallback, OpenAI disabled by default, and lazy singleton initialization with 30s timeout.",
     status: "published",
   },
   {
     slug: "graceful-shutdown-ordering",
     title: "Graceful Shutdown Ordering",
-    summary: "Ordered SIGINT/SIGTERM teardown sequence with per-phase timeouts and double-signal force exit for safe process termination.",
+    summary: "Ordered SIGINT/SIGTERM teardown sequence with sequential await and per-phase .catch() error isolation for safe process termination.",
     status: "published",
   },
   {
@@ -391,6 +391,30 @@ const PATTERNS = [
     slug: "ops-metrics-and-health-monitoring",
     title: "Ops Metrics and Health Monitoring",
     summary: "Express middleware collecting event loop lag, p50/p95/p99 latency histograms, vector operation counters, and per-endpoint metrics with health check aggregation.",
+    status: "published",
+  },
+  {
+    slug: "debounced-entity-event-batching",
+    title: "Debounced Entity Event Batching",
+    summary: "50ms accumulation window for entity mutation events with tenant-scoped key-based deduplication and batch flush to subscribers.",
+    status: "published",
+  },
+  {
+    slug: "role-based-process-deployment",
+    title: "Role-Based Process Deployment",
+    summary: "ROLE=web|jobs|all environment variable splitting for horizontal scaling with conditional subsystem startup per role.",
+    status: "published",
+  },
+  {
+    slug: "tunable-runtime-configuration",
+    title: "Tunable Runtime Configuration",
+    summary: "DB-backed runtime-adjustable parameters with startup warm-up, in-memory caching, and hot updates without process restart.",
+    status: "published",
+  },
+  {
+    slug: "stale-state-recovery-on-startup",
+    title: "Stale State Recovery on Startup",
+    summary: "Startup-time cleanup of stale improvements, orphaned locks, failed workflows, and learned helplessness patterns from ungraceful shutdowns.",
     status: "published",
   },
 ];
