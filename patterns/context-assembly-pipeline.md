@@ -1,90 +1,94 @@
 # Context Assembly Pipeline
 
-> Single-pass parallel context assembly with token budgeting across multiple sources, optimized for latency through concurrent fetching.
+> Modular context gathering where independent context-gatherer modules each assemble their own context slice, combined at dispatch time for the final prompt.
 
 ## Problem
 
-An orchestrator receives messages from many sources — users, scheduled tasks, internal reflections, webhook events. Each needs relevant context, but the amount and type of context differs radically. A user question needs focused search results; a periodic reflection needs broad memory access; a quick triage needs minimal context. Cramming maximum context into every dispatch wastes tokens, slows responses, and drowns signal in noise.
+An orchestrator receives messages from many sources — users, scheduled tasks, internal reflections, webhook events. Each needs relevant context, but the amount and type of context differs radically. A user question needs focused search results; a periodic reflection needs broad memory access; a quick triage needs minimal context. A single monolithic pipeline with hardcoded budget allocation is rigid and hard to extend.
 
 ## Context
 
 - An orchestrator dispatching to multiple AI models
-- Multiple context sources: semantic memory, conversation history, project KBs, pinned items
-- Token budgets that vary by model and task type
-- Need for speed — context assembly is the primary latency contributor
+- Multiple context sources: semantic memory, conversation history, project KBs, pinned items, vibe insights
+- Each context source has its own retrieval logic, formatting, and relevance criteria
 - Projects registering their own searchable knowledge bases
+- Need for speed — context assembly is the primary latency contributor
 
 ## Solution
 
-### Dispatch-Type Budgets
+### Context Gatherer Modules
 
-Define token and result budgets per dispatch type:
-
-```javascript
-const BUDGETS = {
-  user:          { results: 8,  tokens: 600 },
-  reflection:    { results: 30, tokens: 3000 },
-  postmortem:    { results: 30, tokens: 3000 },
-  consolidation: { results: 20, tokens: 2000 },
-  default:       { results: 8,  tokens: 600 },
-};
-```
-
-User messages get lean context for fast response. Reflective processes get 5x the budget for thorough self-examination.
-
-### Parallel Multi-Source Fetching
-
-All context sources are fetched concurrently using `Promise.all()`. This is the critical performance optimization — sequential fetching would multiply latency:
+Rather than a single pipeline with budget allocation, each context source is a standalone gatherer module. Each module knows how to fetch, format, and return its own context slice:
 
 ```javascript
-// context/index.js
-async function assembleContext(message, dispatchType) {
-  const budget = createBudgetTracker(BUDGETS[dispatchType] || BUDGETS.default);
+// context/gatherers/semantic-search.js
+async function gatherSemanticContext(message) {
+  const results = await semanticSearch(message, { limit: 10 });
+  if (results.length === 0) return null;
 
-  // Phase 1: Fire all async fetches in parallel
-  const asyncFetches = [
-    semanticSearch(message, budget.results),
-    getPinnedMemories(),
-    getRecentHistory(10),
-    getActiveEntities(),
-    getProjectContext(),
-    getTimezoneContext(),
-    getSituationalContext(),
-    getAntiPatterns(),
-    getKnowledgeGapQuestions(),
-    getVibeInsights(),
-  ];
+  return formatSearchResults(results);
+}
 
-  const results = await Promise.all(asyncFetches);
+// context/gatherers/pinned-memories.js
+async function gatherPinnedContext() {
+  const pinned = await getPinnedMemories();
+  if (pinned.length === 0) return null;
 
-  // Phase 2: Assemble under token budget with priority ordering
-  const context = assembleParts(results, budget);
-  return context;
+  return formatPinned(pinned);
+}
+
+// context/gatherers/history.js
+async function gatherHistoryContext(conversationId) {
+  const history = await getRecentHistory(conversationId, 10);
+  if (history.length === 0) return null;
+
+  return formatHistory(history);
 }
 ```
 
-### Budget-Aware Assembly
+### Independent Module Registry
 
-Results are added to the context in priority order. Each `addPart()` call checks remaining budget before including content:
+Gatherer modules are registered and invoked independently. Each returns its context slice or null if it has nothing relevant:
 
 ```javascript
-function assembleParts(results, budget) {
-  const parts = [];
+// context/index.js
+const gatherers = [
+  { name: 'semantic-search', fn: gatherSemanticContext },
+  { name: 'pinned-memories', fn: gatherPinnedContext },
+  { name: 'history',         fn: gatherHistoryContext },
+  { name: 'active-entities', fn: gatherEntityContext },
+  { name: 'project-context', fn: gatherProjectContext },
+  { name: 'timezone',        fn: gatherTimezoneContext },
+  { name: 'situational',     fn: gatherSituationalContext },
+  { name: 'anti-patterns',   fn: gatherAntiPatternContext },
+  { name: 'knowledge-gaps',  fn: gatherKnowledgeGapContext },
+  { name: 'vibe-insights',   fn: gatherVibeContext },
+];
+```
 
-  // Pinned items get priority — always included
-  budget.addPart(parts, formatPinned(results.pinned), 'pinned');
+### Parallel Execution
 
-  // Anti-patterns — high priority for LLM behavior correction
-  budget.addPart(parts, formatAntiPatterns(results.antiPatterns), 'anti-patterns');
+All gatherer modules are invoked concurrently. This is the critical performance optimization — sequential fetching would multiply latency:
 
-  // Search results fill remaining budget
-  const remaining = budget.remaining();
-  budget.addPart(parts, trimToTokens(formatResults(results.search), remaining), 'search');
+```javascript
+async function assembleContext(message, conversationId) {
+  const results = await Promise.all(
+    gatherers.map(async (g) => {
+      try {
+        const context = await g.fn(message, conversationId);
+        return { name: g.name, context };
+      } catch (err) {
+        logger.warn({ gatherer: g.name, err }, 'Context gatherer failed');
+        return { name: g.name, context: null };
+      }
+    })
+  );
 
-  // History as fallback continuity
-  budget.addPart(parts, formatHistory(results.history), 'history');
-
-  return parts.join('\n');
+  // Filter out null results and combine
+  return results
+    .filter(r => r.context !== null)
+    .map(r => r.context)
+    .join('\n\n');
 }
 ```
 
@@ -95,7 +99,6 @@ Messages are classified to determine whether full context assembly is needed:
 ```javascript
 // context/classification.js
 function isSimpleMessage(text) {
-  // Short messages, greetings, acknowledgments skip expensive context assembly
   if (text.length < 20) return true;
   if (SIMPLE_PATTERNS.some(p => p.test(text))) return true;
   return false;
@@ -105,7 +108,7 @@ function isSimpleMessage(text) {
 const simple = isSimpleMessage(textContent);
 const context = simple
   ? null  // Skip context assembly entirely
-  : await assembleContext(message, dispatchType);
+  : await assembleContext(message, conversationId);
 ```
 
 ### Content Extraction
@@ -125,40 +128,36 @@ function extractContent(message) {
 
 ## Implications
 
+- Each gatherer module is independent — adding a new context source means adding a new module, not modifying a central pipeline
 - Parallel fetching reduces latency from sum-of-all-sources to max-of-all-sources — typically 3-5x faster
-- Budget tuning is empirical — too tight and the model lacks context, too loose and you waste tokens
+- Individual gatherer failures are isolated — one module failing does not prevent the others from contributing context
 - Simple message classification saves ~200-500ms by skipping context assembly entirely for trivial inputs
-- Pinned memories always consuming budget means they should be kept minimal
-- No separate triage layer — all messages go through the same single pipeline with budget-based assembly
-- Token estimation is approximate — actual token counts may vary by model
+- Without a central budget allocator, token usage depends on what each module returns — modules must self-regulate their output size
 - Anti-pattern injection into context means learned corrections are always fresh
+- The modular approach trades centralized budget control for flexibility and extensibility
 
 ## Code Example
 
 ```javascript
-// Complete context assembly for a user message
-async function prepareMessageWithContext(message, userId, correlationId) {
-  const budget = createBudgetTracker(BUDGETS.user);
+// Complete context assembly using independent gatherer modules
+async function prepareMessageWithContext(message, conversationId) {
+  // Fire all gatherers in parallel — each module fetches its own context
+  const results = await Promise.all(
+    gatherers.map(async (g) => {
+      try {
+        return await g.fn(message, conversationId);
+      } catch {
+        return null;
+      }
+    })
+  );
 
-  // Fire all fetches in parallel — this is the key latency optimization
-  const [search, pinned, history, entities, antiPatterns] = await Promise.all([
-    semanticSearch(message, { limit: budget.results }),
-    getPinnedMemories(userId),
-    getRecentHistory(userId, 10),
-    getActiveEntities(userId),
-    getAntiPatterns(),
-  ]);
+  // Combine non-null results into the final context block
+  const contextBlock = results.filter(Boolean).join('\n\n');
 
-  // Assemble under budget with priority ordering
-  const parts = [];
-  budget.addPart(parts, formatPinned(pinned));
-  budget.addPart(parts, formatAntiPatterns(antiPatterns));
-
-  const remaining = budget.remaining();
-  budget.addPart(parts, trimToTokens(formatSearch(search), remaining));
-  budget.addPart(parts, formatHistory(history));
-
-  return buildSystemMessage(parts) + '\n\n' + message;
+  return contextBlock
+    ? contextBlock + '\n\n' + message
+    : message;
 }
 ```
 

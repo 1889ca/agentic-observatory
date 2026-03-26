@@ -193,7 +193,8 @@ a:hover {
   margin-bottom: 0.5rem;
 }
 
-.pattern-content ul {
+.pattern-content ul,
+.pattern-content ol {
   padding-left: 1.5rem;
   margin-bottom: 1rem;
 }

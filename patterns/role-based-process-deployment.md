@@ -18,7 +18,7 @@ At startup, read `process.env.ROLE` (defaulting to `'all'`) and conditionally in
 - `jobs` — starts job runners, the cognitive processing loop, and scheduled tasks. Does not bind an HTTP port.
 - `all` — starts everything. Used in development and single-instance deployments.
 
-The split is implemented with plain `if`-checks in `index.js`. No plugin system or dynamic loader — the logic is explicit and readable at a glance. PM2's `ecosystem.config.js` defines one process entry per role, letting the process manager restart each independently.
+The split is implemented with plain `if`-checks in `index.js`. No plugin system or dynamic loader — the logic is explicit and readable at a glance:
 
 ```js
 // index.js
@@ -34,27 +34,7 @@ if (role === 'jobs' || role === 'all') {
 }
 ```
 
-```js
-// ecosystem.config.js
-module.exports = {
-  apps: [
-    {
-      name: 'web',
-      script: 'index.js',
-      instances: 4,
-      env: { ROLE: 'web', NODE_ENV: 'production' },
-    },
-    {
-      name: 'jobs',
-      script: 'index.js',
-      instances: 1,
-      env: { ROLE: 'jobs', NODE_ENV: 'production' },
-    },
-  ],
-};
-```
-
-Multiple `web` instances run behind a load balancer. A single `jobs` instance handles all background work, ensuring the cognitive loop runs exactly once.
+A process manager (e.g., PM2) defines one process entry per role, letting each be restarted, scaled, and deployed independently. Multiple `web` instances run behind a load balancer while a single `jobs` instance handles all background work, ensuring the cognitive loop runs exactly once.
 
 ## Implications
 

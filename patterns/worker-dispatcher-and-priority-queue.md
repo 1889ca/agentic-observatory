@@ -1,94 +1,48 @@
 # Worker Dispatcher and Priority Queue
 
-> Weighted event prioritization with resource-level locking and budget tracking for dispatching work through the cognitive processor without conflicts.
+> Worker-availability-based dispatch where tasks are routed to idle workers based on capacity, with parallel worker limits and audit logging.
 
 ## Problem
 
-An orchestrator receives events from many sources — user messages, task results, webhooks, scheduled jobs, ambient activity. Each event type has different urgency, but a naive FIFO queue means a flood of low-priority ambient events can delay processing a user's urgent message. Additionally, two dispatched workers operating on the same resource simultaneously can create conflicts or corrupt state.
+An orchestrator receives events from many sources — user messages, task results, webhooks, scheduled jobs, ambient activity. These events need to be dispatched to workers for processing, but workers are a limited resource. Without awareness of which workers are available and how many can run concurrently, the dispatcher either overloads the system or leaves capacity on the table while tasks wait.
 
 ## Context
 
-- Multiple event types with different urgency levels feeding a shared processing queue
-- A cognitive processor that evaluates and dispatches events to appropriate handlers
-- Risk of concurrent operations on the same resource from different workers
-- Need for budget tracking to prevent runaway cost
-- Some work items can safely run in parallel (isolated tasks)
+- Multiple event types feeding a shared processing pipeline
+- A pool of workers with a configurable concurrency limit
+- Workers have availability states — idle workers can accept tasks, busy workers cannot
+- Need for audit logging to track dispatch decisions
+- Budget tracking to monitor operational cost
 
 ## Solution
 
-### Weighted Event Prioritization
+### Worker Availability Model
 
-Each event type is assigned a static weight. When the dispatcher ticks, it evaluates all pending items and processes highest-weight items first:
+The dispatcher tracks active workers against a configurable maximum. Dispatch decisions are driven by whether idle capacity exists:
 
 ```javascript
 // worker/dispatcher.js
-const SOURCE_WEIGHTS = {
-  user_request:        90,  // Highest: human is waiting for a response
-  retry_failed:        80,  // Previously failed work deserves quick retry
-  github_issue_ready:  70,  // Issue marked ready, time-sensitive
-  coding_todo:         50,  // Scheduled coding work
-  github_issue:        40,  // General issue triage
-  health_check:        30,  // Lowest: background health monitoring
-};
+const MAX_PARALLEL_WORKERS = parseInt(process.env.MAX_PARALLEL_WORKERS) || 3;
 
-function getWeight(item) {
-  return SOURCE_WEIGHTS[item.source] || 0;
-}
-
-function sortByPriority(items) {
-  return items.sort((a, b) => getWeight(b) - getWeight(a));
-}
-```
-
-### Conflict Check
-
-Before dispatching a worker to a repository, the dispatcher checks for conflicts based on task type. Worktree-isolated task types (`solve_issue`, `solve-issue`, `self-improve`, `coding`) can safely run in parallel on the same repo because each operates in its own git worktree. Non-worktree tasks require exclusive access:
-
-```javascript
-// worker/conflict-check.js
-const WORKTREE_TASK_TYPES = ['solve_issue', 'solve-issue', 'self-improve', 'coding'];
-
-function canDispatch(item, runningRepos) {
-  const repo = item.resource || item.workdir;
-  if (!repo) return true;
-
-  const running = runningRepos.get(repo);
-  if (!running) return true;
-
-  // Multiple worktree tasks on same repo = safe, can run parallel
-  if (WORKTREE_TASK_TYPES.includes(item.taskType) &&
-      running.every(r => WORKTREE_TASK_TYPES.includes(r.taskType))) {
-    return true;
-  }
-
-  // One non-worktree task on repo = defer other tasks (potential conflict)
-  audit.log('dispatcher:skip_item', {
-    reason: 'repo_conflict',
-    repo,
-    source: item.source,
-  });
-  return false;
+function getAvailableWorkerCount() {
+  const active = getActiveWorkerCount();
+  return Math.max(0, MAX_PARALLEL_WORKERS - active);
 }
 ```
 
 ### Dispatch Loop
 
-The dispatcher collects work from all sources via `identifyWork()`, filters by parallel limits, budget, and conflicts, then dispatches the highest-scoring items:
+The dispatcher collects pending work via `identifyWork()`, then dispatches tasks to available workers until capacity is exhausted:
 
 ```javascript
 async function dispatch() {
-  const candidates = await identifyWork();  // Collect from all sources with weights
-  const sorted = sortByPriority(candidates);
-  const availableWorkers = getAvailableWorkerCount();
+  const candidates = await identifyWork();  // Collect pending tasks
+  const available = getAvailableWorkerCount();
 
   let dispatched = 0;
 
-  for (const item of sorted) {
-    if (dispatched >= availableWorkers) break;
-    if (!canDispatch(item, runningRepos)) continue;
-
-    // Track running repos to prevent simultaneous non-worktree tasks
-    trackRepo(item);
+  for (const item of candidates) {
+    if (dispatched >= available) break;
 
     await dispatchToWorker(item);
     dispatched++;
@@ -98,9 +52,11 @@ async function dispatch() {
 }
 ```
 
+The key constraint is worker availability — when all worker slots are occupied, remaining tasks wait for the next dispatch cycle regardless of urgency.
+
 ### Budget Tracking
 
-Each dispatch records estimated cost to prevent runaway spending:
+Each dispatch records estimated cost to monitor spending:
 
 ```javascript
 function recordDispatchCost(item) {
@@ -119,19 +75,6 @@ function recordDispatchCost(item) {
 }
 ```
 
-### Max Parallel Workers
-
-A global cap prevents overloading the machine:
-
-```javascript
-const MAX_PARALLEL_WORKERS = parseInt(process.env.MAX_PARALLEL_WORKERS) || 3;
-
-function getAvailableWorkerCount() {
-  const active = getActiveWorkerCount();
-  return Math.max(0, MAX_PARALLEL_WORKERS - active);
-}
-```
-
 ### Audit Logging
 
 Every dispatch decision is logged for post-mortem analysis:
@@ -140,50 +83,77 @@ Every dispatch decision is logged for post-mortem analysis:
 audit.log('dispatcher:dispatch', {
   itemId: item.id,
   source: item.source,
-  weight: getWeight(item),
   resource: item.resource,
   model: item.model,
   queueDepth: pending.length,
 });
 ```
 
+### Periodic Dispatch Cycle
+
+The dispatcher runs on a tick interval, checking for pending work and available workers each cycle:
+
+```javascript
+async function dispatchCycle() {
+  const candidates = await identifyWork();
+  const available = getAvailableWorkerCount();
+
+  for (const item of candidates.slice(0, available)) {
+    audit.log('dispatcher:dispatch', {
+      source: item.source,
+      resource: item.resource,
+    });
+
+    dispatchToWorker(item).finally(() => {
+      // Worker slot freed when task completes
+    });
+
+    recordDispatchCost(item);
+  }
+}
+
+// Run on interval
+setInterval(dispatchCycle, DISPATCH_TICK_MS);
+```
+
 ## Implications
 
-- Static weights are simple but inflexible — a user message always beats a webhook, even if the webhook is critical and the message is trivial. Dynamic weight adjustment could address this but adds complexity.
-- Conflict checking distinguishes worktree-isolated tasks (which can run in parallel on the same repo) from non-worktree tasks (which require exclusive access). This handles the most common safe-parallel case without over-locking.
-- Budget tracking is advisory (warns but doesn't stop) — hard budget enforcement would require a policy decision about which events to drop.
-- The tick interval creates a maximum latency of one tick between an event arriving and dispatch. Sub-second dispatch requires a tighter interval at the cost of more CPU.
-- Audit logging enables replay and diagnosis but generates volume — needs rotation or aggregation.
-- Worker count caps prevent overload but can create backlogs during high-demand periods.
+- Worker availability is the primary dispatch constraint — tasks are dispatched when workers are free, not based on task priority weights
+- The tick interval creates a maximum latency of one tick between an event arriving and dispatch. Sub-second dispatch requires a tighter interval at the cost of more CPU
+- Budget tracking is advisory (warns but doesn't stop) — hard budget enforcement would require a policy decision about which events to drop
+- Worker count caps prevent overload but can create backlogs during high-demand periods
+- Audit logging enables replay and diagnosis but generates volume — needs rotation or aggregation
+- Adding worker capacity is a configuration change (increase `MAX_PARALLEL_WORKERS`), not a code change
 
 ## Code Example
 
 ```javascript
-// Complete dispatch cycle with priority, conflict checks, and budget
+// Complete dispatch cycle driven by worker availability
 async function dispatchCycle() {
-  const candidates = sortByPriority(await identifyWork());
+  const candidates = await identifyWork();
   const available = getAvailableWorkerCount();
 
-  for (const item of candidates.slice(0, available)) {
-    const repo = item.resource || item.workdir;
+  if (available === 0) {
+    audit.log('dispatcher:skip_cycle', { reason: 'no_available_workers' });
+    return;
+  }
 
-    // Skip if repo has a conflict (non-worktree task running)
-    if (!canDispatch(item, runningRepos)) continue;
-
-    // Track repo and dispatch
-    if (repo) trackRepo(item);
+  let dispatched = 0;
+  for (const item of candidates) {
+    if (dispatched >= available) break;
 
     audit.log('dispatcher:dispatch', {
       source: item.source,
-      weight: getWeight(item),
-      repo,
+      resource: item.resource,
+      workersAvailable: available - dispatched,
     });
 
     dispatchToWorker(item).finally(() => {
-      if (repo) untrackRepo(item);
+      // Slot freed — next cycle can dispatch more
     });
 
     recordDispatchCost(item);
+    dispatched++;
   }
 }
 

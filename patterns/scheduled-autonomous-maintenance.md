@@ -1,6 +1,6 @@
 # Scheduled Autonomous Maintenance
 
-> Kanban-style task queue for agent-managed projects with claim-based locking and centralized result processing.
+> Worker task pipelines with multi-step execution, template interpolation, and built-in maintenance pipelines for automated project upkeep.
 
 ## Problem
 
@@ -91,7 +91,7 @@ The orchestrator exposes task management operations that cover the full lifecycl
 - **Create/update:** Register a new task or modify an existing one (schedule, prompt, model, workdir, enabled status)
 - **List:** Inspect all registered tasks and their current state
 - **Toggle:** Pause or resume a task by flipping its `enabled` field without deleting the definition
-- **Manual trigger:** Execute a task immediately outside its normal schedule (still subject to claim-based locking)
+- **Manual trigger:** Execute a task immediately outside its normal schedule
 
 These operations are typically exposed via the orchestrator's API, but the key architectural point is that task definitions live in the database and are managed centrally — not scattered across project config files.
 
@@ -107,8 +107,8 @@ All task results flow back through the orchestrator's message queue:
 ## Implications
 
 - The schedule check is time-based only — no event-driven triggers (e.g., "run when a PR is opened")
-- Claim-based locking means long-running tasks will not be re-enqueued until their claim is released, which is by design but requires tasks to be scoped appropriately
-- No dependency ordering between tasks — if task A must complete before task B, that ordering must be encoded in the prompts or handled at a higher level
+- Pipelines execute steps sequentially — if a step fails, the entire execution is marked failed with no partial retry
+- No dependency ordering between independent pipelines — if pipeline A must complete before pipeline B, that ordering must be encoded at a higher level
 - Heavy scheduling can consume agent dispatch capacity, starving on-demand work
 - The `enabled` toggle provides a safe way to pause maintenance without losing task definitions
 - Task prompts carry the full instruction set — the scheduling system is prompt-agnostic and does not interpret task content

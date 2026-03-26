@@ -1,10 +1,10 @@
 # Outbound Queue with Backoff
 
-> Async message delivery queue with channel-based routing, scheduled delivery, exponential backoff retry, and metadata tracking.
+> Retry logic with exponential backoff for outbound message delivery, integrated into the message sending flow rather than a standalone queue class.
 
 ## Problem
 
-Direct message sending is synchronous and fragile. Channel APIs fail, rate limit, or timeout unpredictably. Without a queue, a failed send is a lost message — the orchestrator has no way to retry and the user never gets notified. Scheduled messages (send a reminder at 9am tomorrow) need a completely separate mechanism if there's no queue, leading to duplicated delivery logic. The combination of unreliable channels, retry needs, and scheduled delivery demands a durable intermediary between "decide to send" and "actually sent."
+Direct message sending is synchronous and fragile. Channel APIs fail, rate limit, or timeout unpredictably. Without retry logic, a failed send is a lost message — the orchestrator has no way to recover and the user never gets notified. Scheduled messages (send a reminder at 9am tomorrow) need a completely separate mechanism if there's no durable intermediary, leading to duplicated delivery logic.
 
 ## Context
 
@@ -12,13 +12,13 @@ Direct message sending is synchronous and fragile. Channel APIs fail, rate limit
 - Channel APIs may be temporarily down, rate-limited, or slow to respond
 - Some messages are immediate; others are scheduled for future delivery
 - Failed sends must be retried automatically without manual intervention
-- The orchestrator needs to fire-and-forget when enqueuing — delivery is the queue's problem
+- The orchestrator needs to fire-and-forget when enqueuing — delivery is the sending flow's problem
 
 ## Solution
 
-### Queue Storage
+### Message Storage
 
-Each enqueued message is a record with delivery metadata:
+Each outbound message is persisted as a record with delivery metadata:
 
 ```javascript
 // Message record structure
@@ -40,57 +40,42 @@ Each enqueued message is a record with delivery metadata:
 
 Messages are stored durably — in a database, not just in memory. A server restart shouldn't lose pending messages.
 
-### Processing Loop
+### Delivery with Integrated Retry
 
-The queue runs a polling loop that picks up due messages and dispatches them through the channel adapter:
+Rather than a dedicated `OutboundQueue` class, the backoff and retry logic is integrated into the message sending flow. A processing loop picks up due messages and attempts delivery through the appropriate channel adapter:
 
 ```javascript
-class OutboundQueue {
-  constructor(store, router, options = {}) {
-    this.store = store;
-    this.router = router;
-    this.pollInterval = options.pollInterval || 2000;
-    this.maxRetries = options.maxRetries || 5;
-    this.running = false;
-  }
+// Message sending flow with integrated retry
+async function processOutboundMessages(store, router, options = {}) {
+  const pollInterval = options.pollInterval || 2000;
+  const maxRetries = options.maxRetries || 5;
 
-  async enqueue(channel, recipient, content, options = {}) {
-    return this.store.insert({
-      id: generateId(),
-      channel,
-      recipient,
-      content,
-      scheduledFor: options.scheduledFor || null,
-      status: 'pending',
-      attempts: 0,
-      maxRetries: options.maxRetries || this.maxRetries,
-      nextRetryAt: null,
-      lastError: null,
-      createdAt: new Date(),
-      deliveredAt: null,
-    });
-  }
+  while (true) {
+    const due = await store.findDue(new Date());
 
-  start() {
-    this.running = true;
-    this.poll();
-  }
-
-  stop() {
-    this.running = false;
-  }
-
-  async poll() {
-    while (this.running) {
-      const due = await this.store.findDue(new Date());
-
-      for (const msg of due) {
-        await this.process(msg);
-      }
-
-      await sleep(this.pollInterval);
+    for (const msg of due) {
+      await attemptDelivery(store, router, msg, maxRetries);
     }
+
+    await sleep(pollInterval);
   }
+}
+
+async function enqueueMessage(store, channel, recipient, content, options = {}) {
+  return store.insert({
+    id: generateId(),
+    channel,
+    recipient,
+    content,
+    scheduledFor: options.scheduledFor || null,
+    status: 'pending',
+    attempts: 0,
+    maxRetries: options.maxRetries || 5,
+    nextRetryAt: null,
+    lastError: null,
+    createdAt: new Date(),
+    deliveredAt: null,
+  });
 }
 ```
 
@@ -99,21 +84,21 @@ class OutboundQueue {
 When a send fails, the message is rescheduled with an exponentially increasing delay. This prevents hammering a channel that's already struggling:
 
 ```javascript
-async process(msg) {
+async function attemptDelivery(store, router, msg, maxRetries) {
   try {
-    await this.store.update(msg.id, { status: 'processing' });
-    await this.router.route(msg.channel, msg.recipient, msg.content);
+    await store.update(msg.id, { status: 'processing' });
+    await router.route(msg.channel, msg.recipient, msg.content);
 
-    await this.store.update(msg.id, {
+    await store.update(msg.id, {
       status: 'delivered',
       deliveredAt: new Date(),
     });
   } catch (err) {
     const attempts = msg.attempts + 1;
 
-    if (attempts >= msg.maxRetries) {
+    if (attempts >= maxRetries) {
       // Dead letter — exhausted all retries
-      await this.store.update(msg.id, {
+      await store.update(msg.id, {
         status: 'failed',
         attempts,
         lastError: err.message,
@@ -125,7 +110,7 @@ async process(msg) {
     const delayMs = Math.pow(2, attempts) * 1000;
     const nextRetryAt = new Date(Date.now() + delayMs);
 
-    await this.store.update(msg.id, {
+    await store.update(msg.id, {
       status: 'pending',
       attempts,
       nextRetryAt,
@@ -158,7 +143,7 @@ async findDue(now) {
 }
 ```
 
-This means scheduled messages and retry delays use the same mechanism. A message scheduled for 9am tomorrow sits in the queue with `scheduledFor` set. When the poll loop runs after 9am, it becomes due and gets processed like any other message.
+This means scheduled messages and retry delays use the same mechanism. A message scheduled for 9am tomorrow sits in the queue with `scheduledFor` set. When the processing loop runs after 9am, it becomes due and gets processed like any other message.
 
 ### Metadata Tracking
 
@@ -176,33 +161,31 @@ const pending = await store.find({ status: 'pending', attempts: { $gt: 0 } });
 
 ## Implications
 
-- The queue adds latency — messages aren't sent inline, they go through a poll cycle. For a 2-second poll interval, worst case adds 2 seconds to delivery
+- The processing loop adds latency — messages aren't sent inline, they go through a poll cycle. For a 2-second poll interval, worst case adds 2 seconds to delivery
 - Backoff prevents hammering failing channels but means a message could take minutes to retry after several failures (5 retries with exponential backoff = up to 32 seconds between last retries)
 - Dead letter handling is essential — messages that exhaust retries need monitoring and a manual retry mechanism
-- Durable storage is non-negotiable. An in-memory queue loses all pending messages on restart
-- The queue naturally handles burst absorption — the orchestrator can enqueue 100 messages instantly and the queue processes them at a sustainable rate
+- Durable storage is non-negotiable. An in-memory approach loses all pending messages on restart
+- The processing loop naturally handles burst absorption — the orchestrator can enqueue 100 messages instantly and they are processed at a sustainable rate
 - Scheduled delivery and retry delays share the same time-gate mechanism, keeping the implementation simple
 
 ## Code Example
 
 ```javascript
 // Wiring and usage
-const queue = new OutboundQueue(messageStore, router, {
+processOutboundMessages(messageStore, router, {
   pollInterval: 2000,
   maxRetries: 5,
 });
 
-queue.start();
-
 // Immediate send — fire and forget
-await queue.enqueue('slack', '#general', 'Build passed.');
+await enqueueMessage(messageStore, 'slack', '#general', 'Build passed.');
 
 // Scheduled send — deliver tomorrow at 9am
-await queue.enqueue('telegram', chatId, 'Good morning! Here is your daily brief.', {
+await enqueueMessage(messageStore, 'telegram', chatId, 'Good morning! Here is your daily brief.', {
   scheduledFor: new Date('2025-03-15T09:00:00Z'),
 });
 
-// Check queue health
+// Check delivery health
 const stats = await messageStore.aggregate({
   pending: { status: 'pending' },
   failed: { status: 'failed' },

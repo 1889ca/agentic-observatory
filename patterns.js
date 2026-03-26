@@ -6,7 +6,7 @@ const PATTERNS = [
   {
     slug: "orchestrator-satellite-communication",
     title: "Orchestrator-Worker Communication",
-    summary: "Multi-strategy task dispatch where work sources feed a priority queue and a central dispatcher selects between runner-based, async, or direct execution strategies based on task type.",
+    summary: "Worker-type-based task routing where the orchestrator matches tasks to workers by type and availability, dispatching to the first suitable idle worker.",
     status: "published",
   },
   {
@@ -19,12 +19,6 @@ const PATTERNS = [
     slug: "activity-tracking-architecture",
     title: "Activity Tracking Architecture",
     summary: "Session-based activity tracking with inter-session messaging, per-session tool permissions, and parent-child session hierarchies.",
-    status: "published",
-  },
-  {
-    slug: "unified-search-across-kbs",
-    title: "Unified Search Across KBs",
-    summary: "Architecture for searching multiple project knowledge bases and memory simultaneously.",
     status: "published",
   },
   {
@@ -42,7 +36,7 @@ const PATTERNS = [
   {
     slug: "context-assembly-pipeline",
     title: "Context Assembly Pipeline",
-    summary: "Single-pass parallel context assembly with token budgeting across multiple sources.",
+    summary: "Modular context gathering where independent context-gatherer modules each assemble their own context slice, combined at dispatch time.",
     status: "published",
   },
   {
@@ -84,7 +78,7 @@ const PATTERNS = [
   {
     slug: "intent-driven-self-scheduling",
     title: "Intent-Driven Self-Scheduling",
-    summary: "Cron-based scheduling dispatching through /api/workers/:workerType/dispatch with priority kanban queue integration and agent self-scheduling.",
+    summary: "Cron-based task scheduling via the unified trigger system, dispatching through the worker API for prioritized execution alongside manual and agent-initiated work.",
     status: "published",
   },
   {
@@ -96,7 +90,7 @@ const PATTERNS = [
   {
     slug: "domain-aware-memory-scoring",
     title: "Domain-Aware Memory Scoring",
-    summary: "Combined scoring of embedding similarity, recency decay, and access frequency for vector-based memory retrieval.",
+    summary: "Embedding similarity from vector search plus recency boost for time-aware memory retrieval. Simpler than originally envisioned -- no access frequency tracking.",
     status: "published",
   },
   {
@@ -114,13 +108,13 @@ const PATTERNS = [
   {
     slug: "autonomous-agent-cycle",
     title: "Autonomous Agent Cycle",
-    summary: "Queue-based cognitive processor with rule matching on a 5-second tick, paired with a periodic objectives review loop for goal tracking.",
+    summary: "2-hour periodic loop that reviews active objectives, generates strategies, and produces actionable tasks for goal-directed autonomous behavior.",
     status: "published",
   },
   {
     slug: "dynamic-system-prompt-composition",
     title: "Dynamic System Prompt Composition",
-    summary: "Multi-layer prompt with hardcoded persona, dynamic vibe context and preference synthesis, per-message skill injection, capability manifest, and anti-patterns composed at dispatch time.",
+    summary: "Multi-layer prompt with hardcoded persona, vibe subsystem (synthesizer, confidence, knowledge-gaps, outcome-reactor), per-message skill injection, capability manifest, and anti-patterns.",
     status: "published",
   },
   {
@@ -156,7 +150,7 @@ const PATTERNS = [
   {
     slug: "outbound-queue-with-backoff",
     title: "Outbound Queue with Backoff",
-    summary: "Async message delivery queue with scheduled delivery, exponential backoff retry, and metadata tracking.",
+    summary: "Retry logic with exponential backoff for outbound message delivery, integrated into the message sending flow with scheduled delivery and metadata tracking.",
     status: "published",
   },
   {
@@ -180,7 +174,7 @@ const PATTERNS = [
   {
     slug: "worker-dispatcher-and-priority-queue",
     title: "Worker Dispatcher and Priority Queue",
-    summary: "Source-weighted task prioritization with worktree-aware conflict checking and budget tracking for parallel worker dispatch.",
+    summary: "Worker-availability-based dispatch where tasks are routed to idle workers based on capacity, with parallel limits and audit logging.",
     status: "published",
   },
   {
@@ -193,12 +187,6 @@ const PATTERNS = [
     slug: "graceful-degradation-and-optional-init",
     title: "Graceful Degradation and Optional Init",
     summary: "Non-blocking startup with per-service .catch() handlers, multi-provider LLM fallback chains, and optional service initialization.",
-    status: "published",
-  },
-  {
-    slug: "planning-and-verification-layer",
-    title: "Planning and Verification Layer",
-    summary: "Pre-execution plan generation with post-execution verification, novel composition detection, and automatic skill generation.",
     status: "published",
   },
   {
@@ -256,21 +244,9 @@ const PATTERNS = [
     status: "published",
   },
   {
-    slug: "autonomy-boost-and-approval-learning",
-    title: "Autonomy Boost and Approval Learning",
-    summary: "Named autonomy boost presets (quick/focus/meeting/commute/deep_work/away, 30min–8h) granting temporary elevated permissions that auto-expire.",
-    status: "published",
-  },
-  {
     slug: "request-scoped-context",
     title: "Request-Scoped Context Propagation",
     summary: "AsyncLocalStorage-based per-request context carrying correlation IDs and embedding caches through async chains. Multi-tenancy hardcoded to tenant 1.",
-    status: "published",
-  },
-  {
-    slug: "commitment-tracking",
-    title: "Commitment Tracking",
-    summary: "Document-based commitment storage with active/overdue querying, progressive three-level escalation, and integration with the cognitive processing loop.",
     status: "published",
   },
   {
@@ -283,12 +259,6 @@ const PATTERNS = [
     slug: "session-episode-tracking",
     title: "Session Episode Tracking",
     summary: "Episode-based conversation grouping with DB-backed session reconstruction, per-session entity tracking, and topic-drift boundary detection.",
-    status: "published",
-  },
-  {
-    slug: "contact-resolution-and-entity-disambiguation",
-    title: "Contact Resolution and Entity Disambiguation",
-    summary: "Fuzzy cross-platform contact matching with confidence-scored disambiguation, multi-source profile aggregation, and unified entity construction.",
     status: "published",
   },
   {
@@ -324,19 +294,13 @@ const PATTERNS = [
   {
     slug: "task-deduplication",
     title: "Task Deduplication",
-    summary: "Keyed deduplication preventing duplicate agent work using compound unique indexes and atomic INSERT ON CONFLICT resolution.",
+    summary: "Inline deduplication within task creation flows using compound unique indexes and atomic INSERT ON CONFLICT resolution.",
     status: "published",
   },
   {
     slug: "model-selection-and-llm-fallback",
     title: "Model Selection and LLM Fallback",
     summary: "Task-aware model routing across Claude + Gemini stack with Gemini Flash-lite as cost fallback, OpenAI disabled by default, and lazy singleton initialization with 30s timeout.",
-    status: "published",
-  },
-  {
-    slug: "graceful-shutdown-ordering",
-    title: "Graceful Shutdown Ordering",
-    summary: "Ordered SIGINT/SIGTERM teardown sequence with sequential await and per-phase .catch() error isolation for safe process termination.",
     status: "published",
   },
   {
@@ -402,7 +366,7 @@ const PATTERNS = [
   {
     slug: "role-based-process-deployment",
     title: "Role-Based Process Deployment",
-    summary: "ROLE=web|jobs|all environment variable splitting for horizontal scaling with conditional subsystem startup per role.",
+    summary: "ROLE=web|jobs|all environment variable for conditional subsystem startup, enabling independent scaling of web and job processes.",
     status: "published",
   },
   {
@@ -414,7 +378,31 @@ const PATTERNS = [
   {
     slug: "stale-state-recovery-on-startup",
     title: "Stale State Recovery on Startup",
-    summary: "Startup-time cleanup of stale improvements, orphaned locks, failed workflows, and learned helplessness patterns from ungraceful shutdowns.",
+    summary: "Startup-time cleanup of orphaned locks, stuck tasks, and stale workflow executions left behind by ungraceful shutdowns.",
+    status: "published",
+  },
+  {
+    slug: "webauthn-passkey-authentication",
+    title: "WebAuthn/Passkey Authentication",
+    summary: "Challenge-response passkey flow with session tokens, credential storage, and 24h expiry for phishing-resistant hardware-backed authentication.",
+    status: "published",
+  },
+  {
+    slug: "retry-utility-with-non-retryable-detection",
+    title: "Retry Utility with Non-Retryable Detection",
+    summary: "Generic makeRetryable() wrapper with configurable exponential backoff that short-circuits on non-retryable error patterns like auth failures and 404s.",
+    status: "published",
+  },
+  {
+    slug: "goal-decomposition-and-objective-planning",
+    title: "Goal Decomposition and Objective Planning",
+    summary: "Multi-level goal breakdown (goals, objectives, strategies, actions) with LLM-driven decomposition for autonomous agent work.",
+    status: "published",
+  },
+  {
+    slug: "validation-and-schema-system",
+    title: "Validation and Schema System",
+    summary: "Zod-based schema validation with type coercion, reusable domain validators, and tool execution integration for reliable LLM-generated input handling.",
     status: "published",
   },
 ];

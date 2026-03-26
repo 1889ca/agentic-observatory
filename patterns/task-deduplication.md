@@ -1,6 +1,6 @@
 # Task Deduplication
 
-> Keyed deduplication preventing duplicate agent work using compound unique indexes and atomic conflict resolution.
+> Inline deduplication within task creation flows using compound unique indexes and atomic INSERT ON CONFLICT resolution.
 
 ## Problem
 
@@ -16,12 +16,14 @@ Multiple agents or triggers can independently decide the same work needs doing �
 
 ## Solution
 
-Each task is identified by a compound key derived from its type and parameters. A unique index on this compound key enforces deduplication at the database level. Task creation uses `INSERT ... ON CONFLICT DO NOTHING`, and the caller checks the affected row count to determine whether they won the dedup race or a duplicate already exists.
+Deduplication is embedded directly within task creation routines rather than existing as a standalone module. Each task creation flow constructs a compound key from the task type and parameters, then uses `INSERT ... ON CONFLICT DO NOTHING` to atomically prevent duplicates at the database level.
 
 ```javascript
-// task-dedup.js
-async function createTaskIfNew(db, { type, params, metadata }) {
-  const dedupKey = buildDedupKey(type, params);
+// Within a task creation routine — dedup is inline, not a separate module
+async function createTask(db, { type, params, metadata }) {
+  // Dedup key is built inline from type + sorted params
+  const stable = JSON.stringify(params, Object.keys(params).sort());
+  const dedupKey = `${type}:${stable}`;
 
   const result = await db.query(`
     INSERT INTO tasks (type, params, dedup_key, status, metadata, created_at)
@@ -36,14 +38,9 @@ async function createTaskIfNew(db, { type, params, metadata }) {
     taskId: won ? result.rows[0].id : null,
   };
 }
-
-function buildDedupKey(type, params) {
-  const stable = JSON.stringify(params, Object.keys(params).sort());
-  return `${type}:${stable}`;
-}
 ```
 
-The compound index ensures that even under heavy concurrency, only one row is inserted for a given type+params combination. No advisory locks, no SELECT-then-INSERT races, no application-level mutex — the database handles it atomically.
+The compound index on `dedup_key` ensures that even under heavy concurrency, only one row is inserted for a given type+params combination. There is no standalone deduplication module or separate `buildDedupKey()` utility — the key construction and conflict resolution are co-located with the insert logic in whatever routine creates the task. This keeps the dedup concern close to where it matters and avoids an abstraction that would need to be wired into every creation path.
 
 ## Implications
 
@@ -51,6 +48,7 @@ The compound index ensures that even under heavy concurrency, only one row is in
 - The dedup window is implicit: tasks remain deduped until completed and cleaned up. A TTL or status-based cleanup is needed to allow re-creation of previously completed tasks
 - Callers must check the `created` flag and handle the "lost race" case gracefully (typically a no-op)
 - Compound keys can grow large with complex params — consider hashing for very large parameter sets
+- Because dedup logic is inline, any new task creation path must remember to include the ON CONFLICT clause — there is no centralized enforcement point
 - This pattern handles creation-time dedup only; it does not prevent duplicate execution if a task is picked up twice (see distributed job locking for that)
 
 ## Code Example
@@ -58,7 +56,7 @@ The compound index ensures that even under heavy concurrency, only one row is in
 ```javascript
 // Webhook handler that may fire multiple times
 async function handleDependencyAlert(webhook) {
-  const { created, taskId } = await createTaskIfNew(db, {
+  const { created, taskId } = await createTask(db, {
     type: 'dependency-update',
     params: { repo: webhook.repo, package: webhook.package, version: webhook.version },
     metadata: { source: 'webhook', receivedAt: Date.now() },

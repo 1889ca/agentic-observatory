@@ -1,6 +1,6 @@
 # Intent-Driven Self-Scheduling
 
-> Agents dispatch their own work and schedule future tasks via the worker dispatch system, with cron-based triggers flowing through the same priority kanban queue as all other work.
+> Cron-based task scheduling via the unified trigger system, dispatching work through the worker API for prioritized execution.
 
 ## Problem
 
@@ -12,14 +12,13 @@ Traditional scheduling for AI agents uses fixed cron jobs defined by humans. The
 - Situations where the agent discovers during one task that future attention is needed
 - Systems where scheduling requirements change dynamically based on what the agent learns
 - Multiple worker models with different cost profiles
-- Tasks need to flow through the same priority system as all other work
 - A unified dispatch endpoint that handles both immediate and scheduled work
 
 ## Solution
 
-### Worker-Type Dispatch Endpoint
+### Cron Triggers Dispatching to Workers
 
-Work is dispatched through a single endpoint scoped by worker type. The worker type determines which execution backend handles the task — local Claude Code, GitHub CC, or other backends:
+Scheduled tasks are defined with cron expressions and persisted in the database. When a cron trigger fires, it dispatches work through the worker API rather than executing directly. The trigger system handles the scheduling concern; the worker system handles execution:
 
 ```javascript
 // routes.js (illustrative)
@@ -39,11 +38,11 @@ Work is dispatched through a single endpoint scoped by worker type. The worker t
 },
 ```
 
-This is the only entry point for dispatching work. There is no separate task CRUD API — tasks are created by dispatching them, and the dispatch system handles queuing, persistence, and execution.
+This is the entry point for dispatching work. Cron triggers call into this same endpoint, meaning scheduled work follows the same path as manually triggered work.
 
-### Cron-Based Scheduling into the Dispatch System
+### Schedule Registration and Persistence
 
-Scheduled tasks are registered with `node-cron`, but when a cron fires, it dispatches through the worker system rather than executing directly. This means scheduled work flows through the same priority kanban queue as everything else:
+Schedules are registered with `node-cron` for timing and persisted to the database so they survive restarts. On startup, all enabled schedules are re-registered:
 
 ```javascript
 // lib/scheduler.js (illustrative)
@@ -78,19 +77,19 @@ async function restoreSchedules() {
 }
 ```
 
-### Kanban Integration
+### Worker API Integration
 
-Scheduled tasks enter the same kanban priority queue as manually triggered and agent-initiated work. This means they respect concurrency limits, per-project locks, and priority ordering:
+Scheduled work enters the worker dispatch system where it is queued alongside manually triggered and agent-initiated work. This means scheduled tasks respect concurrency limits, per-project locks, and priority ordering:
 
 ```
-Cron fires → dispatchToWorker() → kanban queue (prioritized) → dispatcher spawns CC process
+Cron fires → dispatchToWorker() → worker queue (prioritized) → dispatcher spawns worker process
 ```
 
 There is no fast path that bypasses the queue. A low-priority scheduled task will wait behind high-priority manual work, which prevents scheduled maintenance from starving urgent fixes.
 
-### Self-Scheduling During Execution
+### Agent-Initiated Follow-Up Work
 
-Agents running as Claude Code satellites can dispatch follow-up work during their own execution by calling back to the orchestrator's dispatch endpoint. A morning review task might discover a failing build and schedule a follow-up check:
+Agents running as workers can dispatch follow-up work during their own execution by calling back to the orchestrator's dispatch endpoint. A morning review task might discover a failing build and dispatch immediate follow-up:
 
 ```javascript
 // During agent execution — agent dispatches immediate follow-up work
@@ -106,11 +105,9 @@ await fetch('http://localhost:3847/api/workers/local/dispatch', {
 });
 ```
 
-For recurring self-scheduled work, the agent can register a cron schedule through the orchestrator's internal API or by including scheduling instructions in its output that the result handler interprets.
-
 ### Model Selection for Cost Control
 
-Different tasks warrant different model capabilities. The dispatch endpoint accepts a model parameter that the dispatcher passes through to the spawned CC process:
+Different tasks warrant different model capabilities. The dispatch endpoint accepts a model parameter that the dispatcher passes through to the spawned worker process:
 
 - **haiku**: Health checks, status polls, simple verifications
 - **sonnet**: Code reviews, planning, multi-step reasoning (default)
@@ -120,17 +117,16 @@ Cost-conscious scheduling means routine daily checks use haiku, while weekly dee
 
 ## Implications
 
-- All work — scheduled, manual, and agent-initiated — flows through the same dispatch endpoint and kanban queue, making the system's workload fully observable from a single point
+- All work — scheduled, manual, and agent-initiated — flows through the same dispatch endpoint, making the system's workload fully observable from a single point
 - Cron expressions provide minute-level granularity but not sub-minute precision
 - Schedules persist in the database, surviving orchestrator restarts. The scheduler re-registers all enabled schedules on startup
-- Self-dispatched work is indistinguishable from human-triggered work once it enters the queue — the same priority and concurrency rules apply
+- Dispatched work from agents is indistinguishable from human-triggered work once it enters the queue — the same priority and concurrency rules apply
 - The worker type parameter in the dispatch endpoint allows routing to different backends (local CC, GitHub CC) without changing the caller's interface
-- There is no separate task management API to maintain — the dispatch endpoint is the single interface for all work creation
 
 ## Code Example
 
 ```javascript
-// Complete lifecycle: schedule registered, cron fires, work dispatched, agent self-schedules follow-up
+// Complete lifecycle: schedule registered, cron fires, work dispatched, agent dispatches follow-up
 
 // 1. On startup, the orchestrator registers persistent schedules
 registerSchedule('daily-dependency-check', '0 14 * * 1-5', {
@@ -143,10 +139,10 @@ registerSchedule('daily-dependency-check', '0 14 * * 1-5', {
 // 2. At 2pm on Monday, cron fires → dispatches to worker system
 // dispatchToWorker('local', { prompt: '...', model: 'sonnet', metadata: { scheduled_task_id: 'daily-dependency-check' } })
 
-// 3. Kanban queue orders it among other pending work
+// 3. Worker queue orders it among other pending work
 // queue: [urgent-fix (high), daily-dependency-check (normal), cleanup-logs (low)]
 
-// 4. Dispatcher spawns a CC process when a slot opens
+// 4. Dispatcher spawns a worker process when a slot opens
 // claude --prompt "Check all projects for outdated dependencies..." --model sonnet
 
 // 5. During execution, the agent discovers a critical update and dispatches immediate follow-up
@@ -161,7 +157,7 @@ await fetch('http://localhost:3847/api/workers/local/dispatch', {
   }),
 });
 
-// 6. The follow-up enters the kanban queue at high priority and is dispatched next
+// 6. The follow-up enters the worker queue at high priority and is dispatched next
 ```
 
 ## Related Patterns
