@@ -178,13 +178,18 @@ Two higher-level factories compose on top of `defineTool`:
 
 ### Tool Categorization
 
-Tools declare a `category` that maps to a UI category registry. The registry provides icon, color, and grouping for the chat interface. A reverse lookup index enables O(1) category resolution:
+Tools declare a `category` that maps to a UI category registry. The registry provides icon, color, and grouping for the chat interface. A reverse lookup index enables O(1) category resolution. With 28+ tools, categories help both the UI and the LLM reason about tool groupings:
 
 ```javascript
 const TOOL_CATEGORIES = {
-  messaging: { tools: ['message', 'inbox'], icon: 'mail', color: '#4A90A4' },
-  knowledge: { tools: ['remember', 'recall', 'search_memory'], icon: 'brain', color: '#9370DB' },
-  utility: { tools: [], icon: 'gear', color: '#888888' }, // Catch-all
+  entity:       { tools: ['entity', 'navigate', 'focus'], icon: 'layers', color: '#4A90A4' },
+  knowledge:    { tools: ['remember', 'search'], icon: 'brain', color: '#9370DB' },
+  communication:{ tools: ['inbox', 'message'], icon: 'mail', color: '#5BA4CF' },
+  deliberation: { tools: ['deliberate', 'research'], icon: 'users', color: '#E67E22' },
+  media:        { tools: ['generate-image', 'generate-video'], icon: 'image', color: '#E74C3C' },
+  integrations: { tools: ['github', 'finances', 'hue-control'], icon: 'plug', color: '#2ECC71' },
+  ui:           { tools: ['widget'], icon: 'layout', color: '#9B59B6' },
+  utility:      { tools: [], icon: 'gear', color: '#888888' }, // Catch-all
 }
 
 function getToolCategory(toolName) {

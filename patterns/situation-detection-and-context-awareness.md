@@ -264,4 +264,4 @@ async function processMessageWithSituations(message, userId, messageContext) {
 
 - [Context Assembly Pipeline](./context-assembly-pipeline.md)
 - [Dynamic System Prompt Composition](./dynamic-system-prompt-composition.md)
-- [Planning and Verification Layer](./planning-and-verification-layer.md)
+- [Cognitive Processing Loop](./cognitive-processing-loop.md)

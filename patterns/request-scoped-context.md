@@ -247,4 +247,4 @@ async function query({ embedding, filter, limit }) {
 
 - [Unified Event System](./unified-event-system.md)
 - [Context Assembly Pipeline](./context-assembly-pipeline.md)
-- [Audit Logging with Correlation Tracing](./audit-logging-and-correlation.md)
+- [Audit Trail with PII Sanitization](./audit-trail-with-pii-sanitization.md)

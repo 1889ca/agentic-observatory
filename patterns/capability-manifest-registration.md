@@ -144,6 +144,21 @@ async function handleEntityOperation(action, typeName, data) {
 }
 ```
 
+### Current Tool Set
+
+The registry holds 28+ tools spanning diverse domains. Current tool categories include:
+
+- **Entity management**: `entity`, `navigate`, `focus`
+- **Memory and knowledge**: `remember`, `search`
+- **Communication**: `inbox`, `message`
+- **Multi-model**: `deliberate`, `research`
+- **Media generation**: `generate-image`, `generate-video`
+- **Integrations**: `github`, `finances`, `hue-control`
+- **UI**: `widget`
+
+Each tool registers with the same Map-based registry, but category grouping in the system prompt helps the LLM reason about which tool to use for a given task.
+```
+
 ## Implications
 
 - The dual system (Map registry + entity type maps) means two places to look when debugging capability issues
@@ -191,4 +206,4 @@ The manifest registration is the _how_ (storage and lookup), while the declarati
 
 - [Declarative Capability System](./declarative-capability-system.md)
 - [Connector Registry and Capability Discovery](./connector-registry-and-capability-discovery.md)
-- [Unified Search Across KBs](./unified-search-across-kbs.md)
+- [Tools Factory and Declarative Tool Definition](./tools-factory-and-declarative-tool-definition.md)

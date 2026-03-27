@@ -300,7 +300,7 @@ const PATTERNS = [
   {
     slug: "model-selection-and-llm-fallback",
     title: "Model Selection and LLM Fallback",
-    summary: "Task-aware model routing across Claude + Gemini stack with Gemini Flash-lite as cost fallback, OpenAI disabled by default, and lazy singleton initialization with 30s timeout.",
+    summary: "Role-based model routing across Gemini (primary), Claude (complex reasoning), and OpenAI (optional) with separate models for interactive chat, background workers, and deep thinking.",
     status: "published",
   },
   {
@@ -403,6 +403,30 @@ const PATTERNS = [
     slug: "validation-and-schema-system",
     title: "Validation and Schema System",
     summary: "Zod-based schema validation with type coercion, reusable domain validators, and tool execution integration for reliable LLM-generated input handling.",
+    status: "published",
+  },
+  {
+    slug: "contradiction-detection-and-resolution",
+    title: "Contradiction Detection and Resolution",
+    summary: "Semantic similarity-based conflict detection for learned behavioral rules with majority voting and recency-weighted resolution to prevent contradictory pattern accumulation.",
+    status: "published",
+  },
+  {
+    slug: "attention-item-management",
+    title: "Attention Item Management",
+    summary: "Priority queue for items requiring user attention with urgency levels, source-based notification throttling, snooze, auto-resolution, and periodic digest generation.",
+    status: "published",
+  },
+  {
+    slug: "action-coordination-and-conflict-prevention",
+    title: "Action Coordination and Conflict Prevention",
+    summary: "Action buffer with conflict checking against pending and recent operations, type-specific conflict rules, and batch approval for preventing duplicate or contradictory agent actions.",
+    status: "published",
+  },
+  {
+    slug: "autonomy-rule-suggestion",
+    title: "Autonomy Rule Suggestion",
+    summary: "Pattern detection over historical approval decisions to suggest human-readable autonomy rules, with confidence scoring and explicit user acceptance before activation.",
     status: "published",
   },
 ];

@@ -1,119 +1,146 @@
 # Model Selection and LLM Fallback
 
-> Route requests to the best-fit model from a Claude + Gemini stack, with Gemini Flash-lite as the cost-effective fallback and OpenAI available but disabled by default.
+> Role-based model routing across a three-provider stack (Gemini primary, Claude for complex reasoning, OpenAI optional) with separate model assignments for interactive chat, background workers, and deep thinking.
 
 ## Problem
 
-Relying on a single LLM model for all tasks is wasteful and brittle. Simple tasks don't need the most capable (and expensive) model; complex tasks may produce poor results on a cheaper one. Selecting models by rote — always primary, then fallback — ignores the actual requirements of each request. And eagerly initializing all provider clients wastes resources for providers that may never be called.
+Relying on a single LLM model for all tasks is wasteful and brittle. Simple tasks don't need the most capable (and expensive) model; complex tasks may produce poor results on a cheaper one. Beyond basic cost/capability selection, different execution contexts need different models: interactive chat demands low latency, background workers prioritize cost efficiency, and deep analysis requires extended thinking capabilities. A flat model list doesn't capture these role distinctions.
 
 ## Context
 
-- Two active LLM providers: Anthropic (Claude) as primary, Google (Gemini) as fallback
+- Three LLM providers: Google (Gemini) as primary, Anthropic (Claude) for complex reasoning, OpenAI for specialized tasks
+- Distinct execution roles: interactive chat (MAIN_MODEL), background processing (WORKER_MODEL), deep analysis (THINKING_MODEL)
+- Each provider has multiple model tiers — the config assigns specific models to specific roles
 - OpenAI models exist in config but are **disabled by default** — require `RILEY_OPENAI_ENABLED=true` to activate
-- Tasks vary widely in complexity, latency requirements, and cost sensitivity
 - Provider initialization is expensive and should be deferred to first use
-- Gemini Flash-lite serves as the real cost-effective fallback, not OpenAI
-- A central config defines what models exist; a router decides which one to use
+- A central config defines role-to-model mappings; a router resolves the role at dispatch time
 
 ## Solution
 
-Split model management into two layers. A config module declares the catalog of available models — each entry specifies provider, capability tier, cost tier, context window, and an `enabled` flag. A router module accepts a task descriptor and selects the best model from enabled entries. Provider clients are initialized lazily on first use with a singleton promise guard (`modelInitPromise`) and a 30-second timeout to prevent indefinite hangs.
+The config module defines named model roles rather than a flat capability list. Each role maps to a specific model ID, and the router selects by role first, then falls back across providers if the primary fails. Provider clients are initialized lazily on first use with a singleton promise guard and a 30-second timeout.
+
+### Role-Based Model Config
 
 ```javascript
 // config/models.js — illustrative
+const MAIN_MODEL = 'gemini-2.5-flash';        // Interactive chat — fast, cost-effective
+const WORKER_MODEL = 'gemini-2.5-flash-lite';  // Background tasks — cheapest option
+const THINKING_MODEL = 'gemini-3-pro-preview'; // Deep analysis — extended thinking
+
 const MODELS = [
+  // Google (Gemini) — primary provider
   {
-    id: 'claude-sonnet',
+    id: 'gemini-2.5-flash',
+    provider: 'google',
+    role: 'main',
+    capabilities: ['reasoning', 'code', 'fast'],
+    costTier: 'low',
+    contextWindow: 1_000_000,
+    enabled: true,
+  },
+  {
+    id: 'gemini-2.5-flash-lite',
+    provider: 'google',
+    role: 'worker',
+    capabilities: ['summarization', 'classification', 'fast'],
+    costTier: 'lowest',
+    contextWindow: 1_000_000,
+    enabled: true,
+  },
+  {
+    id: 'gemini-3-pro-preview',
+    provider: 'google',
+    role: 'thinking',
+    capabilities: ['reasoning', 'analysis', 'long-context'],
+    costTier: 'medium',
+    contextWindow: 1_000_000,
+    enabled: true,
+  },
+
+  // Anthropic (Claude) — complex reasoning and code
+  {
+    id: 'claude-sonnet-4',
     provider: 'anthropic',
+    role: 'complex',
     capabilities: ['reasoning', 'long-context', 'code'],
     costTier: 'high',
     contextWindow: 200_000,
     enabled: true,
   },
   {
-    id: 'claude-haiku',
+    id: 'claude-opus-4',
     provider: 'anthropic',
+    role: 'advanced',
+    capabilities: ['reasoning', 'analysis', 'code'],
+    costTier: 'highest',
+    contextWindow: 200_000,
+    enabled: true,
+  },
+  {
+    id: 'claude-3-5-haiku',
+    provider: 'anthropic',
+    role: 'fast-reasoning',
     capabilities: ['summarization', 'classification', 'fast'],
     costTier: 'low',
     contextWindow: 200_000,
     enabled: true,
   },
-  {
-    id: 'gemini-flash',
-    provider: 'google',
-    capabilities: ['reasoning', 'code', 'fast'],
-    costTier: 'medium',
-    contextWindow: 1_000_000,
-    enabled: true,
-  },
-  {
-    id: 'gemini-flash-lite',
-    provider: 'google',
-    capabilities: ['summarization', 'classification', 'fast'],
-    costTier: 'low',
-    contextWindow: 1_000_000,
-    enabled: true,  // Real fallback for cost-sensitive tasks
-  },
+
+  // OpenAI — disabled by default
   {
     id: 'gpt-4o',
     provider: 'openai',
     capabilities: ['reasoning', 'code', 'vision'],
     costTier: 'high',
     contextWindow: 128_000,
-    enabled: process.env.RILEY_OPENAI_ENABLED === 'true',  // Disabled by default
+    enabled: process.env.RILEY_OPENAI_ENABLED === 'true',
+  },
+  {
+    id: 'o1',
+    provider: 'openai',
+    role: 'advanced',
+    capabilities: ['reasoning', 'analysis'],
+    costTier: 'highest',
+    contextWindow: 200_000,
+    enabled: process.env.RILEY_OPENAI_ENABLED === 'true',
   },
 ];
 ```
 
+### Role-Based Routing
+
+The router resolves execution context to a model role, then selects from enabled models:
+
 ```javascript
 // lib/llm/router.js — illustrative
-const { MODELS } = require('../../config/models');
-
-// Only consider enabled models
-const activeModels = () => MODELS.filter(m => m.enabled);
-
-// Lazy singleton init with concurrency guard and timeout
-let modelInitPromise = null;
-const clients = {};
-
-async function getClient(provider) {
-  if (clients[provider]) return clients[provider];
-
-  if (!modelInitPromise) {
-    modelInitPromise = Promise.race([
-      initProvider(provider),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Model init timeout (30s)')), 30_000)
-      ),
-    ]).then(client => {
-      clients[provider] = client;
-      modelInitPromise = null;
-      return client;
-    });
-  }
-
-  return modelInitPromise;
-}
-
 function selectModel(task) {
-  const candidates = activeModels().filter(m => {
-    if (task.contextLength && m.contextWindow < task.contextLength) return false;
-    if (task.speedRequired && !m.capabilities.includes('fast')) return false;
-    return true;
-  });
+  const candidates = activeModels();
 
-  if (task.costSensitive) {
-    const cheap = candidates.filter(m => m.costTier === 'low');
-    if (cheap.length) return cheap[0]; // Gemini Flash-lite typically wins here
+  // Role-based selection: worker tasks get the worker model
+  if (task.role === 'worker') {
+    return candidates.find(m => m.id === WORKER_MODEL) ?? candidates[0];
   }
 
+  // Deep thinking tasks get the thinking model
+  if (task.requiresThinking) {
+    return candidates.find(m => m.id === THINKING_MODEL) ?? candidates[0];
+  }
+
+  // Complex reasoning escalates to Claude
   if (task.complexity === 'high') {
-    return candidates.find(m => m.capabilities.includes('reasoning')) ?? candidates[0];
+    return candidates.find(m => m.role === 'complex') ?? candidates[0];
   }
 
-  return candidates[0]; // Claude Sonnet as default
+  // Default: main interactive model (Gemini Flash)
+  return candidates.find(m => m.id === MAIN_MODEL) ?? candidates[0];
 }
+```
 
+### Provider-Level Fallback
+
+When a provider fails entirely, the router falls back across providers. Gemini failure routes to Claude; Claude failure routes to Gemini. OpenAI serves as a tertiary fallback when enabled:
+
+```javascript
 async function complete(task, prompt, options = {}) {
   const model = selectModel(task);
 
@@ -121,44 +148,58 @@ async function complete(task, prompt, options = {}) {
     const client = await getClient(model.provider);
     return await client.complete(model.id, prompt, options);
   } catch (err) {
-    // Provider-level fallback: Anthropic fails → try Google (Gemini)
-    const fallbackModel = activeModels().find(
+    // Cross-provider fallback
+    const fallback = activeModels().find(
       m => m.provider !== model.provider && m.capabilities.includes('reasoning')
     );
-    if (!fallbackModel) throw err;
+    if (!fallback) throw err;
 
-    logger.warn(`Provider ${model.provider} failed, falling back to ${fallbackModel.provider}`);
-    const fallbackClient = await getClient(fallbackModel.provider);
-    return fallbackClient.complete(fallbackModel.id, prompt, options);
+    logger.warn(`${model.provider} failed, falling back to ${fallback.provider}`);
+    const client = await getClient(fallback.provider);
+    return client.complete(fallback.id, prompt, options);
   }
 }
 ```
 
 ## Implications
 
-- The active stack is Claude + Gemini — OpenAI requires explicit opt-in via environment variable
-- Gemini Flash-lite is the real cost-effective fallback for simple tasks, not GPT-4o-mini
-- The config/router split means adding a new model requires only a catalog entry with `enabled: true`
-- Task-based selection forces callers to describe requirements, not model names
-- Provider-level fallback is coarser than model-level: the entire provider must fail before fallback activates
-- Lazy init with `modelInitPromise` singleton prevents duplicate initialization; 30-second timeout prevents indefinite hangs on first use
-- The `enabled` flag pattern allows models to exist in config for easy activation without code changes
+- Gemini is the primary provider for both interactive and worker tasks — Claude handles complex reasoning escalation
+- The worker model (Flash-lite) is distinct from the main model (Flash), enabling cost optimization for background processing without affecting chat quality
+- The thinking model (Gemini 3 Pro) is a separate role for deep analysis, not just a "bigger" version of the main model
+- Three-provider stack provides resilience: Google down → Anthropic fallback → OpenAI tertiary (if enabled)
+- Role-based selection means callers specify intent (`worker`, `thinking`, `complex`) rather than model names
+- Lazy init with singleton promise guard prevents duplicate initialization; 30-second timeout prevents indefinite hangs
+- OpenAI requires explicit opt-in via `RILEY_OPENAI_ENABLED=true` — kept in config for easy activation
 
 ## Code Example
 
 ```javascript
-// High-complexity task — routes to Claude Sonnet
-const result = await router.complete(
-  { complexity: 'high', costSensitive: false, contextLength: 50_000 },
-  'Analyze this codebase and identify architectural risks',
+// Interactive chat — routes to Gemini 2.5 Flash
+const reply = await router.complete(
+  { role: 'main' },
+  'What meetings do I have today?',
+  { maxTokens: 512 }
+);
+
+// Background worker task — routes to Gemini 2.5 Flash-lite
+const summary = await router.complete(
+  { role: 'worker', costSensitive: true },
+  'Summarize these 50 support tickets',
+  { maxTokens: 256 }
+);
+
+// Complex reasoning — escalates to Claude Sonnet
+const analysis = await router.complete(
+  { complexity: 'high' },
+  'Analyze this codebase architecture and identify coupling risks',
   { maxTokens: 2048 }
 );
 
-// Cost-sensitive task — routes to Gemini Flash-lite
-const summary = await router.complete(
-  { complexity: 'low', costSensitive: true, speedRequired: true },
-  'Summarize this support ticket in one sentence',
-  { maxTokens: 128 }
+// Deep thinking — routes to Gemini 3 Pro preview
+const strategy = await router.complete(
+  { requiresThinking: true },
+  'Design a migration plan for moving from monolith to microservices',
+  { maxTokens: 4096 }
 );
 ```
 
@@ -166,4 +207,4 @@ const summary = await router.complete(
 
 - [Graceful Degradation and Optional Init](./graceful-degradation-and-optional-init.md)
 - [Error Triage and Recovery](./error-triage-and-recovery.md)
-- [Lazy Model Initialization](./lazy-model-initialization.md)
+- [LLM Adapter Facade](./llm-adapter-facade.md)

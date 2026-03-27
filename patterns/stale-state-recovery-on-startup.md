@@ -71,6 +71,5 @@ async function bootstrap() {
 
 ## Related Patterns
 
-- [Graceful Shutdown Ordering](./graceful-shutdown-ordering.md)
 - [Distributed Job Locking](./distributed-job-locking.md)
 - [Task Lifecycle and State Machine](./task-lifecycle-and-state-machine.md)
