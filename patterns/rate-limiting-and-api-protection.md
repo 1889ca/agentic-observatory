@@ -1,276 +1,227 @@
 # Rate Limiting and API Protection
 
-> Auto-applied sliding window rate limiter on `/api/*` routes with per-endpoint configurable thresholds, custom key extraction, and Redis-backed or in-memory storage.
+> In-memory timestamp-array rate limiter with standard and heavy endpoint tiers, burst detection, configurable window/max via environment, and automatic periodic cleanup.
 
 ## Problem
 
-Without rate limiting, an API is vulnerable to both accidental and intentional abuse. A chatty client with a retry loop can saturate the server. A misconfigured webhook can fire hundreds of requests per second. An attacker can brute-force authentication endpoints. Even well-meaning internal clients can cause cascading failures by hammering expensive endpoints during peak load. The server has no way to push back — it either processes every request or crashes trying.
+Without rate limiting, an API is vulnerable to both accidental and intentional abuse. A chatty client with a retry loop can saturate the server. A misconfigured webhook can fire hundreds of requests per second. Even well-meaning internal clients can cause cascading failures by hammering expensive endpoints during peak load. The server has no way to push back — it either processes every request or crashes trying.
 
 ## Context
 
-- A Node.js API server exposing `/api/*` routes that serve both internal agents and external integrations
-- Different endpoints have different cost profiles — a health check is cheap, a full analysis endpoint is expensive
-- Clients may be identified by IP address, API key, or authenticated user ID
-- Redis may or may not be available — rate limiting must work in both cases
+- A Node.js API server exposing routes that serve both internal agents and external integrations
+- Different endpoints have different cost profiles — a health check is cheap, a vector search or chat endpoint is expensive
+- Clients are identified by IP address combined with tenant ID
 - The system should communicate limits clearly via standard HTTP headers so clients can self-regulate
-- Rate limiting applies automatically to all API routes without requiring per-route opt-in
+- Rate limiting uses in-memory storage only — no Redis dependency for this layer
 
 ## Solution
 
-### Sliding Window Counter
+### Timestamp-Array Sliding Window
 
-The rate limiter uses a sliding window algorithm. Each request increments a counter keyed by the client identifier and the current time window. The window slides by tracking requests in both the current and previous window, interpolating the count:
+The rate limiter stores an array of request timestamps per client identifier. On each request, timestamps older than the window are pruned, and the array length is compared against the maximum. This is simpler than interpolated sliding windows — it tracks actual requests, not estimates:
 
-```typescript
-// lib/server/rate-limit.ts
-interface WindowState {
-  count: number;
-  windowStart: number;
-}
+```javascript
+// lib/server/rate-limit.js
+const limitStore = new Map()
 
-interface RateLimitResult {
-  allowed: boolean;
-  remaining: number;
-  resetAt: number;
-  retryAfter?: number;
-}
-
-function checkSlidingWindow(
-  current: WindowState,
-  previous: WindowState,
-  windowMs: number,
-  maxRequests: number
-): RateLimitResult {
-  const now = Date.now();
-  const windowElapsed = now - current.windowStart;
-  const windowFraction = windowElapsed / windowMs;
-
-  // Weighted count: full current window + proportional previous window
-  const estimatedCount =
-    current.count + previous.count * (1 - windowFraction);
-
-  const resetAt = current.windowStart + windowMs;
-
-  if (estimatedCount >= maxRequests) {
-    return {
-      allowed: false,
-      remaining: 0,
-      resetAt,
-      retryAfter: Math.ceil((resetAt - now) / 1000),
-    };
+function getEntry(identifier) {
+  let entry = limitStore.get(identifier)
+  if (!entry) {
+    entry = { requests: [], windowStart: Date.now() }
+    limitStore.set(identifier, entry)
   }
+  return entry
+}
 
-  return {
-    allowed: true,
-    remaining: Math.max(0, Math.floor(maxRequests - estimatedCount - 1)),
-    resetAt,
-  };
+function cleanEntry(entry, windowMs) {
+  const cutoff = Date.now() - windowMs
+  entry.requests = entry.requests.filter((r) => r.timestamp > cutoff)
 }
 ```
 
-### Per-Endpoint Configuration
+### Standard vs. Heavy Endpoint Model
 
-Each endpoint can specify its own limits. Unconfigured endpoints fall back to sensible defaults. Configuration is declarative:
+Rather than per-endpoint configuration maps, the limiter uses two tiers: standard and heavy. Heavy endpoints are explicitly listed — everything else gets standard limits:
 
-```typescript
-interface EndpointLimit {
-  maxRequests: number;
-  windowMs: number;
-  keyExtractor?: (req: Request) => string;
+```javascript
+// lib/server/rate-limit.js
+const HEAVY_ENDPOINTS = [
+  '/api/search',
+  '/api/context',
+  '/api/embedding',
+  '/api/documents/search',
+  '/api/memory/search',
+  '/api/chat',
+]
+
+function isHeavyEndpoint(path) {
+  return HEAVY_ENDPOINTS.some((ep) => path.startsWith(ep))
 }
+```
 
-const ENDPOINT_LIMITS: Record<string, EndpointLimit> = {
-  'POST /api/message': {
-    maxRequests: 30,
-    windowMs: 60_000,       // 30 per minute
-  },
-  'POST /api/flows': {
-    maxRequests: 5,
-    windowMs: 60_000,       // 5 per minute — expensive operation
-  },
-  'GET /api/health': {
-    maxRequests: 120,
-    windowMs: 60_000,       // 120 per minute — cheap, called often
-  },
-  'POST /api/hivemind': {
-    maxRequests: 3,
-    windowMs: 300_000,      // 3 per 5 minutes — very expensive
-    keyExtractor: (req) => req.headers['x-api-key'] as string || getClientIp(req),
-  },
-};
+Limits are configured via environment variables through the central config module: `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX_REQUESTS`, `RATE_LIMIT_HEAVY_MAX`, and `RATE_LIMIT_BURST_MAX`.
 
-const DEFAULT_LIMIT: EndpointLimit = {
-  maxRequests: 60,
-  windowMs: 60_000,         // 60 per minute default
-};
+### Burst Detection
 
-function getLimitConfig(method: string, path: string): EndpointLimit {
-  // Try exact match first
-  const exact = ENDPOINT_LIMITS[`${method} ${path}`];
-  if (exact) return exact;
+In addition to the main window check, the limiter tracks a 5-second burst window. Even if a client is under the per-minute limit, sending too many requests in a 5-second burst triggers a 429:
 
-  // Try pattern match (e.g., 'GET /api/tasks/:id' matches 'GET /api/tasks/abc')
-  for (const [pattern, config] of Object.entries(ENDPOINT_LIMITS)) {
-    const [patternMethod, patternPath] = pattern.split(' ');
-    if (patternMethod === method && matchRoute(patternPath, path)) {
-      return config;
+```javascript
+// lib/server/rate-limit.js
+function checkBurst(entry) {
+  const burstWindow = 5000 // 5 seconds
+  const cutoff = Date.now() - burstWindow
+  const recentRequests = entry.requests.filter((r) => r.timestamp > cutoff)
+  return recentRequests.length
+}
+```
+
+### Configurable Limiter Factory
+
+The `createLimiter` factory produces middleware with configurable parameters. Two pre-built instances cover the common cases, and an `autoLimiter` selects between them based on the request path:
+
+```javascript
+// lib/server/rate-limit.js
+function createLimiter(options = {}) {
+  const windowMs = options.windowMs || RATE_LIMIT_WINDOW_MS
+  const maxRequests = options.heavy
+    ? RATE_LIMIT_HEAVY_MAX
+    : (options.max || RATE_LIMIT_MAX_REQUESTS)
+  const burstMax = options.burstMax || RATE_LIMIT_BURST_MAX
+
+  return (req, res, next) => {
+    if (!RATE_LIMIT_ENABLED) return next()
+    if (req.path === '/health' || req.path === '/health/role') return next()
+
+    const identifier = getIdentifier(req)
+    const entry = getEntry(identifier)
+    cleanEntry(entry, windowMs)
+
+    // Check window limit
+    if (entry.requests.length >= maxRequests) {
+      const retryAfter = Math.ceil(
+        (entry.requests[0].timestamp + windowMs - Date.now()) / 1000
+      )
+      res.set('Retry-After', String(retryAfter))
+      res.set('X-RateLimit-Limit', String(maxRequests))
+      res.set('X-RateLimit-Remaining', '0')
+      return res.status(429).json({
+        error: 'Too many requests',
+        retryAfter,
+        limit: maxRequests,
+        window: windowMs / 1000,
+      })
     }
-  }
 
-  return DEFAULT_LIMIT;
+    // Check burst limit
+    if (checkBurst(entry) >= burstMax) {
+      res.set('Retry-After', '5')
+      return res.status(429).json({
+        error: 'Burst limit exceeded',
+        retryAfter: 5,
+        burstLimit: burstMax,
+      })
+    }
+
+    entry.requests.push({ timestamp: Date.now() })
+    res.set('X-RateLimit-Limit', String(maxRequests))
+    res.set('X-RateLimit-Remaining', String(maxRequests - entry.requests.length))
+    next()
+  }
+}
+
+const standardLimiter = createLimiter()
+const heavyLimiter = createLimiter({ heavy: true })
+
+function autoLimiter(req, res, next) {
+  if (!RATE_LIMIT_ENABLED) return next()
+  const limiter = isHeavyEndpoint(req.path) ? heavyLimiter : standardLimiter
+  return limiter(req, res, next)
 }
 ```
 
-### Key Extraction
+### Client Identification
 
-The rate limit key determines what "identity" is being limited. Different endpoints may use different keys — IP address for unauthenticated routes, API key for authenticated ones:
+Rate limit keys combine IP address and tenant ID, allowing per-tenant limits even when requests come from the same IP:
 
-```typescript
-function defaultKeyExtractor(req: Request): string {
-  // Prefer API key if present
-  const apiKey = req.headers['x-api-key'] as string;
-  if (apiKey) return `key:${apiKey}`;
-
-  // Fall back to IP
-  return `ip:${getClientIp(req)}`;
-}
-
-function getClientIp(req: Request): string {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string') {
-    return forwarded.split(',')[0].trim();
-  }
-  return req.socket.remoteAddress || 'unknown';
+```javascript
+// lib/server/rate-limit.js
+function getIdentifier(req) {
+  const ip = req.ip || req.connection?.remoteAddress || 'unknown'
+  const tenantId = req.query?.tenantId || req.body?.tenantId || 'default'
+  return `${ip}:${tenantId}`
 }
 ```
 
-### Storage Backend: Redis or In-Memory
+### Periodic Cleanup
 
-The limiter uses Redis when available for distributed rate limiting across instances, falling back to an in-memory store for single-instance deployments:
+A background interval cleans up stale entries every 5 minutes to prevent unbounded memory growth. The interval is `unref()`-ed so it does not keep the process alive:
 
-```typescript
-import { cacheGet, cacheSet, isEnabled as redisEnabled } from '../redis';
+```javascript
+// lib/server/rate-limit.js
+const CLEANUP_INTERVAL = 5 * 60 * 1000
 
-const localWindows = new Map<string, WindowState>();
-
-async function getWindow(key: string): Promise<WindowState> {
-  if (redisEnabled()) {
-    const data = await cacheGet(key);
-    if (data) return JSON.parse(data);
-  } else {
-    const local = localWindows.get(key);
-    if (local) return local;
-  }
-
-  return { count: 0, windowStart: Date.now() };
-}
-
-async function saveWindow(key: string, state: WindowState, ttlMs: number): Promise<void> {
-  if (redisEnabled()) {
-    await cacheSet(key, JSON.stringify(state), ttlMs);
-  } else {
-    localWindows.set(key, state);
-  }
-}
-```
-
-### Middleware Application
-
-The rate limiter attaches as Express middleware to all `/api/*` routes. It runs before route handlers, rejecting over-limit requests early:
-
-```typescript
-function rateLimitMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const config = getLimitConfig(req.method, req.path);
-  const keyExtractor = config.keyExtractor || defaultKeyExtractor;
-  const clientKey = keyExtractor(req);
-  const windowKey = `ratelimit:${req.method}:${req.path}:${clientKey}`;
-
-  processRateLimit(windowKey, config)
-    .then((result) => {
-      // Always set rate limit headers
-      res.set('X-RateLimit-Limit', String(config.maxRequests));
-      res.set('X-RateLimit-Remaining', String(result.remaining));
-      res.set('X-RateLimit-Reset', String(Math.ceil(result.resetAt / 1000)));
-
-      if (!result.allowed) {
-        res.set('Retry-After', String(result.retryAfter));
-        res.status(429).json({
-          error: 'Too Many Requests',
-          retryAfter: result.retryAfter,
-          message: `Rate limit exceeded. Try again in ${result.retryAfter} seconds.`,
-        });
-        return;
+function startCleanup() {
+  const interval = setInterval(() => {
+    const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS * 2
+    for (const [key, entry] of limitStore) {
+      if (entry.requests.length === 0 ||
+          entry.requests.every((r) => r.timestamp < cutoff)) {
+        limitStore.delete(key)
       }
-
-      next();
-    })
-    .catch((err) => {
-      // Rate limiter failure should not block requests
-      logger.warn({ err }, 'Rate limiter error — allowing request');
-      next();
-    });
+    }
+  }, CLEANUP_INTERVAL)
+  interval.unref?.()
 }
 
-// Auto-apply to all API routes
-app.use('/api/*', rateLimitMiddleware);
+startCleanup() // Starts on module load
 ```
 
-### In-Memory Cleanup
+### Monitoring
 
-Without periodic cleanup, the in-memory store grows unbounded. A sweep removes expired windows:
+The module exposes stats for the ops metrics system:
 
-```typescript
-setInterval(() => {
-  const now = Date.now();
-  let cleaned = 0;
-
-  for (const [key, state] of localWindows) {
-    // Remove windows older than 2x the largest configured window
-    if (now - state.windowStart > 600_000) {
-      localWindows.delete(key);
-      cleaned++;
-    }
+```javascript
+// lib/server/rate-limit.js
+function getStats() {
+  return {
+    activeClients: limitStore.size,
+    totalRequests: /* sum of all entry request counts */,
+    heavyEndpointLimit: RATE_LIMIT_HEAVY_MAX,
+    standardLimit: RATE_LIMIT_MAX_REQUESTS,
+    windowMs: RATE_LIMIT_WINDOW_MS,
   }
-
-  if (cleaned > 0) {
-    logger.debug({ cleaned, remaining: localWindows.size }, 'Rate limit window cleanup');
-  }
-}, 300_000); // Every 5 minutes
+}
 ```
 
 ## Implications
 
-- Auto-application means new API routes get rate limiting by default — no developer can forget to add it
-- The sliding window avoids the "burst at window boundary" problem that fixed windows have (where a client sends max requests at the end of one window and the start of the next)
-- Per-endpoint configuration requires maintenance — adding a new expensive endpoint means adding a limit entry
-- In-memory storage means rate limits are per-instance, not global — a client hitting different instances gets N times the limit. Redis fixes this.
-- The fail-open design (allowing requests when the rate limiter errors) prioritizes availability over protection — acceptable for most internal APIs, may need reconsideration for public-facing ones
-- Standard HTTP headers (`X-RateLimit-*`, `Retry-After`) let well-behaved clients self-regulate without parsing response bodies
-- Key extraction by IP can be inaccurate behind shared proxies or NAT — API key-based limiting is more precise for authenticated endpoints
+- The timestamp-array approach is exact, not estimated — there is no interpolation error at window boundaries, but memory usage scales linearly with request rate per client
+- Two tiers (standard/heavy) is simpler than per-endpoint configuration but less granular — adding a new expensive endpoint means adding it to the `HEAVY_ENDPOINTS` array
+- In-memory storage means rate limits are per-instance — a client hitting different instances behind a load balancer gets N times the limit. This is acceptable for the current deployment model.
+- Health check endpoints are explicitly excluded to prevent load balancer probes from consuming rate limit budget
+- Burst detection catches abusive patterns that stay under the per-minute limit — a client sending 50 requests in 1 second would hit the burst limit even if the per-minute limit is 100
+- The `RATE_LIMIT_ENABLED` flag allows disabling rate limiting entirely in development or testing
+- Standard HTTP headers (`X-RateLimit-*`, `Retry-After`) let well-behaved clients self-regulate
 
 ## Code Example
 
-```typescript
-// Adding a custom limit for a new expensive endpoint
-ENDPOINT_LIMITS['POST /api/satellite/deploy'] = {
-  maxRequests: 2,
-  windowMs: 600_000,        // 2 per 10 minutes
-  keyExtractor: (req) => {
-    // Rate limit by satellite ID, not by IP
-    return `satellite:${req.body?.satelliteId || 'unknown'}`;
-  },
-};
+```javascript
+// Applying the auto-limiter to all API routes
+const { autoLimiter } = require('./rate-limit')
+app.use('/api', autoLimiter)
 
-// The endpoint itself doesn't need to know about rate limiting —
-// the middleware handles it automatically
-app.post('/api/satellite/deploy', async (req, res) => {
-  const result = await deploySatellite(req.body);
-  res.json(result);
-});
+// Custom limiter for a specific route
+const { createLimiter } = require('./rate-limit')
+const strictLimiter = createLimiter({ max: 5, windowMs: 60000, burstMax: 3 })
+app.post('/api/deploy', strictLimiter, deployHandler)
+
+// Monitoring integration
+const { getStats } = require('./rate-limit')
+// getStats() returns: { activeClients: 12, totalRequests: 847, ... }
 ```
 
 ## Related Patterns
 
 - [Redis Optional Caching and Clustering](./redis-optional-caching-and-clustering.md)
+- [Ops Metrics and Health Monitoring](./ops-metrics-and-health-monitoring.md)
 - [Graceful Degradation and Optional Init](./graceful-degradation-and-optional-init.md)
-- [Channel Adapter Architecture](./channel-adapter-architecture.md)

@@ -1,119 +1,241 @@
 # Audit Trail with PII Sanitization
 
-> Correlation-ID traced audit logging with batched non-blocking persistence and PII scrubbing before any data reaches the database.
+> Correlation-ID traced audit logging with 5-second batched non-blocking persistence to S3-compatible storage, and PII scrubbing using `.includes()` substring matching against a sensitive key list with long string truncation.
 
 ## Problem
 
-Without structured audit logging, reconstructing what happened during a multi-step orchestration is guesswork. Naively logging everything creates a different problem: sensitive user data accumulates in audit tables over time, creating compliance risk. Per-event synchronous writes compound this by adding latency to every operation in the main path.
+Without structured audit logging, reconstructing what happened during a multi-step orchestration is guesswork. Naively logging everything creates a different problem: sensitive user data accumulates in audit stores over time, creating compliance risk. Per-event synchronous writes compound this by adding latency to every operation in the main path.
 
 ## Context
 
-This pattern applies to any orchestration system that needs a tamper-evident record of actions across async chains — especially when those actions involve user-provided input that may contain emails, phone numbers, or other PII. It is the foundation for debugging, compliance reporting, and post-incident analysis.
+This pattern applies to any orchestration system that needs a tamper-evident record of actions across async chains — especially when those actions involve user-provided input that may contain tokens, passwords, or API keys. It is the foundation for debugging, compliance reporting, and post-incident analysis.
 
 ## Solution
 
-Every action is tagged with a correlation ID at the entry point (HTTP request, webhook, socket event) and that ID is propagated through the entire async chain via a request-scoped context object. Before any audit entry is written, a scrubbing pass detects and redacts sensitive fields using key-based redaction. Writes are batched and flushed on an interval rather than on each event, so audit logging is never in the critical path.
+### Architecture
 
-The flow:
+The audit system is split across multiple files with clear responsibilities:
 
-1. Entry point generates or receives a correlation ID and attaches it to the async context.
-2. Every `audit.log(action, payload)` call pulls the current correlation ID from context automatically.
-3. The payload passes through the PII scrubber before being enqueued.
-4. A background flush loop drains the queue in batches to the database.
+- `config.js` — timing, thresholds, and sensitive key lists
+- `state.js` — S3 client initialization and shared buffer
+- `core.js` — the main `log()` function and correlation ID generation
+- `sanitize.js` — PII scrubbing and value truncation
+- `storage.js` — batch flush to S3-compatible storage
+- `tracking.js` — tool, job, and request execution wrappers
+- `alerts.js` — error rate monitoring
+- `maintenance.js` — log cleanup and error pattern analysis
 
-```js
-// lib/audit/index.js
+### Correlation ID Propagation
 
-const { getContext } = require('../context');
-const { scrubPII } = require('./scrubber');
-const { flushBatch } = require('./persistence');
+Every audit entry pulls its correlation ID from three sources in priority order: explicit option, data payload, or the request-scoped `AsyncLocalStorage` context:
 
-const queue = [];
-const FLUSH_INTERVAL_MS = 2000;
-const BATCH_SIZE = 50;
+```javascript
+// lib/audit/core.js
+function log(operation, data = {}, options = {}) {
+  if (!state.isEnabled()) return null;
 
-function log(action, payload = {}) {
-  const { correlationId, tenantId, userId } = getContext();
+  const corrId =
+    options.correlationId ||
+    data.correlationId ||
+    requestContext.getCorrelationId();
+
   const entry = {
-    correlationId,
-    tenantId,
-    userId,
-    action,
-    payload: scrubPII(payload),
-    ts: Date.now(),
+    id: `aud_${ulid()}`,
+    ts: new Date().toISOString(),
+    op: operation,
+    comp: options.component || inferComponent(operation),
+    status: options.status || 'ok',
+    corrId,
+    sessId: options.sessionId || requestContext.getUserId() || 'web_user',
+    durMs: options.durationMs,
+    err: options.error,
+    data: sanitize(data),
   };
-  queue.push(entry);
-}
 
-setInterval(() => {
-  if (queue.length === 0) return;
-  const batch = queue.splice(0, BATCH_SIZE);
-  flushBatch(batch).catch(err => {
-    // Re-queue on transient failure; drop on persistent failure to avoid memory leak
-    if (err.transient) queue.unshift(...batch);
-  });
-}, FLUSH_INTERVAL_MS);
+  buffer.push(entry);
 
-module.exports = { log };
-```
-
-```js
-// lib/audit/scrubber.js
-
-const SENSITIVE_KEYS = new Set([
-  'password', 'secret', 'token', 'apiKey', 'api_key',
-  'authorization', 'credential', 'credentials',
-  'accessToken', 'access_token', 'refreshToken', 'refresh_token',
-  'privateKey', 'private_key',
-]);
-
-function isSensitiveKey(key) {
-  return SENSITIVE_KEYS.has(key) ||
-    SENSITIVE_KEYS.has(key.toLowerCase());
-}
-
-function scrubPII(obj) {
-  if (typeof obj === 'string') return obj;
-  if (Array.isArray(obj)) return obj.map(scrubPII);
-  if (obj && typeof obj === 'object') {
-    return Object.fromEntries(
-      Object.entries(obj).map(([k, v]) =>
-        [k, isSensitiveKey(k) ? '[REDACTED]' : scrubPII(v)]
-      )
-    );
+  // Flush if buffer is full or on error
+  if (buffer.length >= MAX_BUFFER_SIZE || options.status === 'error') {
+    flushFn();
   }
-  return obj;
 }
-
-module.exports = { scrubPII };
 ```
 
-> **Note:** Regex-based PII scrubbing (matching emails, phone numbers, SSNs within string values) is a natural extension of this pattern but is not currently implemented. The actual scrubber uses key-based redaction — checking whether object keys match a sensitive-key list and replacing their values wholesale. This is simpler and avoids regex false-positive issues, but does not catch PII embedded in free-text string values.
+The component is inferred from the operation string by splitting on `:` — `tool:execute` infers component `tool`.
 
-Retention is configured per-action-type. A background job enforces TTLs, deleting entries older than the configured window for each action class.
+### PII Scrubbing with Substring Matching
+
+The scrubber uses `.includes()` substring matching against a sensitive key list — not exact `Set.has()` matching. This means `apiKey`, `myApiKey`, and `api_key_backup` all get redacted because they contain a sensitive substring:
+
+```javascript
+// lib/audit/sanitize.js
+const SENSITIVE_KEYS = [
+  'password', 'token', 'secret', 'apiKey', 'api_key',
+  'accessToken', 'refreshToken', 'authorization',
+  'cookie', 'session', 'credential', 'private',
+];
+
+function sanitize(data) {
+  if (!data || typeof data !== 'object') return data;
+
+  const sanitized = Array.isArray(data) ? [] : {};
+
+  for (const [key, value] of Object.entries(data)) {
+    const lowerKey = key.toLowerCase();
+
+    // Redact if key contains any sensitive substring
+    if (SENSITIVE_KEYS.some(sensitive => lowerKey.includes(sensitive))) {
+      sanitized[key] = '[REDACTED]';
+      continue;
+    }
+
+    // Recurse into nested objects
+    if (typeof value === 'object' && value !== null) {
+      sanitized[key] = sanitize(value);
+      continue;
+    }
+
+    // Truncate long strings
+    if (typeof value === 'string' && value.length > 500) {
+      sanitized[key] = value.slice(0, 500) + '...[truncated]';
+      continue;
+    }
+
+    sanitized[key] = value;
+  }
+  return sanitized;
+}
+```
+
+Key design decisions:
+- **Substring matching** (`.includes()`) catches variants like `myAccessToken`, `x_api_key`, `privateData` without maintaining an exhaustive list
+- **Long string truncation** at 500 characters prevents large payloads from bloating audit storage
+- **Recursive traversal** scrubs nested objects — PII hiding in deeply nested structures is still caught
+- **Array support** — arrays are scrubbed element by element
+
+### Tool Argument Summarization
+
+A separate summarizer truncates tool arguments more aggressively for log readability:
+
+```javascript
+function summarizeArgs(args) {
+  const summary = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (typeof value === 'string' && value.length > 200) {
+      summary[key] = value.slice(0, 200) + '...[truncated]';
+    } else if (Array.isArray(value)) {
+      summary[key] = `[Array(${value.length})]`;
+    } else if (typeof value === 'object' && value !== null) {
+      summary[key] = '{Object}';
+    } else {
+      summary[key] = value;
+    }
+  }
+  return summary;
+}
+```
+
+### Batched Non-Blocking Persistence
+
+The flush interval is **5000ms** (5 seconds), with a maximum buffer size of 50 entries that triggers an immediate flush:
+
+```javascript
+// lib/audit/config.js
+const FLUSH_INTERVAL = 5000;    // 5 seconds
+const MAX_BUFFER_SIZE = 50;     // Immediate flush threshold
+
+// lib/audit/state.js
+function init(flushFn) {
+  // Initialize S3-compatible client (DigitalOcean Spaces)
+  s3Client = new S3Client({
+    endpoint: `https://${spacesRegion}.digitaloceanspaces.com`,
+    region: spacesRegion,
+    credentials: { accessKeyId: spacesKey, secretAccessKey: spacesSecret },
+  });
+
+  flushTimer = setInterval(() => flushFn(), FLUSH_INTERVAL);
+
+  // Flush on exit signals
+  process.on('beforeExit', () => flushFn());
+  process.on('SIGTERM', () => flushFn());
+  process.on('SIGINT', () => flushFn());
+}
+```
+
+### Execution Tracking Wrappers
+
+The tracking module provides timing wrappers for tools, jobs, and requests:
+
+```javascript
+// lib/audit/tracking.js
+async function trackTool(correlationId, toolName, fn) {
+  const start = Date.now();
+  try {
+    const result = await fn();
+    log('tool:execute', { toolName, success: true }, {
+      correlationId, durationMs: Date.now() - start,
+    });
+    return result;
+  } catch (err) {
+    log('tool:execute', { toolName, success: false }, {
+      correlationId, durationMs: Date.now() - start,
+      status: 'error', error: err.message,
+    });
+    throw err;
+  }
+}
+
+async function trackJob(jobName, fn) {
+  const start = Date.now();
+  log('job:start', { jobName });
+  try {
+    const result = await fn();
+    log('job:complete', { jobName }, { durationMs: Date.now() - start });
+    return result;
+  } catch (err) {
+    log('job:error', { jobName }, {
+      durationMs: Date.now() - start, status: 'error', error: err.message,
+    });
+    throw err;
+  }
+}
+```
 
 ## Implications
 
-- Audit entries are eventually consistent — the flush interval means a crash within the window can lose the last batch. This is acceptable for most orchestration use cases; use synchronous writes only for legally mandated events.
-- Key-based redaction catches structured sensitive fields (passwords, tokens, API keys) but does not scrub PII embedded in free-text string values. If free-text fields may contain emails, phone numbers, or SSNs, an additional regex-based scrubbing layer should be added.
-- Key-based redaction has no false-positive risk on values but depends on maintaining a complete sensitive-key list. New sensitive field names must be added to the list as the schema evolves.
-- Batching decouples audit throughput from DB throughput, enabling high-frequency orchestration without DB saturation.
-- The correlation ID enables full trace reconstruction across services, which is the primary value of this pattern for debugging.
+- The 5-second flush interval (not 2 seconds) means a crash within that window loses at most 5 seconds of audit data — acceptable for most orchestration use cases
+- Substring matching (`.includes()`) is broader than exact key matching — `myAccessToken` is caught because `accesstoken` (lowercased) contains `token`. This trades some false positive risk on unusual keys for much better coverage
+- Long string truncation at 500 characters prevents large LLM responses or base64 payloads from filling audit storage
+- The S3-compatible storage (DigitalOcean Spaces) means audit logs are durable and queryable via prefix scanning
+- Error entries trigger immediate flush (`buffer.length >= MAX_BUFFER_SIZE || options.status === 'error'`) so errors are never lost to buffering
+- The 30-day retention (`RETENTION_DAYS = 30`) is enforced by a background maintenance job
+- Alert thresholds (5 errors in 10 minutes) enable automated error rate monitoring
 
 ## Code Example
 
-```js
-const audit = require('../lib/audit');
+```javascript
+const audit = require('./lib/audit');
 
-async function handleWebhook(req, res) {
-  // correlationId is already in context from middleware
-  audit.log('webhook.received', { source: req.body.source, event: req.body.event });
+// Simple logging with auto-correlation
+audit.log('webhook.received', { source: 'github', event: 'push' });
 
-  await processEvent(req.body);
+// Tool execution tracking (auto-timed)
+const result = await audit.trackTool('req_123', 'search_google', async () => {
+  return await executeSearchGoogle(args);
+});
 
-  audit.log('webhook.processed', { outcome: 'success' });
-  res.sendStatus(200);
-}
+// Job execution tracking
+await audit.trackJob('morning-routine', async () => {
+  await runMorningRoutine();
+});
+
+// Sanitization example
+audit.sanitize({
+  user: 'mike',
+  apiKey: 'sk-1234',           // → '[REDACTED]' (contains 'apikey')
+  myAccessToken: 'abc',        // → '[REDACTED]' (contains 'accesstoken')
+  description: 'x'.repeat(600) // → truncated to 500 chars + '...[truncated]'
+});
 ```
 
 ## Related Patterns

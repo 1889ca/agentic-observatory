@@ -1,189 +1,315 @@
 # Ops Metrics and Health Monitoring
 
-> In-process collection of event loop lag, per-endpoint latency histograms, and vector operation counters, surfaced through a single health check endpoint that aggregates subsystem status without any external metrics infrastructure.
+> Dedicated `lib/ops/metrics.js` module using `perf_hooks` for high-resolution timing, time-windowed sample buffers with configurable retention, and per-route/DB/job/dispatcher/vector metrics aggregated into a single snapshot.
 
 ## Problem
 
-Observability for a Node.js service is often treated as an afterthought — a Prometheus sidecar, a StatsD daemon, or an APM agent bolted on later. But external agents add operational complexity and create gaps: if the process is stalling under backpressure, the external agent may report it as healthy because the health probe itself timed out gracefully. Latency regressions in specific endpoints are invisible if you only track aggregate response time. And embedding pipeline health — whether embeddings are being generated at all — is completely unobservable unless you instrument it explicitly.
-
-The opposite failure mode is over-instrumentation: pulling in a full metrics library for a service that only needs to answer "is this healthy and is it keeping up?"
+Observability for a Node.js service is often treated as an afterthought — a Prometheus sidecar or APM agent bolted on later. But external agents add operational complexity and create gaps: if the process is stalling under backpressure, the external agent may report it as healthy because the health probe itself timed out gracefully. Latency regressions in specific routes are invisible if you only track aggregate response time. And internal subsystem health — database query speed, job execution duration, vector search latency — is completely unobservable unless instrumented explicitly.
 
 ## Context
 
-- A Node.js/Express API that fronts a vector database, Redis cache, and one or more LLM providers
-- The embedding pipeline runs as part of request handling, not as a separate process, so its throughput is invisible to infrastructure-level monitors
-- Event loop lag is the most important early indicator of overload, but Node's single-threaded model makes it impossible for the process itself to reliably detect stalls without a dedicated interval
-- Teams want a single `/health` endpoint CI/CD and load balancers can poll — not a metrics scrape endpoint requiring a separate collection stack
-- Latency data must survive restarts without a persistent store, so it is held in a rolling in-process buffer
+- A Node.js/Express API that fronts a PostgreSQL database, Redis cache, embedding pipeline, worker dispatcher, and job scheduler
+- Event loop lag is the most important early indicator of overload
+- Teams want a single `/ops/metrics` endpoint that returns a comprehensive snapshot — not a scrape endpoint requiring a separate collection stack
+- Latency data must survive within a process session without a persistent store, held in rolling in-process buffers
+- Different subsystems need different sample retention — HTTP requests need more samples than queue depth checks
 
 ## Solution
 
-### Event Loop Lag Tracking
+### Windowed Sample Buffers
 
-A recurring `setInterval` fires on a known interval. By comparing when the callback actually executes to when it was scheduled, the middleware derives lag — the amount of time the event loop was blocked between ticks:
-
-```javascript
-// lib/server/middleware.js
-// Tracks how late the event loop timer fires relative to its scheduled interval
-const INTERVAL_MS = 100;
-let lastTick = Date.now();
-let currentLagMs = 0;
-
-setInterval(() => {
-  const now = Date.now();
-  currentLagMs = Math.max(0, now - lastTick - INTERVAL_MS);
-  lastTick = now;
-}, INTERVAL_MS).unref(); // .unref() so this interval doesn't keep the process alive
-```
-
-`.unref()` is essential — without it the process will not exit cleanly when the main workload is done.
-
-### Per-Endpoint Latency Histograms
-
-The Express middleware attaches a start timestamp to each request. On the response `finish` event, it computes duration and appends it to a per-endpoint ring buffer. p50/p95/p99 are computed on demand from the buffer:
+The metrics module (`lib/ops/metrics.js`) uses a `makeWindow()` factory that creates time-bounded, size-bounded sample buffers. Old samples are pruned on every access:
 
 ```javascript
-// lib/server/middleware.js
-const latencyBuckets = new Map(); // endpoint -> number[]
-const MAX_SAMPLES = 1000;
+// lib/ops/metrics.js
+const { performance } = require('perf_hooks')
 
-function recordLatency(endpoint, durationMs) {
-  if (!latencyBuckets.has(endpoint)) {
-    latencyBuckets.set(endpoint, []);
+const DEFAULT_WINDOW_MS = 5 * 60 * 1000     // 5-minute window
+const DEFAULT_MAX_SAMPLES = 2000
+const MAX_ROUTES = 40                         // Cap route cardinality
+
+function makeWindow({ windowMs = DEFAULT_WINDOW_MS, maxSamples = DEFAULT_MAX_SAMPLES } = {}) {
+  const samples = []
+
+  const prune = (now) => {
+    const cutoff = now - windowMs
+    while (samples.length > 0 && samples[0].t < cutoff) samples.shift()
+    if (samples.length > maxSamples) samples.splice(0, samples.length - maxSamples)
   }
-  const bucket = latencyBuckets.get(endpoint);
-  bucket.push(durationMs);
-  // Keep the buffer bounded — drop oldest samples
-  if (bucket.length > MAX_SAMPLES) bucket.shift();
-}
 
-function percentile(sorted, p) {
-  const idx = Math.ceil((p / 100) * sorted.length) - 1;
-  return sorted[Math.max(0, idx)];
-}
-
-function getLatencyStats(endpoint) {
-  const samples = (latencyBuckets.get(endpoint) || []).slice().sort((a, b) => a - b);
-  if (!samples.length) return null;
   return {
-    p50: percentile(samples, 50),
-    p95: percentile(samples, 95),
-    p99: percentile(samples, 99),
-    count: samples.length,
-  };
-}
-
-// Middleware — attaches timing and records on finish
-function metricsMiddleware(req, res, next) {
-  const startMs = Date.now();
-  res.on('finish', () => {
-    const endpoint = `${req.method} ${req.route?.path ?? req.path}`;
-    recordLatency(endpoint, Date.now() - startMs);
-  });
-  next();
-}
-```
-
-Using `req.route?.path` (the route pattern, not the URL) groups all `/users/123` and `/users/456` calls under `GET /users/:id`, preventing the bucket map from growing without bound.
-
-### Vector Operation Counters
-
-The embedding pipeline increments counters each time it produces or fails to produce an embedding. These are plain in-process integers — no atomic primitives needed because Node.js is single-threaded:
-
-```javascript
-// lib/server/middleware.js
-const vectorCounters = {
-  embeddingsGenerated: 0,
-  embeddingErrors: 0,
-  vectorSearches: 0,
-};
-
-// Called from the embedding pipeline, not the HTTP layer
-function incrementVectorCounter(key) {
-  if (key in vectorCounters) vectorCounters[key]++;
-}
-```
-
-### Health Check Endpoint
-
-A single `/health` route queries each subsystem and assembles a composite response. If any critical subsystem fails, the response status is 503:
-
-```javascript
-// lib/server/middleware.js
-async function healthHandler(req, res) {
-  const checks = await Promise.allSettled([
-    checkDatabase(),   // e.g., db.raw('SELECT 1')
-    checkRedis(),      // e.g., redis.ping()
-    checkLLMProvider(), // e.g., lightweight probe against the LLM API
-  ]);
-
-  const [db, redis, llm] = checks.map(r =>
-    r.status === 'fulfilled' ? { ok: true } : { ok: false, error: r.reason?.message }
-  );
-
-  const healthy = db.ok && llm.ok; // Redis failure is degraded, not critical
-
-  res.status(healthy ? 200 : 503).json({
-    status: healthy ? 'ok' : 'degraded',
-    eventLoopLagMs: currentLagMs,
-    subsystems: { db, redis, llm },
-    vectorCounters,
-    // Latency snapshot for a representative set of endpoints
-    latency: {
-      'POST /api/query': getLatencyStats('POST /api/query'),
-      'POST /api/embed': getLatencyStats('POST /api/embed'),
+    add(value) {
+      const now = Date.now()
+      samples.push({ t: now, v: value })
+      prune(now)
     },
-  });
+    values() { prune(Date.now()); return samples.map((s) => s.v) },
+    count()  { prune(Date.now()); return samples.length },
+  }
 }
 ```
 
-`Promise.allSettled` (not `Promise.all`) is deliberate: one failing subsystem should not prevent the health report from including data about the others.
+Six dedicated windows track different subsystems, each with appropriate retention:
+
+```javascript
+const httpWindow     = makeWindow()                                          // 5min, 2000 samples
+const contextWindow  = makeWindow()                                          // context assembly
+const vectorWindow   = makeWindow()                                          // vector search
+const eventLoopWindow = makeWindow({ maxSamples: 3000, windowMs: 2 * 60 * 1000 }) // 2min, 3000
+const jobWindow      = makeWindow()                                          // job execution
+const dbQueryWindow  = makeWindow({ maxSamples: 3000 })                      // DB queries
+```
+
+### Percentile Computation
+
+Percentiles (p50, p95, p99) are computed on-demand from the windowed samples:
+
+```javascript
+// lib/ops/metrics.js
+function quantile(values, q) {
+  if (!values || values.length === 0) return 0
+  const sorted = [...values].sort((a, b) => a - b)
+  const idx = Math.floor((sorted.length - 1) * q)
+  return sorted[idx]
+}
+
+function summarize(values) {
+  if (!values || values.length === 0) return { count: 0, p50: 0, p95: 0, p99: 0, max: 0 }
+  return {
+    count: values.length,
+    p50: quantile(values, 0.5),
+    p95: quantile(values, 0.95),
+    p99: quantile(values, 0.99),
+    max: Math.max(...values),
+  }
+}
+```
+
+### Per-Route HTTP Metrics
+
+HTTP requests are tracked globally and per-route. Route paths are normalized to collapse dynamic segments (numeric IDs, UUIDs) into `:id` to prevent cardinality explosion:
+
+```javascript
+// lib/ops/metrics.js
+function normalizePath(path) {
+  if (!path) return 'unknown'
+  let normalized = path
+  normalized = normalized.replace(/\/\d+/g, '/:id')
+  normalized = normalized.replace(/\/[0-9a-fA-F-]{8,}/g, '/:id')
+  return normalized
+}
+
+function recordHttpRequest({ durationMs, method, path, statusCode }) {
+  httpStats.total += 1
+  httpWindow.add(durationMs)
+  if (statusCode >= 500) httpStats.errors += 1
+  httpStats.statusCounts[statusCode] = (httpStats.statusCounts[statusCode] || 0) + 1
+
+  const routeKey = `${method} ${normalizePath(path)}`
+  let routeEntry = httpStats.routes.get(routeKey)
+  if (!routeEntry) {
+    if (httpStats.routes.size >= MAX_ROUTES) {
+      // Overflow bucket prevents unbounded growth
+      routeEntry = httpStats.routes.get('OTHER') || { window: makeWindow({ maxSamples: 800 }) }
+      httpStats.routes.set('OTHER', routeEntry)
+    } else {
+      routeEntry = { window: makeWindow({ maxSamples: 800 }) }
+      httpStats.routes.set(routeKey, routeEntry)
+    }
+  }
+  routeEntry.window.add(durationMs)
+}
+```
+
+The `startHttpRequest()` helper uses `performance.now()` for high-resolution timing:
+
+```javascript
+function startHttpRequest() {
+  httpStats.inflight += 1
+  const start = performance.now()
+  return (meta) => {
+    const durationMs = performance.now() - start
+    httpStats.inflight -= 1
+    recordHttpRequest({ durationMs, ...meta })
+  }
+}
+```
+
+### Database Query Tracking
+
+DB query metrics track total count, errors, latency distribution, and slow query detection:
+
+```javascript
+// lib/ops/metrics.js
+function recordDbQuery({ durationMs, ok, slow, statement }) {
+  dbStats.total += 1
+  if (!ok) dbStats.errors += 1
+  dbQueryWindow.add(durationMs)
+  if (slow) {
+    dbStats.slowCount += 1
+    dbStats.lastSlow = { at: new Date().toISOString(), durationMs, statement }
+  }
+}
+```
+
+Connection pool stats are set externally by the DB module:
+
+```javascript
+function setDbPoolStats(stats) {
+  dbPoolStats = { ...stats, updatedAt: new Date().toISOString() }
+}
+function setDbReadPoolStats(stats) {
+  dbReadPoolStats = { ...stats, updatedAt: new Date().toISOString() }
+}
+```
+
+### Job and Dispatcher Metrics
+
+Job execution is tracked per-job-name with individual windows:
+
+```javascript
+// lib/ops/metrics.js
+function recordJob({ name, durationMs, ok }) {
+  jobStats.total += 1
+  if (!ok) jobStats.errors += 1
+  jobWindow.add(durationMs)
+
+  let entry = jobStats.byName.get(name)
+  if (!entry) {
+    entry = { window: makeWindow({ maxSamples: 400 }), errors: 0, total: 0 }
+    jobStats.byName.set(name, entry)
+  }
+  entry.total += 1
+  if (!ok) entry.errors += 1
+  entry.window.add(durationMs)
+}
+
+function recordDispatcherCycle({ durationMs, ok, dispatched }) {
+  dispatcherStats = {
+    lastRunAt: new Date().toISOString(),
+    lastDurationMs: durationMs,
+    lastOk: ok,
+    lastDispatched: !!dispatched,
+  }
+}
+```
+
+### Event Loop Lag Monitor
+
+A 1-second `setInterval` measures event loop lag by comparing actual execution time against expected:
+
+```javascript
+// lib/ops/metrics.js
+function startEventLoopMonitor(intervalMs = 1000) {
+  let last = performance.now()
+  const timer = setInterval(() => {
+    const now = performance.now()
+    const lag = Math.max(0, now - last - intervalMs)
+    eventLoopWindow.add(lag)
+    last = now
+  }, intervalMs)
+  if (timer.unref) timer.unref()
+}
+```
+
+### Queue Depth Sampling
+
+Worker task queue depth and outbound queue status are sampled every 30 seconds:
+
+```javascript
+// lib/ops/metrics.js
+async function refreshQueueStats() {
+  const [worker, outbound] = await Promise.all([
+    workerTasks.getStats(),
+    outboundQueue.getStatus(),
+  ])
+  queueStats = {
+    workerTasks: { pending: worker?.pending || 0, running: worker?.running || 0, stuck: worker?.stuck_count || 0 },
+    outbound: outbound || null,
+    updatedAt: new Date().toISOString(),
+  }
+}
+```
+
+### Unified Snapshot
+
+A single `getSnapshot()` call assembles all metrics into a comprehensive object:
+
+```javascript
+// lib/ops/metrics.js
+function getSnapshot() {
+  return {
+    timestamp: new Date().toISOString(),
+    uptimeSec: Math.round(process.uptime()),
+    process: { memory: process.memoryUsage(), cpu: process.cpuUsage() },
+    http: {
+      inflight: httpStats.inflight,
+      total: httpStats.total,
+      errors: httpStats.errors,
+      statusCounts: httpStats.statusCounts,
+      latency: summarize(httpWindow.values()),
+      routes: /* per-route summaries */,
+    },
+    context: { total: contextStats.total, latency: summarize(contextWindow.values()) },
+    vectorSearch: { total: vectorStats.total, errors: vectorStats.errors, latency: summarize(vectorWindow.values()) },
+    eventLoopLag: summarize(eventLoopWindow.values()),
+    db: {
+      pool: dbPoolStats,
+      readPool: dbReadPoolStats,
+      queries: { total: dbStats.total, errors: dbStats.errors, latency: summarize(dbQueryWindow.values()), slowCount: dbStats.slowCount, lastSlow: dbStats.lastSlow },
+    },
+    queues: queueStats,
+    dispatcher: dispatcherStats,
+    jobs: { total: jobStats.total, errors: jobStats.errors, latency: summarize(jobWindow.values()), byName: /* per-job summaries */ },
+  }
+}
+```
 
 ## Implications
 
-- No external metrics service is required. The process is entirely self-contained, which simplifies deployment and avoids a class of "metrics are up but app is down" failures.
-- Latency histograms are approximate. The ring buffer holds recent samples only; percentiles reflect current behavior, not historical trends. For long-term trend analysis, scrape `/health` periodically and store externally.
-- Event loop lag detection requires the interval to run on the same thread as request handling. If the process is completely locked, the interval cannot fire and lag appears as zero — the health check itself will time out, which is the correct observable behavior for a load balancer.
-- Per-endpoint bucketing via route pattern prevents cardinality explosion, but requires Express route registration to be complete before the first request arrives. Dynamic or catch-all routes need explicit normalization.
-- Vector counters reset on process restart. They are useful for rate-of-change monitoring within a session, not for cumulative lifetime statistics.
-- The health endpoint should not require authentication — load balancers and readiness probes need to reach it without credentials — but it should be excluded from latency tracking to avoid skewing endpoint stats.
+- No external metrics service is required — the process is entirely self-contained, simplifying deployment
+- Windowed samples mean percentiles reflect current behavior (last 5 minutes), not historical trends — scrape the snapshot periodically for long-term analysis
+- `MAX_ROUTES = 40` with an `OTHER` overflow bucket prevents unbounded memory growth from high-cardinality paths
+- `perf_hooks.performance.now()` provides microsecond resolution without Date clock skew
+- Event loop lag detection depends on the interval firing — if the process is completely frozen, the interval cannot fire and lag appears as zero (the health check itself times out, which is the correct signal for load balancers)
+- Per-job-name breakdown enables identifying which specific jobs are slow or failing without external APM
+- Queue depth is sampled (30s interval), not event-driven — spikes shorter than the sample interval are missed
+- All counters reset on process restart — they measure rate-of-change within a session, not cumulative lifetime stats
 
 ## Code Example
 
-Full middleware registration in the Express app:
-
 ```javascript
-// lib/server/middleware.js
-// Register before routes so timing captures the full request lifecycle
-app.use(metricsMiddleware);
+// Integration: Express middleware for HTTP metrics
+const metrics = require('../ops/metrics')
 
-// Register after routes so req.route is populated
-app.get('/health', healthHandler);
+app.use((req, res, next) => {
+  const finish = metrics.startHttpRequest()
+  res.on('finish', () => {
+    finish({ method: req.method, path: req.path, statusCode: res.statusCode })
+  })
+  next()
+})
 
-// Expose counter increment for use by the embedding pipeline
-module.exports = { incrementVectorCounter, getLatencyStats };
-```
-
-The embedding pipeline calls `incrementVectorCounter` directly:
-
-```javascript
-// lib/embeddings/pipeline.js
-const { incrementVectorCounter } = require('../server/middleware');
-
-async function embed(text) {
-  try {
-    const vector = await llmClient.embed(text);
-    incrementVectorCounter('embeddingsGenerated');
-    return vector;
-  } catch (err) {
-    incrementVectorCounter('embeddingErrors');
-    throw err;
-  }
+// Integration: DB query instrumentation
+const start = performance.now()
+try {
+  const result = await pool.query(sql, params)
+  metrics.recordDbQuery({ durationMs: performance.now() - start, ok: true })
+  return result
+} catch (err) {
+  metrics.recordDbQuery({ durationMs: performance.now() - start, ok: false })
+  throw err
 }
+
+// Start background monitors on server boot
+metrics.startBackgroundTasks()
+
+// Expose snapshot via route
+app.get('/ops/metrics', (req, res) => res.json(metrics.getSnapshot()))
 ```
 
 ## Related Patterns
 
-- [Structured Logging with Child Loggers](./structured-logging-with-child-loggers.md) — health check failures and lag spikes should emit structured log entries through the same logging pipeline so operators get correlated context alongside metrics
-- [Graceful Degradation and Optional Init](./graceful-degradation-and-optional-init.md) — subsystem health probes inside the health endpoint should tolerate the same optional-init contract as startup: if Redis never connected, the probe returns `ok: false` rather than throwing
-- [Redis Optional Caching and Clustering](./redis-optional-caching-and-clustering.md) — the Redis health probe in the health endpoint is the runtime counterpart to Redis's optional initialization; both treat Redis as a non-critical dependency
+- [Structured Logging with Child Loggers](./structured-logging-with-child-loggers.md)
+- [Graceful Degradation and Optional Init](./graceful-degradation-and-optional-init.md)
+- [Rate Limiting and API Protection](./rate-limiting-and-api-protection.md)

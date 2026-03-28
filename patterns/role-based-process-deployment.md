@@ -46,6 +46,6 @@ A process manager (e.g., PM2) defines one process entry per role, letting each b
 
 ## Related Patterns
 
-- [Graceful Shutdown Ordering](./graceful-shutdown-ordering.md)
+- [Graceful Degradation and Optional Init](./graceful-degradation-and-optional-init.md)
 - [Graceful Degradation and Optional Init](./graceful-degradation-and-optional-init.md)
 - [Cognitive Processing Loop](./cognitive-processing-loop.md)

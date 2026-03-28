@@ -1,291 +1,202 @@
 # Database Abstraction and Schema Management
 
-> PostgreSQL abstraction layer with lazy initialization, advisory-lock-protected schema migrations, connection pooling, and dual read/write API that hides database specifics from the rest of the codebase.
+> PostgreSQL abstraction with a TypeScript query handler compiled to JS, a fluent `SelectQuery` builder, domain-specific schema modules, and file-based migrations managed by `node-pg-migrate`.
 
 ## Problem
 
-Direct database access scattered across an application creates several compounding problems. Connection management gets duplicated — every module that touches the database opens its own connection or assumes one exists. Schema migrations run at startup, but without coordination, two instances starting simultaneously can run the same migration concurrently, corrupting schema state or hitting unique constraint violations on migration tracking tables. Query construction leaks PostgreSQL-specific syntax into business logic, making it impossible to reason about data access patterns or swap storage backends. And when the database is temporarily unreachable, every caller needs its own retry logic or the application crashes on the first transient network blip.
+Direct database access scattered across an application creates several compounding problems. Connection management gets duplicated — every module that touches the database opens its own connection or assumes one exists. Query construction leaks PostgreSQL-specific syntax into business logic, making it impossible to reason about data access patterns. When the database schema evolves, ad-hoc migration scripts create versioning confusion. And without a fluent builder, every module that needs dynamic WHERE clauses rebuilds the same boilerplate: accumulating conditions, tracking parameter indices, concatenating strings.
 
 ## Context
 
 - A Node.js orchestrator using PostgreSQL as its primary data store
-- Multiple modules need database access but should not manage connections directly
-- The application may run multiple instances behind a load balancer, all sharing the same database
-- Schema evolves over time with additive migrations that must run exactly once
-- Some modules only read data while others perform writes — different access patterns benefit from different APIs
-- The database connection should not block application startup if it's temporarily unavailable
+- The query handler is authored in TypeScript and compiled to JavaScript — the rest of the codebase is plain JS
+- Multiple modules need database access but should not manage connections or build raw SQL directly
+- Schema evolves through file-based migrations that run via `node-pg-migrate`
+- Schema definitions are organized into domain-specific modules (people, projects, knowledge, messaging, etc.)
+- Both raw SQL and fluent builder access patterns are needed — some queries are too complex for a builder
+- Read replicas may be used for heavy read operations
 
 ## Solution
 
-### Lazy Initialization with Connection Pooling
+### Query Handler Architecture
 
-The database module exports a ready-to-use API, but the actual connection pool isn't created until the first query. This avoids blocking startup and means modules can import the database layer at load time without triggering a connection attempt:
+The database layer is split into a compiled TypeScript query handler (`lib/db/query-handler/`) and a plain JS entry point (`lib/db/index.js`) that re-exports everything. The query handler is organized into focused sub-modules:
 
-```typescript
-// lib/db.ts
-import { Pool, PoolConfig } from 'pg';
+```javascript
+// lib/db/query-handler.js (compiled from TypeScript)
+// Re-exports organized by concern:
 
-let pool: Pool | null = null;
-let initPromise: Promise<Pool> | null = null;
+// Builder
+exports.SelectQuery   // Fluent chainable query builder
+exports.db            // Low-level DB adapter reference
 
-function getPoolConfig(): PoolConfig {
-  return {
-    connectionString: process.env.DATABASE_URL,
-    max: parseInt(process.env.DB_POOL_MAX || '10'),
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 5000,
-  };
-}
+// CRUD operations
+exports.select        // Returns a SelectQuery instance
+exports.insert        // Insert row, return ID
+exports.insertMany    // Batch insert
+exports.update        // Update rows matching condition
+exports.del           // Delete rows matching condition
+exports.upsert        // Insert or update on conflict
 
-async function getPool(): Promise<Pool> {
-  if (pool) return pool;
+// Raw SQL (unscoped)
+exports.raw           // Execute raw SQL, return rows
+exports.rawRead       // Raw SQL routed to read replica
+exports.rawOne        // Raw SQL, return first row
+exports.rawOneRead    // Raw SQL first row, read replica
 
-  // Prevent multiple concurrent initialization attempts
-  if (!initPromise) {
-    initPromise = initializePool();
+// Tenant-scoped raw SQL
+exports.rawWithTenant         // Auto-inject tenant_id
+exports.rawWithTenantRead     // Tenant-scoped on read replica
+
+// Search & transactions
+exports.transaction   // Wrap operations in a transaction
+exports.search        // Full-text search helper
+exports.vectorSearch  // pgvector similarity search
+```
+
+### Fluent SelectQuery Builder
+
+The `SelectQuery` class eliminates duplicated dynamic WHERE clause building across the codebase. Modules chain methods instead of concatenating SQL strings:
+
+```javascript
+// lib/db/query-handler/builder.ts (compiled to JS)
+class SelectQuery {
+  constructor(table) {
+    this.table = table
+    this.columns = '*'
+    this.whereClauses = []
+    this.whereParams = []
+    this.joinClauses = []
+    this.orderByClauses = []
+    this.limitValue = null
+    this.offsetValue = null
+    this._useReadReplica = false
   }
 
-  return initPromise;
-}
+  select(columns) { /* set columns */ return this }
+  where(condition, ...params) { /* add WHERE clause */ return this }
+  whereIn(column, values) { /* add IN clause */ return this }
+  whereJsonContains(column, path, value) { /* JSONB @> operator */ return this }
+  join(table, condition, type = 'INNER') { /* add JOIN */ return this }
+  leftJoin(table, condition) { return this.join(table, condition, 'LEFT') }
+  orderBy(column, direction) { /* add ORDER BY */ return this }
+  limit(n) { /* set LIMIT */ return this }
+  offset(n) { /* set OFFSET */ return this }
+  useReadReplica() { /* route to read replica */ return this }
+  skipTenantScope() { /* no-op, kept for API compat */ return this }
 
-async function initializePool(): Promise<Pool> {
-  const newPool = new Pool(getPoolConfig());
-
-  newPool.on('error', (err) => {
-    logger.error({ err }, 'Unexpected pool error');
-    pool = null;
-    initPromise = null;
-  });
-
-  // Verify connectivity with a test query
-  const client = await newPool.connect();
-  try {
-    await client.query('SELECT 1');
-  } finally {
-    client.release();
-  }
-
-  pool = newPool;
-  logger.info('Database pool initialized');
-  return newPool;
+  // Terminal methods
+  async all() { /* execute and return all rows */ }
+  async one() { /* execute and return first row */ }
+  async count() { /* execute COUNT(*) variant */ }
 }
 ```
 
-### Advisory Locks for Schema Migration
+Parameter placeholders use `?` internally and are converted to PostgreSQL `$1, $2` format at build time. The builder handles edge cases like empty `IN` clauses (returns no rows) and direction-aware `ORDER BY` parsing.
 
-PostgreSQL advisory locks provide application-level locking without creating lock tables. Before running migrations, the process acquires an advisory lock using a fixed lock ID. Any other instance attempting to migrate simultaneously will block until the first one finishes:
+### Domain-Specific Schema Modules
 
-```typescript
-// lib/db-postgres/migrate.ts
-const MIGRATION_LOCK_ID = 839271; // Arbitrary but fixed
+Schema definitions live in `lib/db-postgres/schema/`, organized by domain rather than as a single monolithic file:
 
-async function runMigrations(): Promise<void> {
-  const pool = await getPool();
-  const client = await pool.connect();
-
-  try {
-    // Acquire advisory lock — blocks until available
-    await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_ID]);
-    logger.info('Migration lock acquired');
-
-    // Ensure migrations tracking table exists
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        applied_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
-
-    // Determine which migrations have already run
-    const { rows: applied } = await client.query(
-      'SELECT version FROM schema_migrations ORDER BY version'
-    );
-    const appliedVersions = new Set(applied.map((r) => r.version));
-
-    // Run pending migrations in order
-    for (const migration of MIGRATIONS) {
-      if (appliedVersions.has(migration.version)) continue;
-
-      logger.info({ version: migration.version, name: migration.name }, 'Running migration');
-      await client.query('BEGIN');
-
-      try {
-        await client.query(migration.sql);
-        await client.query(
-          'INSERT INTO schema_migrations (version, name) VALUES ($1, $2)',
-          [migration.version, migration.name]
-        );
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-      }
-    }
-  } finally {
-    // Release advisory lock — even if migrations failed
-    await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_ID]);
-    client.release();
-    logger.info('Migration lock released');
-  }
-}
+```
+lib/db-postgres/schema/
+  core.js            # Base tables (documents, preferences, audit)
+  people.js          # Person identifiers, relationships
+  projects.js        # Projects, milestones
+  knowledge.js       # Knowledge graph, entities
+  messaging.js       # Conversations, messages
+  financial.js       # Budgets, transactions
+  goals.js           # Objectives, key results
+  learning.js        # Self-improvement tracking
+  worker-pipelines.js # Worker task pipelines
+  ...20+ domain files
 ```
 
-### Dual Read/Write API
+Each module exports CREATE TABLE statements for its domain. The schema loader composes them at migration time.
 
-The abstraction provides separate helpers for read and write operations. Read operations return rows directly. Write operations (insert, update, delete) return metadata about affected rows. This separation makes access patterns explicit and enables future read-replica routing:
+### File-Based Migrations
 
-```typescript
-// lib/db.ts — public API
+Migrations are managed through `node-pg-migrate` with timestamped files in the `migrations/` directory:
 
-/** Execute a read query, returning rows */
-async function query<T = Record<string, unknown>>(
-  sql: string,
-  params?: unknown[]
-): Promise<T[]> {
-  const pool = await getPool();
-  const { rows } = await pool.query(sql, params);
-  return rows as T[];
-}
-
-/** Insert a row, returning the inserted record */
-async function insert<T = Record<string, unknown>>(
-  table: string,
-  data: Record<string, unknown>
-): Promise<T> {
-  const keys = Object.keys(data);
-  const values = Object.values(data);
-  const placeholders = keys.map((_, i) => `$${i + 1}`);
-
-  const sql = `
-    INSERT INTO ${escapeIdentifier(table)} (${keys.map(escapeIdentifier).join(', ')})
-    VALUES (${placeholders.join(', ')})
-    RETURNING *
-  `;
-
-  const pool = await getPool();
-  const { rows } = await pool.query(sql, values);
-  return rows[0] as T;
-}
-
-/** Update rows matching a condition */
-async function update(
-  table: string,
-  data: Record<string, unknown>,
-  where: Record<string, unknown>
-): Promise<number> {
-  const setClauses: string[] = [];
-  const whereClauses: string[] = [];
-  const values: unknown[] = [];
-  let paramIndex = 1;
-
-  for (const [key, value] of Object.entries(data)) {
-    setClauses.push(`${escapeIdentifier(key)} = $${paramIndex++}`);
-    values.push(value);
-  }
-
-  for (const [key, value] of Object.entries(where)) {
-    whereClauses.push(`${escapeIdentifier(key)} = $${paramIndex++}`);
-    values.push(value);
-  }
-
-  const sql = `
-    UPDATE ${escapeIdentifier(table)}
-    SET ${setClauses.join(', ')}
-    WHERE ${whereClauses.join(' AND ')}
-  `;
-
-  const pool = await getPool();
-  const result = await pool.query(sql, values);
-  return result.rowCount ?? 0;
-}
-
-/** Delete rows matching a condition */
-async function remove(
-  table: string,
-  where: Record<string, unknown>
-): Promise<number> {
-  const whereClauses: string[] = [];
-  const values: unknown[] = [];
-  let paramIndex = 1;
-
-  for (const [key, value] of Object.entries(where)) {
-    whereClauses.push(`${escapeIdentifier(key)} = $${paramIndex++}`);
-    values.push(value);
-  }
-
-  const sql = `
-    DELETE FROM ${escapeIdentifier(table)}
-    WHERE ${whereClauses.join(' AND ')}
-  `;
-
-  const pool = await getPool();
-  const result = await pool.query(sql, values);
-  return result.rowCount ?? 0;
-}
+```
+migrations/
+  1767194177505_baseline-schema.js
+  1767202750141_person-identifiers.js
+  1767300000001_graph-layer.js
+  1767300000002_knowledge-layer.js
+  1767300000003_capability-registry.js
+  ...
 ```
 
-### Connection Failure Recovery
+Each migration file exports `up` and `down` functions. The baseline migration composes all domain schema modules for fresh installs; subsequent migrations handle incremental changes.
 
-The pool error handler nullifies the cached pool, forcing the next query to re-initialize. Combined with the lazy init pattern, this means transient database outages are recovered from automatically — the next operation triggers a fresh connection attempt:
+### Companion QueryBuilder for Complex Dynamic Queries
 
-```typescript
-newPool.on('error', (err) => {
-  logger.error({ err }, 'Pool connection lost — will reinitialize on next query');
-  pool = null;
-  initPromise = null;
-});
+A separate `QueryBuilder` class (`lib/db/query-builder.js`) provides an alternative fluent interface for more complex scenarios with dynamic SET clauses, conditional joins, and LIKE patterns:
+
+```javascript
+// lib/db/query-builder.js
+const qb = new QueryBuilder('worker_tasks')
+  .where('status', 'pending')
+  .whereIn('task_type', ['coding', 'code-review'])
+  .whereLike('description', '%deploy%')
+  .orderBy('priority', 'DESC')
+  .limit(10)
+
+const { sql, params } = qb.build()
 ```
-
-Callers that need to handle database unavailability can catch the connection error and degrade gracefully rather than crashing.
 
 ## Implications
 
-- Lazy initialization means the application starts even if the database is temporarily unreachable — useful for orchestrators that have non-database functionality
-- Advisory locks are session-scoped — if the process crashes mid-migration, PostgreSQL automatically releases the lock when the connection drops
-- The dual API makes it easy to audit which modules perform writes vs. reads, and opens the door to read-replica routing without changing callers
-- Parameterized queries via `$1, $2` placeholders prevent SQL injection without requiring an ORM
-- The `escapeIdentifier` function is critical for table/column names — without it, dynamic table names would be an injection vector
-- Connection pooling bounds concurrent database connections, preventing connection exhaustion under load
-- No ORM overhead — the abstraction is thin enough that callers can still write raw SQL when the helpers don't fit
+- The TypeScript query handler gives type safety at authorship time while the compiled JS integrates seamlessly with the plain-JS codebase — no runtime TypeScript dependency
+- Domain-specific schema modules prevent a single 2000-line schema file and make it clear which tables belong to which feature area
+- `node-pg-migrate` handles migration ordering and tracking automatically — no custom advisory-lock code needed
+- The fluent builder eliminates the most common source of SQL injection in dynamic queries while keeping raw SQL available for complex operations
+- Read replica routing via `useReadReplica()` and `rawRead()` is opt-in per query — callers that need write-after-read consistency use the default writer
+- `skipTenantScope()` is a no-op kept for API compatibility — the system is single-tenant, but the method signature remains for future flexibility
+- Parameter placeholder conversion (`?` to `$N`) happens at build time, not at the caller level — callers write natural parameterized queries
 
 ## Code Example
 
-```typescript
-// Usage from a business logic module — no pool management, no SQL injection concerns
-import { query, insert, update, remove } from '../lib/db';
+```javascript
+// Usage from a business logic module
+const { select, insert, raw, rawOne } = require('../db/query-handler')
 
-interface Task {
-  id: string;
-  name: string;
-  status: string;
-  created_at: Date;
+// Fluent builder for filtered queries
+async function getActiveTasks(workerType, status) {
+  let query = select('worker_tasks')
+    .where('archived_at IS NULL')
+    .orderBy('created_at DESC')
+    .limit(50)
+
+  if (workerType) query = query.where('worker_type = ?', workerType)
+  if (status) query = query.where('status = ?', status)
+
+  return query.all()
 }
 
-async function getActiveTasks(): Promise<Task[]> {
-  return query<Task>(
-    'SELECT * FROM tasks WHERE status = $1 ORDER BY created_at DESC',
-    ['active']
-  );
+// Raw SQL for complex aggregations
+async function getTaskStats() {
+  return rawOne(`
+    SELECT
+      COUNT(*) FILTER (WHERE status = 'running') as running,
+      COUNT(*) FILTER (WHERE status = 'pending') as pending,
+      COALESCE(SUM(cost_usd) FILTER (
+        WHERE completed_at > NOW() - INTERVAL '24 hours'
+      ), 0) as cost_24h
+    FROM worker_tasks
+  `)
 }
 
-async function createTask(name: string): Promise<Task> {
-  return insert<Task>('tasks', {
-    name,
-    status: 'active',
-    created_at: new Date(),
-  });
-}
-
-async function completeTask(taskId: string): Promise<void> {
-  const affected = await update('tasks', { status: 'completed' }, { id: taskId });
-  if (affected === 0) {
-    throw new Error(`Task ${taskId} not found`);
-  }
-}
-
-async function purgeOldTasks(beforeDate: Date): Promise<number> {
-  return remove('tasks', { status: 'completed' });
+// Insert with automatic ID return
+async function createPreference(category, key, value) {
+  return insert('preferences', {
+    category,
+    preference_key: key,
+    value: JSON.stringify(value),
+    source: 'explicit',
+    confidence: 1.0,
+  })
 }
 ```
 

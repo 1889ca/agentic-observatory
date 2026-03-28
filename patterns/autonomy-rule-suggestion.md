@@ -1,194 +1,309 @@
 # Autonomy Rule Suggestion
 
-> AI-driven suggestion of user-defined automation rules based on observed behavioral patterns — the system learns what it should be allowed to do.
+> Action-driven rule generation that creates autonomy rules from individually approved actions using pattern-based condition extraction, scope validation, and explicit single-action approval — no statistical pattern detection or aggregated analysis.
 
 ## Problem
 
-Configuring an AI agent's autonomy is tedious. Users must manually define rules like "auto-approve task creation for project X" or "always ask before sending messages to clients." Most users don't know what rules they need until they've been interrupted by approval requests dozens of times. The ideal system would observe the user's approval patterns and suggest rules that match their demonstrated preferences — turning reactive permission management into proactive automation.
+Configuring an AI agent's autonomy is tedious. Users must manually define rules like "auto-archive emails from noreply@github.com" or "always ask before closing GitHub issues." Most users don't know what rules they need until they've been interrupted by approval requests dozens of times. The ideal system would let users say "always allow this type" when approving an action, and generate the appropriate rule automatically.
 
 ## Context
 
 - An AI agent with autonomy tiers (AUTO/NOTIFY/ASK/NEVER) that gate different actions
-- Users frequently approve or deny the same types of actions
-- Approval patterns are contextual: auto-approve for personal projects but always ask for client work
-- The system has access to historical approval decisions with metadata (action type, target, time, decision)
-- Suggested rules must be human-readable and editable — not opaque ML decisions
+- Users approve or deny actions one at a time through the UI
+- When approving, users can check "Always allow this type" to trigger rule generation
+- The system has access to the specific approved action with its full metadata
+- Generated rules must be human-readable, editable, and safe by default
+- Rules are stored as first-class autonomy rules that gate future actions
 
 ## Solution
 
-A rule suggestion engine analyzes historical approval decisions to detect patterns. When a pattern reaches sufficient confidence (consistent decisions over multiple occurrences), the system suggests a named automation rule. The user can accept, modify, or reject the suggestion. Accepted rules are stored as first-class autonomy rules that gate future actions.
+### Pattern-Based Condition Extraction
 
-### Pattern Detection
-
-The engine aggregates approval decisions by action type and contextual dimensions:
+Rather than analyzing historical patterns statistically, the auto-rule generator works from a single approved action. It uses a pattern registry keyed by action type to extract appropriate rule conditions:
 
 ```javascript
-// tools/suggest-autonomy-rule.js — illustrative
-async function analyzeApprovalPatterns(decisions) {
-  // Group decisions by action type + context dimensions
-  const patterns = {};
+// lib/agent/auto-rule-generator/patterns.js
+const RULE_PATTERNS = {
+  'email.archive': (action) => {
+    const sender = action.parameters?.sender || action.parameters?.from
+    if (!sender) return null
 
-  for (const decision of decisions) {
-    const key = buildPatternKey(decision);
-
-    if (!patterns[key]) {
-      patterns[key] = { approved: 0, denied: 0, contexts: [], lastSeen: null };
+    // Notification addresses → use domain pattern
+    if (sender.match(/^(no-?reply|notifications?|alerts?)@/i)) {
+      const domain = sender.split('@')[1]
+      return {
+        conditions: { type: 'email', action_type: 'archive', sender_pattern: `*@${domain}` },
+        suggestedTier: 'AUTO',
+      }
     }
-
-    if (decision.approved) {
-      patterns[key].approved++;
-    } else {
-      patterns[key].denied++;
+    // Specific sender
+    return {
+      conditions: { type: 'email', action_type: 'archive', sender_pattern: sender },
+      suggestedTier: 'AUTO',
     }
-    patterns[key].contexts.push(decision.context);
-    patterns[key].lastSeen = decision.timestamp;
+  },
+
+  'github.close_issue': (action) => {
+    const repo = action.parameters?.repo
+    if (!repo) return null
+    return {
+      conditions: { type: 'github', event_type: 'close_issue', repo },
+      suggestedTier: 'NOTIFY',
+    }
+  },
+
+  'github.merge_pr': (action) => {
+    const repo = action.parameters?.repo
+    if (!repo) return null
+    return {
+      conditions: { type: 'github', event_type: 'merge_pr', repo },
+      suggestedTier: 'NOTIFY',
+    }
+  },
+
+  // Generic tool call fallback
+  tool_call: (action) => {
+    const toolName = action.parameters?.toolName
+    if (!toolName) return null
+
+    // Reject overly broad tools
+    if (toolName === 'search' || toolName === 'navigate') return null
+
+    return {
+      conditions: { tool_name: toolName },
+      suggestedTier: 'NOTIFY',
+    }
+  },
+}
+```
+
+The pattern registry covers email actions (archive, label, delete), GitHub actions (close issue, merge PR, create issue), task/document/calendar actions, and a generic `tool_call` fallback.
+
+### Pattern Key Extraction
+
+A `getPatternKey()` function derives the lookup key from an action's metadata, handling nested tool calls and domain-specific routing:
+
+```javascript
+// lib/agent/auto-rule-generator/extraction.js
+function getPatternKey(action) {
+  const actionType = action.actionType || action.action_type
+
+  if (actionType === 'tool_call') {
+    const toolName = action.parameters?.toolName
+    const toolArgs = action.parameters?.toolArgs || {}
+
+    // Map known tools to specific patterns
+    if (toolName === 'entity' && toolArgs.entityType && toolArgs.action) {
+      return `${toolArgs.entityType}.${toolArgs.action}`
+    }
+    if (toolName === 'send_email' || toolName === 'archive_email') {
+      return `email.${toolName.replace('_email', '')}`
+    }
+    if (toolName?.startsWith('github_')) {
+      return `github.${toolName.replace('github_', '')}`
+    }
+    return 'tool_call'
   }
 
-  return patterns;
+  if (actionType === 'email') return `email.${action.parameters?.action || 'unknown'}`
+  if (actionType === 'github') return `github.${action.parameters?.action || 'unknown'}`
+  return actionType || 'unknown'
 }
 
-function buildPatternKey(decision) {
-  // Group by: action type + significant context dimensions
-  const parts = [decision.actionType];
+function generateRuleFromAction(action) {
+  const patternKey = getPatternKey(action)
+  let patternFn = RULE_PATTERNS[patternKey]
 
-  if (decision.context.project) parts.push(`project:${decision.context.project}`);
-  if (decision.context.targetType) parts.push(`target:${decision.context.targetType}`);
-  if (decision.context.source) parts.push(`source:${decision.context.source}`);
+  // Fall back to generic tool_call pattern
+  if (!patternFn && action.actionType === 'tool_call') {
+    patternFn = RULE_PATTERNS.tool_call
+  }
 
-  return parts.join('|');
-}
-```
+  if (!patternFn) return null
 
-### Confidence Scoring
-
-A pattern becomes suggestion-worthy when it shows consistent behavior over enough occurrences:
-
-```javascript
-function scoreSuggestion(pattern) {
-  const total = pattern.approved + pattern.denied;
-  if (total < 5) return 0; // Need minimum sample size
-
-  const consistency = Math.max(pattern.approved, pattern.denied) / total;
-  const recency = daysSince(pattern.lastSeen) < 7 ? 1.0 : 0.8;
-
-  return consistency * recency;
-}
-
-const SUGGESTION_THRESHOLD = 0.85;
-
-function generateSuggestions(patterns) {
-  return Object.entries(patterns)
-    .map(([key, pattern]) => ({
-      key,
-      pattern,
-      score: scoreSuggestion(pattern),
-      direction: pattern.approved > pattern.denied ? 'AUTO' : 'NEVER',
-    }))
-    .filter(s => s.score >= SUGGESTION_THRESHOLD)
-    .sort((a, b) => b.score - a.score);
+  const result = patternFn(action)
+  return result ? {
+    conditions: result.conditions,
+    suggestedTier: result.suggestedTier || 'NOTIFY',
+    patternKey,
+  } : null
 }
 ```
 
-### Rule Generation
+### Safety Guardrails
 
-Suggestions are converted to human-readable rule definitions:
+Two layers of safety prevent dangerous or overly broad rules:
+
+**1. Dangerous action blocking** — Certain tools are never eligible for rule creation:
 
 ```javascript
-// lib/agent/autonomy-rules.js — illustrative
-function suggestionToRule(suggestion) {
-  const { key, direction, pattern } = suggestion;
-  const dimensions = parsePatternKey(key);
+// lib/agent/auto-rule-generator/validation.js
+function isSafeForRuleCreation(action) {
+  const toolName = action.parameters?.toolName
+
+  const dangerousTools = [
+    'delete_file', 'delete_document', 'delete_permanently',
+    'send_money', 'transfer_funds', 'execute_code', 'run_command',
+  ]
+
+  if (toolName && dangerousTools.some((t) => toolName.toLowerCase().includes(t))) {
+    return { safe: false, reason: `Cannot create automatic rules for dangerous operations like ${toolName}` }
+  }
+
+  // NEVER tier actions are never eligible
+  if (action.approvalTier === 4 || action.approval_tier === 4) {
+    return { safe: false, reason: 'Cannot create rules for permanently blocked actions (NEVER tier)' }
+  }
+
+  return { safe: true }
+}
+```
+
+**2. Scope validation** — Rules are checked against recent action history to detect overly broad conditions:
+
+```javascript
+// lib/agent/auto-rule-generator/validation.js
+async function validateRuleScope(conditions, threshold = 100) {
+  // Query autonomous_actions from last 30 days matching these conditions
+  // If match count > threshold, warn that the rule is too broad
+  const matchCount = await countMatchingActions(conditions)
+
+  if (matchCount > threshold) {
+    return {
+      valid: false,
+      matchCount,
+      warning: `This rule would match ${matchCount} recent actions (threshold: ${threshold}). Consider more specific conditions.`,
+    }
+  }
+
+  return { valid: true, matchCount }
+}
+```
+
+### Human-Readable Name and Description Generation
+
+Suggested names and descriptions are derived from the conditions and pattern key, not from LLM generation:
+
+```javascript
+// lib/agent/auto-rule-generator/suggestions.js
+function suggestRuleName(action, ruleData) {
+  const parts = []
+  const tierVerb = ruleData?.suggestedTier === 'AUTO' ? 'Auto' :
+    ruleData?.suggestedTier === 'NOTIFY' ? 'Notify on' : 'Allow'
+  parts.push(tierVerb)
+
+  if (ruleData.patternKey.includes('.')) {
+    const [type, subAction] = ruleData.patternKey.split('.')
+    parts.push(subAction, type)
+  } else {
+    parts.push(ruleData.patternKey)
+  }
+
+  if (ruleData.conditions.sender_pattern) {
+    const sender = ruleData.conditions.sender_pattern
+    parts.push(sender.startsWith('*@') ? `from ${sender.slice(2)}` : `from ${sender}`)
+  } else if (ruleData.conditions.repo) {
+    parts.push(`in ${ruleData.conditions.repo}`)
+  }
+
+  return parts.join(' ')
+}
+
+// Example outputs:
+// "Auto archive email from github.com"
+// "Notify on close_issue github in my-org/my-repo"
+// "Allow create task"
+```
+
+### Rule Creation Orchestrator
+
+The `createRuleSuggestion()` function orchestrates the full flow: safety check, pattern extraction, scope validation, name/description generation, and tier enforcement:
+
+```javascript
+// lib/agent/auto-rule-generator/creation.js
+async function createRuleSuggestion(action, options = {}) {
+  // 1. Safety check
+  const safety = isSafeForRuleCreation(action)
+  if (!safety.safe) return { canCreate: false, reason: safety.reason }
+
+  // 2. Generate rule data from action
+  const ruleData = generateRuleFromAction(action)
+  if (!ruleData) return { canCreate: false, reason: 'Could not determine conditions for this action type' }
+
+  // 3. Validate scope
+  const scopeCheck = await validateRuleScope(ruleData.conditions)
+
+  // 4. Build rule
+  const name = options.customName || suggestRuleName(action, ruleData)
+  const description = suggestRuleDescription(action, ruleData)
+  const tier = options.customTier?.toUpperCase() || ruleData.suggestedTier
+
+  // Safety: default to NOTIFY for auto-generated rules
+  const safeTier = tier === 'AUTO' && !options.customTier ? 'NOTIFY' : tier
 
   return {
-    name: generateRuleName(dimensions),
-    description: generateDescription(dimensions, direction, pattern),
-    conditions: {
-      actionType: dimensions.actionType,
-      project: dimensions.project ?? undefined,
-      targetType: dimensions.targetType ?? undefined,
-      source: dimensions.source ?? undefined,
-    },
-    autonomyTier: direction,  // AUTO or NEVER
-    confidence: suggestion.score,
-    basedOn: pattern.approved + pattern.denied, // Number of observations
-  };
-}
-
-function generateRuleName(dimensions) {
-  const parts = [`auto-${dimensions.actionType}`];
-  if (dimensions.project) parts.push(`for-${dimensions.project}`);
-  if (dimensions.targetType) parts.push(`on-${dimensions.targetType}`);
-  return parts.join('-');
-}
-
-function generateDescription(dimensions, direction, pattern) {
-  const action = direction === 'AUTO' ? 'Auto-approve' : 'Always ask before';
-  const scope = dimensions.project ? ` in ${dimensions.project}` : '';
-  return `${action} ${dimensions.actionType}${scope} (based on ${pattern.approved + pattern.denied} past decisions)`;
-}
-```
-
-### User-Facing Suggestion Flow
-
-Suggestions are surfaced through the attention system and require explicit acceptance:
-
-```javascript
-async function proposeSuggestions() {
-  const decisions = await getRecentDecisions({ days: 30 });
-  const patterns = await analyzeApprovalPatterns(decisions);
-  const suggestions = generateSuggestions(patterns);
-
-  for (const suggestion of suggestions) {
-    const rule = suggestionToRule(suggestion);
-
-    // Surface as an attention item, not auto-applied
-    await addAttentionItem({
-      source: 'autonomy',
-      title: `Suggested rule: ${rule.name}`,
-      body: `${rule.description}. Accept this rule?`,
-      urgency: 'low',
-      metadata: { rule, suggestion },
-    });
+    canCreate: true,
+    rule: { name, description, conditions: ruleData.conditions, granted_tier: safeTier },
+    warning: scopeCheck.valid ? undefined : scopeCheck.warning,
+    suggestedTier: ruleData.suggestedTier,
+    matchCount: scopeCheck.matchCount,
   }
 }
-
-async function acceptSuggestion(suggestionId) {
-  const rule = getSuggestion(suggestionId).rule;
-  await saveAutonomyRule(rule);
-  logger.info('Autonomy rule accepted', { name: rule.name, tier: rule.autonomyTier });
-}
 ```
+
+### Default-to-NOTIFY Safety Net
+
+The most important safety feature: auto-generated rules default to NOTIFY tier even when the pattern suggests AUTO. Only when the user explicitly upgrades the tier does a rule grant full autonomy:
+
+```javascript
+const safeTier = tier === 'AUTO' && !options.customTier ? 'NOTIFY' : tier
+```
+
+This means the system will execute the action and notify the user, but won't silently auto-approve until the user consciously opts in.
 
 ## Implications
 
-- Shifts autonomy configuration from manual to semi-automatic — reduces friction while keeping the user in control
-- The 5-observation minimum and 0.85 confidence threshold prevent premature suggestions from noisy data
-- Rules are transparent and editable — unlike opaque ML models, users can understand and modify suggested rules
-- Pattern detection is dimension-based (project, target type, source) — adding new dimensions requires updating the key builder
-- Suggestions are never auto-applied — the attention item flow ensures the user consciously opts in
-- Historical decisions may not reflect current preferences — recency weighting helps but a "reset" mechanism would be useful for preference changes
-- The system learns what it should be allowed to do, creating a natural path from cautious (ASK everything) to confident (AUTO where appropriate)
+- Single-action generation is simpler and more transparent than statistical pattern analysis — the user sees exactly which action triggered the rule
+- The pattern registry is explicit — adding a new action type requires adding a pattern function, not training a model
+- Default-to-NOTIFY means auto-generated rules are always safe by default; the user must actively upgrade to AUTO
+- Scope validation prevents accidentally broad rules (e.g., a rule matching thousands of past actions), but the threshold (100) is configurable
+- Dangerous tools are hard-blocked at the safety layer — no amount of user approval can create an auto-execute rule for `delete_permanently`
+- Name generation is deterministic and predictable — users can edit the suggested name, but the default is always human-readable
+- The generic `tool_call` fallback handles unknown tools but produces less specific conditions — custom patterns should be added for frequently used tools
+- No LLM is involved in rule generation — the entire flow is deterministic pattern matching and template expansion
 
 ## Code Example
 
 ```javascript
-// User has approved 12 task creations in "website-redesign" project, denied 0
-// Pattern: { key: 'create-task|project:website-redesign', approved: 12, denied: 0 }
-// Score: 1.0 (100% consistency, recent)
+// User approves an email archive action and checks "Always allow this type"
+const action = {
+  id: 42,
+  actionType: 'tool_call',
+  parameters: {
+    toolName: 'archive_email',
+    toolArgs: { sender: 'noreply@github.com', subject: 'New PR review' },
+    sender: 'noreply@github.com',
+  },
+}
 
-// System suggests:
+const result = await createRuleSuggestion(action)
 // {
-//   name: 'auto-create-task-for-website-redesign',
-//   description: 'Auto-approve create-task in website-redesign (based on 12 past decisions)',
-//   conditions: { actionType: 'create-task', project: 'website-redesign' },
-//   autonomyTier: 'AUTO',
+//   canCreate: true,
+//   rule: {
+//     name: 'Notify on archive email from github.com',
+//     description: 'When sender pattern: *@github.com, execute and notify you. Created from approved action #42.',
+//     conditions: { type: 'email', action_type: 'archive', sender_pattern: '*@github.com' },
+//     granted_tier: 'NOTIFY',   // Downgraded from AUTO for safety
+//   },
+//   suggestedTier: 'AUTO',      // Pattern suggested AUTO
+//   matchCount: 23,              // 23 similar actions in last 30 days
 // }
 
-// User accepts → future task creations in that project skip approval
+// User can then upgrade to AUTO if they want full autonomy
 ```
 
 ## Related Patterns
 
 - [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
 - [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)
-- [Evolution and Self-Improvement](./evolution-and-self-improvement.md)
+- [Audit Trail with PII Sanitization](./audit-trail-with-pii-sanitization.md)

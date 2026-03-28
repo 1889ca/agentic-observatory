@@ -1,201 +1,289 @@
 # Action Coordination and Conflict Prevention
 
-> Buffer pending operations with batch approval, conflict checking before dispatch, and recent-action tracking to prevent duplicate or contradictory work.
+> Reversible action buffer with TTL-based undo windows, domain-specific undo handlers, and auto-finalization -- enabling a "trust but verify" autonomy model where the agent acts first and the user can revert.
 
 ## Problem
 
-An autonomous agent that can take multiple actions — sending messages, creating tasks, modifying data — can easily step on itself. Two concurrent pipeline stages might both try to send a follow-up message. A scheduled job might create a task that a manual request already created seconds ago. Without coordination, the agent produces duplicate messages, conflicting data modifications, and confused users who receive the same notification twice.
+An autonomous agent that can take actions -- archiving emails, creating tasks, labeling messages, scheduling events -- needs a mechanism for users to reverse mistakes without manual intervention. The traditional approach of requiring approval before every action is too slow and creates bottlenecks. But executing irreversibly means any mistake requires manual cleanup. The agent needs to act decisively while giving users a safety net.
 
 ## Context
 
-- An AI agent with multiple execution paths: interactive chat, background workers, scheduled tasks, autonomous cycles
-- Actions have side effects visible to users (messages sent, tasks created, integrations triggered)
-- Some actions are idempotent (reading data) but many are not (sending a Telegram message)
-- The agent processes requests concurrently — race conditions are not theoretical
-- Users expect the agent to act coherently, not like multiple uncoordinated bots
+- An AI agent with autonomous capabilities that execute real actions (email operations, task management, calendar changes)
+- Some operations are inherently reversible (archive/unarchive, label/unlabel, create/delete)
+- Users expect responsive autonomy -- the agent should act, not ask permission for routine operations
+- A configurable window gives users time to review and revert before actions become permanent
+- The system needs to track what can be undone and execute domain-specific reversal logic
 
 ## Solution
 
-An action coordination layer sits between intent and execution. All actions pass through a buffer that checks for conflicts against recent actions and pending operations before dispatch. Batch approval groups related actions for user review when autonomy rules require it.
+### Reversible Action Type Registry
 
-### Action Buffer
-
-Pending actions are buffered with metadata for conflict detection:
+Each reversible action type declares its inverse operation and default TTL (time-to-live before auto-finalization):
 
 ```javascript
-// lib/orchestrator/coordination.js — illustrative
-const pendingActions = [];
-const recentActions = [];  // Sliding window of last N executed actions
-const RECENT_WINDOW = 300_000; // 5 minutes
+// lib/agent/action-buffer/types.js
+const DEFAULT_TTL_SECONDS = 300; // 5 minutes
 
-function bufferAction(action) {
-  const conflicts = checkConflicts(action);
+const REVERSIBLE_ACTIONS = {
+  // Email operations
+  'email.archive':    { undoAction: 'email.unarchive', ttl: 300 },
+  'email.unarchive':  { undoAction: 'email.archive', ttl: 300 },
+  'email.label':      { undoAction: 'email.removeLabel', ttl: 300 },
+  'email.removeLabel':{ undoAction: 'email.label', ttl: 300 },
+  'email.markRead':   { undoAction: 'email.markUnread', ttl: 300 },
+  'email.star':       { undoAction: 'email.unstar', ttl: 300 },
 
-  if (conflicts.length > 0) {
-    logger.warn('Action conflicts detected', {
-      action: action.type,
-      conflicts: conflicts.map(c => c.reason),
-    });
-    return { status: 'blocked', conflicts };
-  }
+  // Draft operations (longer TTL -- drafts take time to review)
+  'draft.create':     { undoAction: 'draft.delete', ttl: 600 },
+  'draft.update':     { undoAction: 'draft.restore', ttl: 600 },
 
-  pendingActions.push({
-    ...action,
-    bufferedAt: Date.now(),
-    status: 'pending',
-  });
+  // Task operations
+  'task.create':      { undoAction: 'task.delete', ttl: 300 },
+  'task.complete':    { undoAction: 'task.uncomplete', ttl: 300 },
+  'task.archive':     { undoAction: 'task.unarchive', ttl: 300 },
+  'task.prioritize':  { undoAction: 'task.deprioritize', ttl: 300 },
 
-  return { status: 'buffered' };
-}
-```
-
-### Conflict Detection
-
-The conflict checker compares incoming actions against both pending and recently executed actions using type-specific rules:
-
-```javascript
-function checkConflicts(action) {
-  const conflicts = [];
-  const candidates = [...pendingActions, ...getRecentActions()];
-
-  for (const existing of candidates) {
-    // Same target, same action type = duplicate
-    if (existing.type === action.type && existing.target === action.target) {
-      conflicts.push({
-        existing,
-        reason: 'duplicate',
-        message: `${action.type} on ${action.target} already ${existing.status}`,
-      });
-      continue;
-    }
-
-    // Type-specific conflict rules
-    if (CONFLICT_RULES[action.type]?.(action, existing)) {
-      conflicts.push({
-        existing,
-        reason: 'logical-conflict',
-        message: CONFLICT_RULES[action.type].message(action, existing),
-      });
-    }
-  }
-
-  return conflicts;
-}
-
-const CONFLICT_RULES = {
-  'send-message': (action, existing) => {
-    // Don't send two messages to the same recipient within 30s
-    return existing.type === 'send-message'
-      && existing.target === action.target
-      && (Date.now() - existing.executedAt) < 30_000;
-  },
-  'create-task': (action, existing) => {
-    // Don't create tasks with identical titles
-    return existing.type === 'create-task'
-      && existing.payload?.title === action.payload?.title;
-  },
+  // Calendar, reminder, document operations...
+  'event.create':     { undoAction: 'event.delete', ttl: 300 },
+  'reminder.create':  { undoAction: 'reminder.cancel', ttl: 300 },
+  'note.create':      { undoAction: 'note.delete', ttl: 300 },
 };
-```
 
-### Recent Action Tracking
-
-Executed actions are tracked in a sliding window for conflict detection and audit:
-
-```javascript
-// lib/orchestrator/action-log.js — illustrative
-function recordExecution(action, result) {
-  recentActions.push({
-    ...action,
-    executedAt: Date.now(),
-    result: result.success ? 'success' : 'failure',
-  });
-
-  // Prune old entries
-  const cutoff = Date.now() - RECENT_WINDOW;
-  while (recentActions.length > 0 && recentActions[0].executedAt < cutoff) {
-    recentActions.shift();
-  }
+function isReversible(actionType) {
+  return actionType in REVERSIBLE_ACTIONS;
 }
 
-function getRecentActions(filter = {}) {
-  return recentActions.filter(a => {
-    if (filter.type && a.type !== filter.type) return false;
-    if (filter.target && a.target !== filter.target) return false;
-    return true;
-  });
+function getUndoAction(actionType) {
+  return REVERSIBLE_ACTIONS[actionType]?.undoAction || null;
 }
 ```
 
-### Batch Approval
+### DB-Backed Action Buffer
 
-When multiple related actions are pending and autonomy rules require user approval, they are grouped for batch review:
+When a reversible action is executed, it's recorded in an `action_buffer` table with the undo payload and an expiration timestamp:
 
 ```javascript
-function groupForApproval(pending) {
-  const groups = {};
-
-  for (const action of pending) {
-    const key = action.approvalGroup ?? action.type;
-    if (!groups[key]) groups[key] = [];
-    groups[key].push(action);
+// lib/agent/action-buffer/buffer.js
+async function bufferAction({ actionType, actionId, description, undoPayload, ttlSeconds, metadata = {} }) {
+  if (!isReversible(actionType)) {
+    throw new Error(`Action type '${actionType}' is not reversible`);
   }
 
-  return Object.entries(groups).map(([group, actions]) => ({
-    group,
-    count: actions.length,
-    actions: actions.map(a => ({
-      type: a.type,
-      target: a.target,
-      summary: a.summary,
-    })),
-  }));
+  const expiresAt = new Date(Date.now() + (ttlSeconds || getDefaultTTL(actionType)) * 1000);
+
+  const id = await insert('action_buffer', {
+    tenant_id: tenantId,
+    action_type: actionType,
+    action_id: actionId,
+    description,
+    undo_payload: JSON.stringify(undoPayload),
+    undo_action: getUndoAction(actionType),
+    buffered_at: new Date().toISOString(),
+    expires_at: expiresAt.toISOString(),
+    status: 'buffered', // buffered -> undone | finalized
+    metadata: JSON.stringify(metadata),
+  });
+
+  audit.log('action_buffer:buffered', { bufferId: id, actionType, description, expiresAt });
+  return id;
 }
+```
 
-// User approves or rejects a batch
-async function approveBatch(groupId, approved) {
-  const actions = pendingActions.filter(a =>
-    (a.approvalGroup ?? a.type) === groupId
-  );
+### Domain-Specific Undo Handlers
 
-  for (const action of actions) {
-    if (approved) {
-      await dispatch(action);
-    } else {
-      action.status = 'rejected';
+Undo execution dispatches to domain-specific handlers based on the action type prefix. Each handler knows how to reverse its domain's operations:
+
+```javascript
+// lib/agent/action-buffer/undo.js
+async function executeUndo(actionType, undoAction, undoPayload) {
+  const [service] = actionType.split('.');
+
+  switch (service) {
+    case 'email': {
+      const google = require('../../google');
+      return executeEmailUndo(undoAction, undoPayload, google);
     }
+    case 'task': {
+      const tasksV2 = require('../../document-tasks');
+      return executeTaskUndo(undoAction, undoPayload, tasksV2);
+    }
+    case 'document':
+    case 'note': {
+      const documents = require('../../documents');
+      return executeDocumentUndo(undoAction, undoPayload, documents);
+    }
+    // ... event, reminder, draft handlers
   }
+}
+
+// lib/agent/action-buffer/undo-handlers.js
+async function executeEmailUndo(undoAction, payload, google) {
+  const { messageId, labelIds } = payload;
+
+  switch (undoAction) {
+    case 'email.unarchive':
+      await google.gmail.modifyLabels(messageId, ['INBOX'], ['ARCHIVE']);
+      return { restored: messageId };
+
+    case 'email.removeLabel':
+      await google.gmail.modifyLabels(messageId, [], labelIds);
+      return { removedLabels: labelIds };
+
+    case 'email.markUnread':
+      await google.gmail.modifyLabels(messageId, ['UNREAD'], []);
+      return { markedUnread: messageId };
+    // ...
+  }
+}
+
+async function executeTaskUndo(undoAction, payload, tasksV2) {
+  const { taskId, previousState } = payload;
+
+  switch (undoAction) {
+    case 'task.delete':
+      await tasksV2.remove(taskId);
+      return { deleted: taskId };
+
+    case 'task.uncomplete':
+      await tasksV2.update(taskId, { status: 'pending' });
+      return { uncompleted: taskId };
+
+    case 'task.unarchive':
+      await tasksV2.update(taskId, { status: previousState?.status || 'pending' });
+      return { unarchived: taskId };
+  }
+}
+```
+
+### Undo Execution with Window Enforcement
+
+The undo operation checks the TTL window before executing, auto-finalizing if the window has expired:
+
+```javascript
+async function undoAction(bufferId) {
+  const action = await select('action_buffer')
+    .where('id = ?', bufferId)
+    .where("status = 'buffered'")
+    .one();
+
+  if (!action) {
+    return { success: false, message: 'Buffered action not found or already processed' };
+  }
+
+  // Check if still within undo window
+  if (new Date(action.expires_at) < new Date()) {
+    await update('action_buffer', { status: 'finalized' }, 'id = ?', bufferId);
+    return { success: false, message: 'Undo window has expired' };
+  }
+
+  const undoPayload = JSON.parse(action.undo_payload);
+  const result = await executeUndo(action.action_type, action.undo_action, undoPayload);
+
+  await update('action_buffer', {
+    status: 'undone',
+    undone_at: new Date().toISOString(),
+  }, 'id = ?', bufferId);
+
+  return { success: true, message: `Undone: ${action.description}`, undone: result };
+}
+```
+
+### Auto-Finalization and Maintenance
+
+A periodic maintenance job finalizes expired buffered actions and cleans up old records:
+
+```javascript
+// lib/agent/action-buffer/maintenance.js
+async function finalizeExpired() {
+  const now = new Date().toISOString();
+  const result = await raw(
+    `UPDATE action_buffer
+     SET status = 'finalized', finalized_at = $1
+     WHERE status = 'buffered' AND expires_at <= $2
+     RETURNING id`,
+    [now, now]
+  );
+  return result.length;
+}
+
+async function cleanup(daysOld = 7) {
+  const cutoff = new Date(Date.now() - daysOld * 24 * 60 * 60 * 1000).toISOString();
+  const result = await raw(
+    `DELETE FROM action_buffer
+     WHERE status IN ('finalized', 'undone')
+       AND COALESCE(finalized_at, undone_at) < $1
+     RETURNING id`,
+    [cutoff]
+  );
+  return result.length;
+}
+```
+
+### Querying Buffered Actions
+
+Users and the UI can see what's currently undoable, with remaining time displayed:
+
+```javascript
+async function getBufferedActions(options = {}) {
+  const actions = await select('action_buffer')
+    .where("status = 'buffered'")
+    .where('expires_at > ?', new Date().toISOString())
+    .orderBy('buffered_at DESC')
+    .all();
+
+  return actions.map((a) => ({
+    id: a.id,
+    actionType: a.action_type,
+    description: a.description,
+    remainingSeconds: Math.max(0, Math.round((new Date(a.expires_at) - new Date()) / 1000)),
+  }));
 }
 ```
 
 ## Implications
 
-- The buffer adds latency between intent and execution — acceptable for most actions, but immediate actions (like user-requested sends) may need a fast path
-- Conflict detection is rule-based, not ML-based — new action types require new conflict rules
-- Recent action window (5 minutes) is a tuning parameter: too short misses slow-developing conflicts, too long blocks legitimate retries
-- Batch approval reduces notification noise but requires UI support for grouped action review
-- The coordination layer is in-memory — doesn't survive restarts. Persistent buffering would add durability at the cost of complexity
-- False positives (blocking legitimate similar actions) are less harmful than false negatives (allowing duplicates through)
+- The "trust but verify" model lets the agent act immediately for better responsiveness, while giving users a configurable safety net (default 5 minutes, 10 minutes for drafts)
+- DB-backed buffering survives restarts -- unlike in-memory action logs, buffered actions persist through deployments and crashes
+- Domain-specific undo handlers keep reversal logic close to the service it operates on (Gmail, tasks, documents), making it testable in isolation
+- The reversible action registry is a closed set -- only explicitly declared action types can be buffered, preventing accidental buffering of irreversible operations
+- TTL expiration is a clean state transition: `buffered` -> `finalized` happens automatically, no user action required for the happy path
+- The `undoPayload` carries all data needed for reversal at buffer time -- the undo handler doesn't need to re-query state, which avoids race conditions if the underlying data changes
+- Maintenance cleanup (7-day default) prevents the action_buffer table from growing unboundedly
+- Action types use a `service.operation` naming convention (e.g., `email.archive`) that makes dispatch routing trivial via `actionType.split('.')`
 
 ## Code Example
 
 ```javascript
-// Worker tries to send a follow-up message
-const result = bufferAction({
-  type: 'send-message',
-  target: 'user:alice',
-  payload: { text: 'Following up on your request' },
-  source: 'scheduled-task',
-});
-// → { status: 'blocked', conflicts: [{ reason: 'duplicate', message: 'send-message on user:alice already executed 15s ago' }] }
+const buffer = require('./lib/agent/action-buffer');
 
-// Two tasks created from different sources — conflict caught
-bufferAction({ type: 'create-task', payload: { title: 'Review PR #42' }, source: 'chat' });
-bufferAction({ type: 'create-task', payload: { title: 'Review PR #42' }, source: 'worker' });
-// Second one blocked as duplicate
+// Agent archives an email autonomously
+const bufferId = await buffer.bufferAction({
+  actionType: 'email.archive',
+  description: 'Archived newsletter from TechDaily',
+  undoPayload: { messageId: 'abc123' },
+  ttlSeconds: 300,
+});
+
+// User sees notification: "Archived newsletter from TechDaily [Undo]"
+
+// Check what's undoable
+const undoable = await buffer.getBufferedActions();
+// → [{ id: 5, actionType: 'email.archive', description: 'Archived newsletter...',
+//      remainingSeconds: 287 }]
+
+// User clicks Undo within 5 minutes
+const result = await buffer.undoAction(bufferId);
+// → { success: true, message: 'Undone: Archived newsletter from TechDaily' }
+
+// After TTL expires, unclaimed actions auto-finalize
+await buffer.finalizeExpired();
+
+// Weekly cleanup of old records
+await buffer.cleanup(7);
 ```
 
 ## Related Patterns
 
-- [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
-- [Worker Dispatcher and Priority Queue](./worker-dispatcher-and-priority-queue.md)
 - [Undo and Revert System](./undo-and-revert-system.md)
+- [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
+- [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)

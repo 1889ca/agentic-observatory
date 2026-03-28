@@ -1,263 +1,323 @@
 # Situation Detection and Context Awareness
 
-> Runtime detection of user situations (in a meeting, on mobile, debugging, deploying) that adjusts agent behavior through prompt-injected hints rather than hard-coded tool restrictions.
+> Runtime detection of user situations (in a meeting, deep work, traveling, stressed) that adjusts agent behavior through structured behavior objects and priority-based merging.
 
 ## Problem
 
-An AI agent that behaves identically regardless of what the user is currently doing becomes either intrusive or unhelpful. Sending a deployment notification while the user is presenting to a client is disruptive. Generating a detailed code walkthrough when the user is on mobile and needs a quick answer wastes their time. Agents need situational awareness — the ability to detect what's happening around the user and adjust their behavior accordingly. But hard-coding behavioral rules into every tool creates a maintenance nightmare and makes the system brittle to new situations.
+An AI agent that behaves identically regardless of what the user is currently doing becomes either intrusive or unhelpful. Sending a deployment notification while the user is presenting to a client is disruptive. Offering task suggestions when the user is overwhelmed adds cognitive load instead of reducing it. Agents need situational awareness -- the ability to detect what's happening around the user and adjust their behavior accordingly. But hard-coding behavioral rules into every tool creates a maintenance nightmare and makes the system brittle to new situations.
 
 ## Context
 
 - An orchestrator that interacts with users across multiple channels and time zones
-- External signals available: calendar APIs, user status indicators, conversation patterns, time-of-day data
-- Multiple situations can overlap (e.g., "on mobile" and "in a meeting" simultaneously)
-- Behavioral adjustments range from tone changes to tool suppression
+- External signals available: calendar APIs, focus mode status, time-of-day data, health/wellness metrics
+- Multiple situations can overlap (e.g., "weekend" and "late_night" simultaneously)
+- Behavioral adjustments range from tone changes to notification suppression to proactive action gating
 - The system should degrade gracefully when detection signals are unavailable
+- Manual situations (traveling, vacation) coexist with auto-detected ones
 
 ## Solution
 
-### Situation Registry
+### Situation Definitions with Structured Behaviors
 
-Each situation is a named object with detection rules, behavioral hints, a priority for conflict resolution, and a TTL for automatic expiry:
+Each situation is a named object with a type classification, detection method, priority for conflict resolution, and a structured `behaviors` object that describes how the agent should adapt:
 
 ```javascript
-// situations/registry.js
-const situations = {
-  'in-meeting': {
-    priority: 90,
-    ttlMs: 2 * 60 * 60 * 1000, // 2 hours max
-    hints: [
-      'User is in a meeting. Keep responses extremely brief.',
-      'Do NOT send notifications to external channels.',
-      'Prefer bullet points over prose.',
-    ],
-    suppressTools: ['send-notification', 'deploy', 'schedule-message'],
-  },
-
-  'on-mobile': {
-    priority: 70,
-    ttlMs: 4 * 60 * 60 * 1000,
-    hints: [
-      'User is on mobile. Keep responses short and scannable.',
-      'Avoid code blocks longer than 10 lines.',
-      'Prefer summaries over full details — offer to expand if needed.',
-    ],
-    suppressTools: [],
-  },
-
-  'debugging': {
-    priority: 50,
-    ttlMs: 60 * 60 * 1000,
-    hints: [
-      'User is actively debugging. Prioritize precision over brevity.',
-      'Include line numbers, stack traces, and exact error messages.',
-      'Suggest diagnostic steps rather than jumping to conclusions.',
-    ],
-    suppressTools: [],
-  },
-
-  'in-deploy': {
+// lib/situations/definitions.js
+const SITUATIONS = {
+  in_meeting: {
+    type: 'activity',
+    detection: 'calendar',
     priority: 80,
-    ttlMs: 30 * 60 * 1000,
-    hints: [
-      'A deployment is in progress. Minimize non-critical interruptions.',
-      'Prioritize deployment-related queries over everything else.',
-      'Surface health check results proactively.',
-    ],
-    suppressTools: ['consolidate-memory', 'run-reflection'],
+    behaviors: {
+      notifications: 'silent',
+      tone: 'brief',
+      interruptions: 'block',
+      proactiveSuggestions: false,
+    },
+  },
+
+  deep_work: {
+    type: 'activity',
+    detection: 'focus_mode',
+    priority: 70,
+    behaviors: {
+      notifications: 'minimal',
+      tone: 'focused',
+      interruptions: 'block',
+      proactiveSuggestions: false,
+      briefings: 'defer',
+    },
+  },
+
+  morning: {
+    type: 'temporal',
+    detection: 'time',
+    timeRange: { start: 6, end: 10 },
+    priority: 20,
+    behaviors: {
+      tone: 'energetic',
+      proactive: ['briefing', 'priority_todos'],
+    },
+  },
+
+  late_night: {
+    type: 'temporal',
+    detection: 'time',
+    timeRange: { start: 22, end: 6 }, // wraps around midnight
+    priority: 30,
+    behaviors: {
+      tone: 'calm',
+      proactiveSuggestions: false,
+      notifications: 'minimal',
+    },
+  },
+
+  vacation: {
+    type: 'manual',
+    detection: 'manual',
+    priority: 90,
+    behaviors: {
+      notifications: 'emergency_only',
+      tone: 'relaxed',
+      interruptions: 'block',
+      proactiveSuggestions: false,
+      briefings: 'skip',
+    },
+  },
+
+  // Wellness-based situations (auto-detected from health data)
+  stressed: {
+    type: 'wellness',
+    detection: 'health_data',
+    healthCondition: { metric: 'stress', threshold: 7, comparison: 'gte' },
+    priority: 45,
+    behaviors: {
+      tone: 'calm_supportive',
+      proactiveSuggestions: 'wellness_only',
+      taskSuggestions: 'reduce',
+      offerWellnessCheck: true,
+    },
+  },
+
+  overwhelmed: {
+    type: 'wellness',
+    detection: 'health_data',
+    healthCondition: {
+      type: 'compound',
+      conditions: [
+        { metric: 'stress', threshold: 7, comparison: 'gte' },
+        { metric: 'energy', threshold: 4, comparison: 'lte' },
+      ],
+      require: 'all',
+    },
+    priority: 55,
+    behaviors: {
+      tone: 'very_supportive',
+      proactiveSuggestions: false,
+      taskSuggestions: 'block',
+      interruptions: 'gentle',
+      offerSupport: true,
+      reduceCognitiveLoad: true,
+    },
   },
 };
 ```
 
-### Detection Sources
+Key design decision: behaviors are structured objects (not hint arrays). Each property maps to a specific behavioral dimension -- `notifications`, `tone`, `interruptions`, `proactiveSuggestions` -- making them machine-readable for downstream consumers rather than relying on LLM interpretation of free-text hints.
 
-Situations are detected through multiple lightweight sources, each returning zero or more situation activations:
+### Four Situation Types
 
-```javascript
-// situations/detectors.js
-const detectors = [
-  // Calendar integration — check for active/upcoming meetings
-  async function calendarDetector(userId) {
-    const events = await calendar.getCurrentEvents(userId);
-    if (!events.length) return [];
+Situations fall into four categories, each with a different detection mechanism:
 
-    const inMeeting = events.some(e => e.status === 'active');
-    return inMeeting ? [{ situation: 'in-meeting', source: 'calendar', expiresAt: events[0].end }] : [];
-  },
+1. **Activity** -- detected from external signals like calendar events (`in_meeting`) or OS focus mode (`deep_work`)
+2. **Temporal** -- detected from time of day (`morning`, `late_night`, `end_of_day`) or day of week (`weekend`)
+3. **Manual** -- user-activated situations stored in the database (`traveling`, `vacation`, `presenting`)
+4. **Wellness** -- auto-detected from health/mood tracking data with threshold conditions (`stressed`, `low_energy`, `overwhelmed`)
 
-  // Channel signal — mobile clients send a device header
-  function channelDetector(userId, messageContext) {
-    if (messageContext?.deviceType === 'mobile') {
-      return [{ situation: 'on-mobile', source: 'channel-header' }];
-    }
-    return [];
-  },
+### Parallel Detection
 
-  // Conversation analysis — detect debugging patterns from recent messages
-  function conversationDetector(userId, messageContext, recentHistory) {
-    const debugIndicators = ['stack trace', 'error', 'bug', 'TypeError', 'undefined is not', 'segfault'];
-    const recentTexts = recentHistory.slice(0, 5).map(m => m.content).join(' ').toLowerCase();
-    const matches = debugIndicators.filter(i => recentTexts.includes(i.toLowerCase()));
-
-    if (matches.length >= 2) {
-      return [{ situation: 'debugging', source: 'conversation-analysis' }];
-    }
-    return [];
-  },
-
-  // System state — detect active deployments
-  async function deployDetector(userId) {
-    const activeDeploys = await deploys.getActive(userId);
-    if (activeDeploys.length > 0) {
-      return [{ situation: 'in-deploy', source: 'deploy-tracker' }];
-    }
-    return [];
-  },
-];
-```
-
-### Situation Activation and Stacking
-
-Multiple situations can be active simultaneously. The activation manager tracks active situations, handles expiry, and resolves conflicts when hints contradict each other:
+The detector runs all detection sources concurrently. Each source is isolated -- a failure in one doesn't affect others:
 
 ```javascript
-// situations/manager.js
-const activeSituations = new Map(); // userId -> Map<situationName, activation>
+// lib/situations/detector.js
+async function detect(options = {}) {
+  const { skipCache = false, manualSituations = [] } = options;
+  const active = [];
 
-async function detectSituations(userId, messageContext, recentHistory) {
-  // Run all detectors in parallel — each is lightweight, no LLM calls
-  const detections = await Promise.all(
-    detectors.map(d => d(userId, messageContext, recentHistory).catch(() => []))
-  );
-  const flat = detections.flat();
+  // Run all async detections in PARALLEL
+  const [focusResult, calendarResult, healthStats] = await Promise.all([
+    detectFocusMode().catch(() => false),
+    detectCalendarMeeting().catch(() => ({ inMeeting: false, event: null })),
+    getHealthStats().catch(() => ({})),
+  ]);
 
-  const userSituations = activeSituations.get(userId) ?? new Map();
-
-  // Activate new situations
-  for (const detection of flat) {
-    const definition = situations[detection.situation];
-    if (!definition) continue;
-
-    userSituations.set(detection.situation, {
-      ...definition,
-      activatedAt: Date.now(),
-      expiresAt: detection.expiresAt ?? Date.now() + definition.ttlMs,
-      source: detection.source,
-    });
+  // Process each detection source
+  if (focusResult) {
+    active.push({ name: 'deep_work', definition: SITUATIONS.deep_work, source: 'detected' });
   }
 
-  // Expire stale situations
-  for (const [name, activation] of userSituations) {
-    if (Date.now() > activation.expiresAt) {
-      userSituations.delete(name);
+  if (calendarResult.inMeeting) {
+    active.push({ name: 'in_meeting', definition: SITUATIONS.in_meeting, source: 'detected' });
+  }
+
+  // Time-based (synchronous, no external calls)
+  for (const [name, def] of Object.entries(getByDetection('time'))) {
+    if (def.timeRange && isInTimeRange(def.timeRange)) {
+      active.push({ name, definition: def, source: 'detected' });
     }
   }
 
-  activeSituations.set(userId, userSituations);
-  return userSituations;
+  // Health-based situations
+  active.push(...detectHealthSituations(healthStats));
+
+  // Manual situations from DB
+  for (const manual of manualSituations) {
+    if (!manual.expiresAt || new Date(manual.expiresAt) > new Date()) {
+      active.push({ name: manual.name, definition: getDefinition(manual.name), source: 'manual' });
+    }
+  }
+
+  return active;
 }
 ```
 
-### Priority-Based Conflict Resolution
+Detection results are cached for 5 seconds to avoid redundant work during a single request cycle. Health stats use a longer 60-second cache since they change slowly.
 
-When multiple active situations provide conflicting hints (e.g., "be brief" vs. "be detailed"), the higher-priority situation wins:
+### Priority-Based Behavior Merging
+
+When multiple situations are active simultaneously, their behaviors are merged with higher-priority situations overriding lower-priority ones:
 
 ```javascript
-// situations/resolver.js
-function resolveHints(userSituations) {
-  // Sort by priority descending
-  const sorted = [...userSituations.values()]
-    .sort((a, b) => b.priority - a.priority);
+// lib/situations/index.js
+async function getBehaviors() {
+  const active = await detect();
 
-  const hints = [];
-  const suppressedTools = new Set();
+  // Sort by priority (lower first, so higher priority overrides)
+  const sorted = [...active].sort((a, b) => a.definition.priority - b.definition.priority);
 
+  // Merge behaviors -- higher priority wins on conflicts
+  const behaviors = {};
   for (const situation of sorted) {
-    hints.push(...situation.hints);
-    situation.suppressTools.forEach(t => suppressedTools.add(t));
+    Object.assign(behaviors, situation.definition.behaviors);
   }
 
-  return { hints, suppressedTools };
+  return behaviors;
 }
 ```
 
-### Prompt Injection (Not Hard-Coding)
+### Suppression Checks
 
-Situations modify behavior through system prompt injection, not by altering tool logic. The tool declarations remain unchanged — the LLM receives hints about what to avoid and decides accordingly:
+Downstream systems query the situation layer to decide whether to proceed with actions:
 
 ```javascript
-// situations/injector.js
-function injectSituationalContext(systemPrompt, userSituations) {
-  if (userSituations.size === 0) return systemPrompt;
+async function shouldSuppress(action) {
+  const behaviors = await getBehaviors();
 
-  const { hints, suppressedTools } = resolveHints(userSituations);
-
-  const situationBlock = [
-    '## Active Situations',
-    ...hints.map(h => `- ${h}`),
-  ];
-
-  if (suppressedTools.size > 0) {
-    situationBlock.push('');
-    situationBlock.push('## Tool Restrictions (current situation)');
-    situationBlock.push(`Avoid using these tools unless the user explicitly requests them: ${[...suppressedTools].join(', ')}`);
+  if (action === 'notification') {
+    if (behaviors.notifications === 'silent') {
+      return { suppress: true, reason: 'Notifications are silenced' };
+    }
+    if (behaviors.notifications === 'emergency_only') {
+      return { suppress: true, reason: 'Only emergency notifications allowed' };
+    }
   }
 
-  return systemPrompt + '\n\n' + situationBlock.join('\n');
+  if (action === 'interruption' && behaviors.interruptions === 'block') {
+    return { suppress: true, reason: 'Interruptions are blocked' };
+  }
+
+  if (action === 'proactive' && behaviors.proactiveSuggestions === false) {
+    return { suppress: true, reason: 'Proactive suggestions disabled' };
+  }
+
+  return { suppress: false };
 }
 ```
 
-The key design decision: tool restrictions are expressed as hints ("avoid using"), not enforced blocks. If the user explicitly says "deploy now" during a meeting, the LLM can still call the deploy tool. The hints shift default behavior without removing capabilities.
+### Manual Activation with DB Persistence
+
+Manual situations are stored in the database with optional expiry, surviving process restarts:
+
+```javascript
+async function activate(name, options = {}) {
+  const { source = 'manual', expiresAt = null, data = {} } = options;
+  const def = definitions.getDefinition(name);
+
+  // Get or create the context in the database
+  let context = await rawOne('SELECT id FROM contexts WHERE name = $1', [name]);
+
+  if (!context && def) {
+    await insert('contexts', {
+      name,
+      type: def.type,
+      behaviors: JSON.stringify(def.behaviors),
+      priority: def.priority,
+    });
+    context = await rawOne('SELECT id FROM contexts WHERE name = $1', [name]);
+  }
+
+  await insert('active_contexts', {
+    context_id: context.id,
+    activated_by: source,
+    activation_data: JSON.stringify(data),
+    expires_at: expiresAt ? new Date(expiresAt).toISOString() : null,
+  });
+
+  // Log to history for pattern analysis
+  await insert('context_history', { context_id: context.id, context_name: name });
+
+  detector.clearCache();
+  return { success: true };
+}
+```
 
 ## Implications
 
-- Detection runs as a pre-processing step before context assembly — it adds negligible latency because detectors use cached data and simple heuristics, not LLM calls
-- Prompt injection keeps tool logic clean — tools don't need to know about situations, and new situations can be added without modifying any tool code
-- Hints are advisory, not mandatory — the LLM can override them when the user's explicit intent contradicts the situation, preserving user agency
-- TTL-based expiry prevents stale situations from persisting indefinitely, but may expire too early if a meeting runs long; calendar-sourced expirations are more accurate
-- Priority-based resolution is simple but coarse — two situations with the same priority will both contribute hints without conflict resolution between them
-- Graceful degradation: if a detector fails (calendar API down, no device header), it returns an empty array and other detectors continue normally
-- Situation stacking means the agent can be simultaneously "on mobile" and "in a meeting," receiving hints from both — the combined effect is more restrictive than either alone
+- Structured behaviors (not free-text hints) make situation effects machine-testable -- you can assert that `getBehaviors().notifications === 'silent'` during a meeting without parsing natural language
+- Detection runs as a pre-processing step with parallel execution and caching -- negligible latency impact since detectors use cached data, not LLM calls
+- Wellness situations add empathy-aware behavior -- the agent reduces cognitive load when the user reports high stress, rather than pushing more tasks
+- Priority-based merging is simple but effective -- vacation (priority 90) overrides weekend (priority 15), and meeting (80) overrides morning (20)
+- Manual situations persist in the database with expiry dates, so "I'm traveling until Friday" survives process restarts and auto-deactivates
+- Graceful degradation: if any detection source fails (calendar API down, no health data), it returns a safe default and other detectors continue normally
+- The `shouldSuppress` API provides a clean integration point -- notification systems, proactive features, and briefing generators all check situations before acting
+- Compound health conditions (e.g., `overwhelmed` requires both high stress AND low energy) prevent false positives from single-metric spikes
 
 ## Code Example
 
 ```javascript
-// Complete situation detection and injection during message processing
-async function processMessageWithSituations(message, userId, messageContext) {
-  const recentHistory = await getRecentHistory(userId, 5);
+// Full usage: detect situations and adjust behavior
+const situations = require('./lib/situations');
 
-  // Detect active situations — runs all detectors in parallel
-  const userSituations = await detectSituations(userId, messageContext, recentHistory);
+// Get all currently active situations
+const active = await situations.getActive();
+// → [{ name: 'morning', type: 'temporal', priority: 20 },
+//    { name: 'stressed', type: 'wellness', priority: 45 }]
 
-  // Build base system prompt (persona, capabilities, anti-patterns)
-  let systemPrompt = await buildSystemPrompt(userId);
+// Get merged behaviors
+const behaviors = await situations.getBehaviors();
+// → { tone: 'calm_supportive', proactiveSuggestions: 'wellness_only',
+//    proactive: ['briefing', 'priority_todos'], taskSuggestions: 'reduce' }
 
-  // Inject situational context as hints
-  systemPrompt = injectSituationalContext(systemPrompt, userSituations);
-
-  // Log active situations for observability
-  if (userSituations.size > 0) {
-    const names = [...userSituations.keys()];
-    logger.info(`Active situations for ${userId}: ${names.join(', ')}`);
-  }
-
-  // Assemble context and dispatch to LLM with situation-aware prompt
-  const context = await assembleContext(message, 'user');
-  const response = await dispatch(systemPrompt, context, message);
-
-  return response;
+// Check before sending notification
+const { suppress, reason } = await situations.shouldSuppress('notification');
+if (suppress) {
+  logger.info(`Notification suppressed: ${reason}`);
 }
 
-// Example: user sends a message while in a meeting on mobile
-// Detected situations: 'in-meeting' (priority 90), 'on-mobile' (priority 70)
-// Injected hints:
-//   - User is in a meeting. Keep responses extremely brief.
-//   - Do NOT send notifications to external channels.
-//   - Prefer bullet points over prose.
-//   - User is on mobile. Keep responses short and scannable.
-//   - Avoid code blocks longer than 10 lines.
-// Suppressed tools: send-notification, deploy, schedule-message
-// Result: LLM gives a 3-bullet response instead of a detailed explanation
+// Get the current tone for response generation
+const tone = await situations.getTone();
+// → 'calm_supportive' (stressed overrides morning's 'energetic')
+
+// Manually activate a situation
+await situations.activate('traveling', {
+  expiresAt: '2024-01-15T00:00:00Z',
+  data: { destination: 'Tokyo' },
+});
+
+// Check specific situation
+if (await situations.isActive('deep_work')) {
+  // Don't interrupt
+}
 ```
 
 ## Related Patterns

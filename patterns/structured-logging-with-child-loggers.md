@@ -1,265 +1,197 @@
 # Structured Logging with Child Loggers
 
-> Pino-based JSON logging with per-module child loggers, configurable levels, environment metadata in every entry, and AsyncLocalStorage integration for correlation IDs.
+> Pino-based JSON logging with a single global `LOG_LEVEL`, per-module child loggers created via `child({ module: '...' })`, environment-aware pretty printing, and stdout-only output.
 
 ## Problem
 
-Unstructured logging — `console.log('something happened')` — works until it doesn't. When multiple modules emit logs concurrently across async operations, flat text output becomes unreadable. Correlating a request's journey across modules requires manual grepping. Debug-level logs from a noisy module drown out important messages from others, but the only control is a global level that's all-or-nothing. In production, text logs resist automated parsing, making alerting and dashboards unreliable. And sensitive context (PID, environment, module origin) must be manually included in every log call, which means it's inconsistently present.
+Unstructured logging — `console.log('something happened')` — works until it doesn't. When multiple modules emit logs concurrently across async operations, flat text output becomes unreadable. Correlating a request's journey across modules requires manual grepping. Sensitive context (PID, environment, module origin) must be manually included in every log call, which means it's inconsistently present. In production, text logs resist automated parsing, making alerting and dashboards unreliable.
 
 ## Context
 
-- A Node.js orchestrator with many modules (database, Redis, job scheduler, messenger, HTTP server, etc.)
+- A Node.js orchestrator with many modules (database, Redis, job scheduler, messenger, HTTP server, LLM providers, worker dispatch, etc.)
 - Concurrent async operations make log interleaving a constant problem
-- Different modules need different log verbosity — the database layer at debug during a migration issue, everything else at info
-- Production logs feed into a log aggregation system (ELK, Datadog, etc.) that expects structured JSON
+- Production logs feed into a log aggregation system that expects structured JSON
 - Development logs need to be human-readable without piping through external tools
-- Request-scoped correlation IDs must appear in log entries without passing them through every function call
+- Module identification should appear automatically without manual tagging in every log call
 
 ## Solution
 
-### Logger Factory with Automatic Metadata
+### Root Logger with Global Level
 
-The core module creates a root Pino logger with base metadata that appears in every log entry. Child loggers are created per module, automatically tagging every entry with the module name:
+The core module creates a root Pino logger with a single global log level. There are no per-module level overrides — one `LOG_LEVEL` environment variable controls all output:
 
-```typescript
-// lib/logger.ts
-import pino, { Logger, LoggerOptions } from 'pino';
+```javascript
+// lib/logger.js
+const pino = require('pino')
 
-const IS_DEV = process.env.NODE_ENV !== 'production';
+const isProduction = process.env.NODE_ENV === 'production'
+const isDevelopment = !isProduction
 
-const rootOptions: LoggerOptions = {
-  level: process.env.LOG_LEVEL || 'info',
+// Single global level — no per-module overrides
+const LOG_LEVEL = process.env.LOG_LEVEL || (isProduction ? 'info' : 'debug')
+
+const usePrettyPrint = process.env.LOG_PRETTY === 'true' || isDevelopment
+
+const baseConfig = {
+  level: LOG_LEVEL,
+  timestamp:
+    pino.stdTimeFunctions?.isoTime ||
+    (() => `,"time":"${new Date().toISOString()}"`),
   base: {
     pid: process.pid,
     env: process.env.NODE_ENV || 'development',
   },
-  timestamp: pino.stdTimeFunctions.isoTime,
-  ...(IS_DEV && {
-    transport: {
+}
+```
+
+### Environment-Aware Transport
+
+In development, `pino-pretty` provides colorized, human-readable output. If `pino-pretty` is not installed (e.g., in a minimal production container), the logger falls back to standard JSON:
+
+```javascript
+// lib/logger.js
+let transport = null
+if (usePrettyPrint) {
+  try {
+    require.resolve('pino-pretty')
+    transport = pino.transport({
       target: 'pino-pretty',
       options: {
         colorize: true,
-        translateTime: 'HH:MM:ss',
+        translateTime: 'SYS:yyyy-mm-dd HH:MM:ss.l',
         ignore: 'pid,hostname',
+        messageFormat: '{module} {msg}',
       },
-    },
-  }),
-};
-
-const root: Logger = pino(rootOptions);
-
-/**
- * Create a child logger for a specific module.
- * Every log entry from this logger includes { module: name }.
- */
-export function createLogger(moduleName: string): Logger {
-  const level = getModuleLevel(moduleName);
-  const child = root.child({ module: moduleName });
-
-  if (level) {
-    child.level = level;
-  }
-
-  return child;
-}
-```
-
-### Per-Module Log Levels
-
-Different modules can run at different log levels. This is configured via environment variables — a comma-separated list of `module=level` overrides:
-
-```typescript
-// LOG_LEVELS="lib/db=debug,lib/redis=warn,lib/scheduler=trace"
-const MODULE_LEVELS: Record<string, string> = {};
-
-function parseModuleLevels(): void {
-  const config = process.env.LOG_LEVELS || '';
-  if (!config) return;
-
-  for (const entry of config.split(',')) {
-    const [module, level] = entry.trim().split('=');
-    if (module && level) {
-      MODULE_LEVELS[module] = level;
-    }
+    })
+  } catch {
+    // pino-pretty not installed — use default JSON
+    transport = null
   }
 }
 
-parseModuleLevels();
+const rootLogger = pino(baseConfig, transport)
+```
 
-function getModuleLevel(moduleName: string): string | undefined {
-  // Exact match first
-  if (MODULE_LEVELS[moduleName]) return MODULE_LEVELS[moduleName];
+The `messageFormat: '{module} {msg}'` ensures the module name appears inline in pretty output, making it easy to visually scan which module produced each line.
 
-  // Prefix match: 'lib/db' matches 'lib/db/migrate'
-  for (const [prefix, level] of Object.entries(MODULE_LEVELS)) {
-    if (moduleName.startsWith(prefix)) return level;
-  }
+### Child Logger Factory
 
-  return undefined; // Use root level
+Every module creates a child logger by calling `child()` with a module binding. The child inherits the root's level and transport but tags every entry with the module name:
+
+```javascript
+// lib/logger.js
+function child(bindings) {
+  return rootLogger.child(bindings)
+}
+
+// Exported alongside direct logging methods
+module.exports = {
+  info: rootLogger.info.bind(rootLogger),
+  warn: rootLogger.warn.bind(rootLogger),
+  error: rootLogger.error.bind(rootLogger),
+  debug: rootLogger.debug.bind(rootLogger),
+  trace: rootLogger.trace.bind(rootLogger),
+  fatal: rootLogger.fatal.bind(rootLogger),
+  child,
+  level: () => rootLogger.level,
+  isLevelEnabled: (level) => rootLogger.isLevelEnabled(level),
+  logger: rootLogger,
 }
 ```
 
-### Correlation ID Integration via AsyncLocalStorage
+The root logger methods are exported directly so callers without a module context (startup code, one-off scripts) can log without creating a child.
 
-Log entries automatically include the request correlation ID when one is set in the current async context. This uses `AsyncLocalStorage` — no parameter drilling required:
+### Module Usage Pattern
 
-```typescript
-import { AsyncLocalStorage } from 'async_hooks';
+Every module follows the same two-line pattern to get a fully configured logger:
 
-interface RequestContext {
-  correlationId: string;
-  userId?: string;
-}
+```javascript
+// In any module
+const logger = require('./logger').child({ module: 'redis' })
 
-const asyncContext = new AsyncLocalStorage<RequestContext>();
-
-// Pino mixin: runs on every log call, injecting context from AsyncLocalStorage
-const rootOptionsWithMixin: LoggerOptions = {
-  ...rootOptions,
-  mixin() {
-    const ctx = asyncContext.getStore();
-    if (!ctx) return {};
-
-    return {
-      correlationId: ctx.correlationId,
-      ...(ctx.userId && { userId: ctx.userId }),
-    };
-  },
-};
+// All log calls automatically include { module: 'redis' }
+logger.info('Initial connection established')
+logger.warn({ delayMs: 1000, attempt: 3 }, 'Reconnecting')
+logger.error({ err }, 'Client error')
 ```
 
-The mixin runs synchronously on every log call. When there's no active async context (background tasks, startup logging), it returns an empty object — no extra fields, no errors.
+This pattern is used consistently across the entire codebase. Representative child loggers include:
 
-### Request Context Middleware
+```javascript
+// lib/redis.js
+const logger = require('./logger').child({ module: 'redis' })
 
-The HTTP server middleware establishes the async context for each request, generating or extracting a correlation ID:
+// lib/llm/providers/gemini.js
+const logger = require('../../logger').child({ module: 'llm-gemini' })
 
-```typescript
-import { randomUUID } from 'crypto';
+// lib/worker/dispatch.js
+const logger = require('../logger').child({ module: 'worker-dispatch' })
 
-function requestContextMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const correlationId =
-    (req.headers['x-correlation-id'] as string) || randomUUID();
-
-  // Set on response for client visibility
-  res.set('X-Correlation-ID', correlationId);
-
-  const context: RequestContext = {
-    correlationId,
-    userId: req.user?.id,
-  };
-
-  asyncContext.run(context, () => next());
-}
-
-app.use(requestContextMiddleware);
+// lib/skills/matcher.js
+const logger = require('../logger').child({ module: 'skill-matcher' })
 ```
 
 ### Output Formats
 
-In development, `pino-pretty` produces human-readable colorized output:
+In development with `pino-pretty`:
 
 ```
-14:23:07 INFO  [lib/scheduler]: Running job morning-review
-    correlationId: "abc-123"
-14:23:07 DEBUG [lib/db]: Query executed in 12ms
-    correlationId: "abc-123"
-    sql: "SELECT * FROM tasks WHERE status = $1"
+2026-03-28 09:15:02.123 INFO  redis Initial connection established
+2026-03-28 09:15:02.456 WARN  redis Reconnecting
+    delayMs: 1000
+    attempt: 3
 ```
 
-In production, raw JSON goes to stdout for log aggregation:
+In production, raw JSON to stdout:
 
 ```json
-{"level":30,"time":"2025-03-15T14:23:07.123Z","pid":1234,"env":"production","module":"lib/scheduler","correlationId":"abc-123","msg":"Running job morning-review"}
+{"level":30,"time":"2026-03-28T09:15:02.123Z","pid":1234,"env":"production","module":"redis","msg":"Initial connection established"}
 ```
 
-### Log Levels and Their Usage
+### No AsyncLocalStorage, No Per-Module Levels
 
-The six standard Pino levels, with conventions for when to use each:
-
-```typescript
-const logger = createLogger('lib/example');
-
-// trace: ultra-verbose, function entry/exit, loop iterations
-logger.trace({ input }, 'Processing item');
-
-// debug: internal state useful during development or debugging
-logger.debug({ queryMs: 12, sql }, 'Query executed');
-
-// info: normal operational events — startup, job completion, config loaded
-logger.info({ jobName }, 'Job completed successfully');
-
-// warn: unexpected but recoverable — fallback used, retry needed, deprecated usage
-logger.warn({ attempt: 3 }, 'Redis reconnection attempt');
-
-// error: operation failed — includes error object for stack trace
-logger.error({ err, taskId }, 'Task execution failed');
-
-// fatal: process cannot continue — about to exit
-logger.fatal({ err }, 'Unrecoverable error — shutting down');
-```
-
-### No Custom Transports
-
-The logger writes to stdout exclusively. Log routing, filtering, and shipping are handled by the deployment environment (Docker log driver, systemd journal, log collector sidecar). This keeps the application simple and avoids the reliability issues of in-process log shipping:
-
-```typescript
-// In production: raw JSON to stdout
-// Docker/k8s/systemd captures stdout
-// Log collector (Filebeat, Fluentd, Vector) ships to aggregation
-
-// In development: pino-pretty to stdout
-// Developer reads directly in terminal
-```
+The logger is intentionally simple. There is no `AsyncLocalStorage` mixin for correlation IDs — request tracing, if needed, is handled at a different layer. There are no per-module level overrides — the global `LOG_LEVEL` (defaulting to `debug` in development, `info` in production) applies uniformly. This keeps the logger fast and predictable.
 
 ## Implications
 
 - Structured JSON enables automated alerting, dashboards, and querying in log aggregation systems — impossible with unstructured text
-- Per-module levels let developers increase verbosity for a specific module during debugging without being drowned by noise from others
-- The `mixin` function runs on every log call — it must be fast. AsyncLocalStorage lookup is O(1) so this is safe, but custom mixins should avoid I/O
-- Child loggers are cheap in Pino (they share serializers and transport with the parent) — creating one per module is fine
-- `pino-pretty` is a dev dependency only — it should not be in the production bundle
-- The correlation ID bridges log entries across modules for a single request, making distributed tracing possible without a full tracing framework
-- Writing only to stdout means the application never blocks on log I/O (no file rotation, no network calls) — log reliability is the platform's responsibility
-- Fatal-level logs should be paired with a `process.exit(1)` — Pino doesn't exit for you
+- A single global level is simpler to reason about than per-module overrides but means turning on debug for one noisy module affects all modules
+- Child loggers are cheap in Pino (they share serializers and transport with the parent) — creating one per module adds negligible overhead
+- The `pino-pretty` fallback means the logger works in any environment, even if `pino-pretty` is not installed — it just outputs JSON
+- Writing only to stdout means the application never blocks on log I/O — log reliability is the platform's responsibility (Docker, systemd, log collectors)
+- The exported root-level methods (`info`, `warn`, etc.) provide a convenience for code that does not belong to a specific module, but child loggers should be preferred for traceability
+- No custom transports — log routing, filtering, and shipping are handled by the deployment environment
 
 ## Code Example
 
-```typescript
-// Usage in a module — two lines to get a fully configured logger
-import { createLogger } from '../lib/logger';
+```javascript
+// Typical module usage
+const logger = require('../logger').child({ module: 'job-lock' })
 
-const logger = createLogger('lib/scheduler');
-
-async function executeJob(jobName: string): Promise<void> {
-  logger.info({ jobName }, 'Starting job execution');
-
-  const startTime = Date.now();
+async function tryAcquire(jobName) {
+  logger.info({ jobName }, 'Attempting lock acquisition')
 
   try {
-    const result = await runJobByName(jobName);
-
-    logger.info(
-      { jobName, durationMs: Date.now() - startTime, result: result.summary },
-      'Job completed'
-    );
+    const result = await acquireLock(jobName)
+    if (result.acquired) {
+      logger.info({ jobName, distributed: result.distributed }, 'Lock acquired')
+    } else {
+      logger.info({ jobName, reason: result.reason }, 'Skipping job: lock not acquired')
+    }
+    return result
   } catch (err) {
-    logger.error(
-      { err, jobName, durationMs: Date.now() - startTime },
-      'Job failed'
-    );
-    throw err;
+    logger.error({ err, jobName }, 'Lock acquisition failed')
+    throw err
   }
 }
 
-// Output in production (with correlation ID from the triggering request):
-// {"level":30,"time":"2025-03-15T09:00:01.234Z","pid":5678,"env":"production",
-//  "module":"lib/scheduler","correlationId":"req-abc-123",
-//  "jobName":"morning-review","msg":"Starting job execution"}
+// Output (production):
+// {"level":30,"time":"...","pid":5678,"env":"production",
+//  "module":"job-lock","jobName":"email-triage","msg":"Attempting lock acquisition"}
 ```
 
 ## Related Patterns
 
-- [Request-Scoped Context Propagation](./request-scoped-context.md)
+- [Ops Metrics and Health Monitoring](./ops-metrics-and-health-monitoring.md)
 - [Audit Trail with PII Sanitization](./audit-trail-with-pii-sanitization.md)
 - [Graceful Degradation and Optional Init](./graceful-degradation-and-optional-init.md)

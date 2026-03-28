@@ -1,233 +1,254 @@
 # Decision Gating and Autonomy Tiers
 
-> Route autonomous agent decisions through notification tiers to prevent alert fatigue while ensuring critical actions reach humans.
+> User-defined conditional rule engine that elevates or restricts tool autonomy tiers based on pattern matching against action context, layered on top of the static tier system.
 
 ## Problem
 
-Autonomous agents make many decisions — some trivial (status updates), some important (deployment opportunities), some critical (production errors). Without structured routing, agents either spam humans with every decision (alert fatigue leads to humans ignoring everything) or operate too silently (critical issues go unnoticed). The system needs a centralized policy that classifies decisions by urgency and routes them accordingly.
+Static tool tiers are a good default, but users develop trust patterns that don't fit a single tier assignment. A user might want "auto-archive all emails from no-reply@ addresses" (elevating an ASK-tier action to AUTO for a specific sender pattern) or "always ask before touching the billing-api repo" (restricting a NOTIFY-tier action to ASK for a specific repo). Without user-defined rules, the system either requires manual overrides for every recurring exception or forces the user to change the global autonomy level, which is too coarse.
 
 ## Context
 
-- An orchestrator managing multiple projects with different autonomy expectations
-- Decisions that vary in urgency and consequence
-- Human operators who need to stay informed without being overwhelmed
-- Systems that evolve over time — a decision that starts as critical may become routine
+- A static tool tier system (AUTO/NOTIFY/ASK/NEVER) that handles the common case
+- Users who develop predictable patterns of approval and rejection
+- Actions that carry context (sender, repo, event type, tool name, project)
+- Need for rules that are auditable, reversible, and cacheable
+- Rules that can both elevate (grant more autonomy) and restrict (require more caution)
 
 ## Solution
 
-### Three-Tier Autonomy Model
+### Conditional Rule Engine
 
-Every autonomous decision is classified into one of three numeric tiers:
-
-| Tier | Name | Behavior | Use Case |
-|------|------|----------|----------|
-| 1 | AUTO | Execute silently, logged only | Routine health checks, successful cron runs, minor state changes |
-| 2 | NOTIFY | Execute and notify human after the fact (rate-limited per window) | Deploy suggestions, optimization findings, PR review requests |
-| 3 | ASK | Block and request human approval before executing | Production errors, security events, blocking failures |
-
-### Dynamic Rule Evaluation
-
-Rather than a static lookup table, tier assignment is computed at runtime by `lib/agent/autonomy-rules.js`. Rules evaluate context, domain confidence (from `autonomyTracker`), and action fingerprints to produce a numeric confidence score (0–1). That score is then mapped to a tier:
+`lib/agent/autonomy-rules.js` implements a rule engine where each rule has a set of conditions and a granted tier. When an action matches a rule's conditions, the rule's tier overrides the default. Rules use AND logic: all specified conditions must match for the rule to fire.
 
 ```javascript
-// lib/agent/autonomy-rules.js — rules evaluate at runtime, not at deploy time
-import { autonomyTracker } from './autonomy-tracker.js';
+// lib/agent/autonomy-rules.js
 
-const rules = [
-  {
-    name: 'domain-confidence',
-    evaluate(context) {
-      const score = autonomyTracker.getDomainConfidence(context.domain);
-      // High tracked confidence → lean AUTO; low or unknown → lean ASK
-      return score;
-    }
-  },
-  {
-    name: 'action-fingerprint',
-    evaluate(context) {
-      const fingerprint = computeActionFingerprint(context.action, context.params);
-      const history = autonomyTracker.getFingerprintHistory(fingerprint);
-      if (!history) return 0.5;  // unknown action — neutral
-      return history.successRate;
-    }
-  },
-  {
-    name: 'blast-radius',
-    evaluate(context) {
-      // Destructive or production-scoped actions reduce confidence
-      if (context.scope === 'production' || context.destructive) return 0.1;
-      if (context.scope === 'staging') return 0.7;
-      return 0.9;
-    }
-  },
-];
-
-export function evaluateTier(context) {
-  const scores = rules.map(r => r.evaluate(context));
-  const confidence = scores.reduce((a, b) => a + b, 0) / scores.length;
-
-  if (confidence >= 0.85) return { tier: 1, label: 'AUTO',   confidence };
-  if (confidence >= 0.50) return { tier: 2, label: 'NOTIFY', confidence };
-  return                         { tier: 3, label: 'ASK',    confidence };
-}
+// Rule schema (stored in autonomy_rules table):
+// {
+//   name: "Auto-archive newsletters",
+//   conditions: { type: "email", sender_pattern: "no-reply@*" },
+//   granted_tier: "AUTO",
+//   direction: "elevate",  // or "restrict"
+//   enabled: true,
+// }
 ```
 
-The three tiers remain the output classification — AUTO, NOTIFY, ASK — but the input is dynamic rather than a fixed enum lookup.
+### Condition Types
 
-### Autonomy Boost: NOTIFY → AUTO Promotion
-
-The `autonomy-boost` subsystem tracks consecutive approvals per action fingerprint. When a NOTIFY-tier action is approved by the human enough times in a row, it is promoted to AUTO:
+Rules support multiple condition domains, each with its own matching fields:
 
 ```javascript
-// autonomy-boost: promotes NOTIFY → AUTO on repeated approval
-export function recordApproval(fingerprint) {
-  const record = autonomyTracker.getOrCreate(fingerprint);
-  record.consecutiveApprovals += 1;
+// Email conditions
+{ sender_pattern: "no-reply@*", subject_pattern: "*invoice*", label: "newsletters" }
 
-  if (record.consecutiveApprovals >= BOOST_THRESHOLD) {
-    // Promote: future evaluations will see high confidence for this fingerprint
-    autonomyTracker.setFingerprintConfidence(fingerprint, 0.92);
-    record.consecutiveApprovals = 0;  // reset streak
+// GitHub conditions
+{ repo: "owner/billing-api", event_type: "assigned", author: "dependabot*" }
+
+// Task conditions
+{ source: "scheduled", project_pattern: "billing*" }
+
+// Generic conditions (work for any action)
+{ action_type: "deploy", target_pattern: "production*", tool_name: "send_email" }
+```
+
+Patterns support wildcards: `*` matches any characters, `?` matches a single character. Matching is case-insensitive.
+
+### Pattern Matching
+
+Each action carries a context object. The rule engine checks every condition in the rule against the action context. All conditions must match (AND logic):
+
+```javascript
+function matchesSingleRule(action, rule) {
+  const conditions = rule.conditions || {};
+
+  for (const [key, value] of Object.entries(conditions)) {
+    if (value === null || value === undefined) continue;
+
+    switch (key) {
+      case 'sender_pattern':
+        if (!matchesPattern(value, action.email?.sender || action.sender))
+          return false;
+        break;
+
+      case 'repo':
+        if (!matchesPattern(value, action.github?.repo || action.repo))
+          return false;
+        break;
+
+      case 'tool_name':
+        if (!matchesPattern(value, action.toolName || action.tool))
+          return false;
+        break;
+
+      // ... 12+ condition types covering email, GitHub, task, generic
+    }
   }
-}
-
-export function recordRejection(fingerprint) {
-  const record = autonomyTracker.getOrCreate(fingerprint);
-  record.consecutiveApprovals = 0;  // break the streak on any rejection
-  autonomyTracker.decayFingerprintConfidence(fingerprint, 0.15);
+  return true;  // All conditions matched
 }
 ```
 
-This replaces the static `decisions` map: new action types start unknown (neutral confidence), earn AUTO status through demonstrated approval history, and lose it on rejection.
+### Tier Elevation and Restriction
 
-### Notification Batching for Tier 2
-
-Tier 2 (NOTIFY) prevents notification spam through a per-project, per-decision batching window:
+Rules have a `direction` field that controls whether they make things more permissive (elevate) or more cautious (restrict):
 
 ```javascript
-const notifyGate = new Map();
+async function getEffectiveTier(action, defaultTier) {
+  const rules = await getEnabledRules();
+  const matchingRule = await matchesRule(action, rules);
 
-function shouldNotify(projectName, decisionName) {
-  const tier = getDecisionTier(decisionName);
+  if (matchingRule) {
+    const grantedTier = tierToNumber(matchingRule.granted_tier);
 
-  // Always record for audit trail
-  recordDecision(projectName, decisionName, tier);
+    if (matchingRule.direction === 'restrict') {
+      // Only apply if MORE restrictive (higher number)
+      if (grantedTier > defaultTier) {
+        return { tier: grantedTier, rule: matchingRule, restricted: true };
+      }
+    } else {
+      // Only apply if MORE permissive (lower number)
+      if (grantedTier < defaultTier) {
+        return { tier: grantedTier, rule: matchingRule, elevated: true };
+      }
+    }
+  }
 
-  if (tier === 3) return true;   // ASK — always notify, block for approval
-  if (tier === 1) return false;  // AUTO — silent, logged only
-
-  // NOTIFY (tier 2): at most once per window per project+decision
-  const key = `${projectName}:${decisionName}`;
-  const last = notifyGate.get(key) ?? 0;
-  const window = decisionPolicy.defaults.notifyWindowMs;
-
-  if (Date.now() - last < window) return false;
-  notifyGate.set(key, Date.now());
-  return true;
+  return { tier: defaultTier, rule: null, elevated: false };
 }
 ```
 
-### Decision Audit Trail
+This means an elevating rule can only make things less restrictive, and a restricting rule can only make things more restrictive. A rule cannot accidentally do the opposite of its declared intent.
 
-A ring buffer of recent routing decisions powers observability. Every decision is recorded regardless of tier, making the agent's decision-making transparent even when notifications are suppressed:
+### Integration with Tool Tier System
+
+The autonomy rules layer sits between the static tier lookup and the confidence decision engine. `canExecuteToolWithRules()` in `lib/tools/tiers.js` checks for rule overrides before applying autonomy-level logic:
 
 ```javascript
-const recentDecisions = [];
-const MAX_RECENT = 100;
+// lib/tools/tiers.js
+async function canExecuteToolWithRules(toolName, autonomyLevel, context) {
+  const baseTier = getToolTier(toolName);
 
-function recordDecision(projectName, decisionName, tier) {
-  recentDecisions.unshift({
-    projectName,
-    decisionName,
-    tier,
-    ts: Date.now(),
-  });
-  if (recentDecisions.length > MAX_RECENT) recentDecisions.pop();
+  // NEVER tier cannot be elevated by rules (safety boundary)
+  if (baseTier === APPROVAL_TIERS.NEVER) {
+    return { canExecute: false, requiresConfirmation: true };
+  }
+
+  // Check for rule-based tier override
+  const effective = await autonomyRules.getEffectiveTier(
+    { toolName, tool: toolName, ...context },
+    baseTier
+  );
+
+  // Apply standard autonomy-level logic using the effective tier
+  // autonomy 4: everything except NEVER
+  // autonomy 3: AUTO + NOTIFY + ASK
+  // autonomy 2: AUTO + NOTIFY
+  // autonomy 1: AUTO only
+  return applyAutonomyLogic(effective.tier, autonomyLevel, effective);
+}
+```
+
+### Caching and Performance
+
+Rules are cached per-tenant with a 30-second TTL. The cache is invalidated on any CRUD operation:
+
+```javascript
+const CACHE_TTL_MS = 30000;
+const rulesCache = new Map(); // tenantId -> { rules, expiry }
+
+async function getEnabledRules() {
+  const cached = rulesCache.get(tenantId);
+  if (cached && Date.now() < cached.expiry) return cached.rules;
+
+  const rules = await select('autonomy_rules')
+    .where('enabled = ?', true)
+    .orderBy('created_at', 'ASC')
+    .all();
+
+  rulesCache.set(tenantId, { rules: parsedRules, expiry: Date.now() + CACHE_TTL_MS });
+  return parsedRules;
 }
 
-// Dashboard endpoint exposes full audit trail
-function getRecentDecisions() {
-  return recentDecisions;
+function invalidateCache(tenantId) {
+  rulesCache.delete(tenantId);
 }
+```
+
+### Usage Tracking
+
+Each time a rule fires, it increments a usage counter and updates its last-used timestamp:
+
+```javascript
+async function recordRuleUsage(ruleId, actionId) {
+  await update('autonomy_rules', {
+    used_count: { $raw: 'used_count + 1' },
+    last_used_at: new Date().toISOString(),
+  }, 'id = ?', ruleId);
+}
+```
+
+### Seed Defaults
+
+The system ships with disabled default rules that users can enable:
+
+```javascript
+const defaults = [
+  {
+    name: 'Auto-archive newsletters',
+    conditions: { type: 'email', sender_pattern: 'no-reply@*' },
+    granted_tier: 'AUTO',
+    enabled: false,
+  },
+  {
+    name: 'Auto-create tasks from GitHub assignments',
+    conditions: { type: 'github', event_type: 'assigned' },
+    granted_tier: 'AUTO',
+    enabled: false,
+  },
+  // ...
+];
 ```
 
 ## Implications
 
-- Default confidence for unknown actions is neutral (0.5 → NOTIFY) — agents are not silently autonomous for new action types until they build a track record
-- Dynamic rules mean tier assignment can shift at runtime without code deploys — `autonomyTracker` state is the live source of truth for routing behavior
-- The autonomy-boost streak counter resets on any rejection, making demotion fast and promotion slow by design
-- The tier 2 batching window is global — different action types may warrant different rate limits in practice
-- In-memory rate-limiting and tracker state reset on orchestrator restart, which could cause a brief burst of tier 2 notifications and temporary loss of promotion history
-- No "off" tier — even tier 1 (AUTO) decisions are recorded in the audit trail, maintaining full observability
-- The three-tier output model is deliberately stable. The complexity lives in the rule evaluation layer, not in the tier definitions themselves
+- Rules use first-match semantics: the first matching rule wins. Rule ordering is by `created_at ASC`, meaning older rules have priority
+- NEVER tier is exempt from rule elevation: even if a rule grants AUTO to a NEVER-tier tool, the safety boundary in `canExecuteToolWithRules()` blocks it before rules are consulted
+- Direction enforcement prevents accidental misconfiguration: an "elevate" rule that specifies a more restrictive tier than the default is silently ignored (returns the default tier)
+- AND logic means rules get more specific as conditions are added: a rule with 3 conditions is harder to trigger than one with 1 condition
+- 30-second cache TTL means rule changes take up to 30 seconds to take effect, but CRUD operations invalidate immediately for the modifying tenant
+- Wildcard pattern matching converts to regex at match time, not at rule creation time, so patterns are human-readable in the database
+- Usage tracking enables stale rule detection: rules with `used_count = 0` and `created_at` older than 30 days are candidates for cleanup
 
 ## Code Example
 
 ```javascript
-// Reference implementation: Riley orchestrator
+// User creates a rule: "Auto-archive all notification emails"
+await autonomyRules.createRule({
+  name: 'Auto-archive notifications',
+  conditions: { type: 'email', sender_pattern: 'notifications@*' },
+  granted_tier: 'AUTO',
+  direction: 'elevate',
+});
 
-// An agent reports a decision during autonomous operation
-async function handleAgentDecision(project, action, details) {
-  const context = {
-    domain: project,
-    action: action.type,
-    params: action.params,
-    scope: action.scope ?? 'unknown',
-    destructive: action.destructive ?? false,
-  };
+// Action arrives: archive email from notifications@github.com
+const action = {
+  toolName: 'archive_email',
+  type: 'email',
+  email: { sender: 'notifications@github.com' },
+};
 
-  const { tier, label, confidence } = evaluateTier(context);
-  const fingerprint = computeActionFingerprint(action.type, action.params);
+// Static tier for archive_email: ASK (3)
+// Rule matches: sender_pattern 'notifications@*' matches 'notifications@github.com'
+// Rule grants: AUTO (1)
+// Direction: elevate, and 1 < 3, so elevation applies
+const effective = await getEffectiveTier(action, 3);
+// { tier: 1, rule: { name: 'Auto-archive notifications' }, elevated: true }
 
-  recordDecision(project, action.type, tier, confidence);
-
-  if (tier === 3) {
-    // ASK — block and wait for human approval
-    const approved = await requestApproval({ project, action, tier, confidence, details });
-    if (approved) recordApproval(fingerprint);
-    else           recordRejection(fingerprint);
-    return;
-  }
-
-  if (shouldNotify(project, action.type)) {
-    // NOTIFY (tier 2) — execute and inform human after the fact
-    await sendNotification({
-      project,
-      action: action.type,
-      tier,
-      confidence,
-      details,
-      timestamp: new Date().toISOString(),
-    });
-    // Implicit approval — count toward boost streak
-    recordApproval(fingerprint);
-  }
-
-  // AUTO (tier 1) — silent execution, recorded in audit trail only
-}
-
-// Usage from a flow step
-handleAgentDecision('billing-api',
-  { type: 'deploy-suggestion', scope: 'production', destructive: false, params: { branch: 'feature/new-pricing' } },
-  'All tests pass. Ready for production deploy.');
-
-// First call (unknown fingerprint): confidence ~0.5 → NOTIFY, notifies, records approval
-// After BOOST_THRESHOLD consecutive approvals: fingerprint confidence → 0.92 → AUTO
-// scope:'production' + destructive:true: blast-radius rule lowers confidence → ASK
+// Now: archive_email executes as AUTO instead of requiring approval
 ```
-
-## Relationship to Other Autonomy Patterns
-
-This pattern, [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md), and [Deliberative Alignment](./deliberative-alignment.md) form a three-layer autonomy system:
-
-- **Decision Gating (this pattern)** — Dynamic routing policy. `autonomy-rules.js` evaluates context, domain confidence, and action fingerprints at runtime to produce a tier (AUTO/NOTIFY/ASK). The `autonomy-boost` subsystem promotes NOTIFY → AUTO based on consecutive approval history. This is the outermost layer — it determines _how_ a decision is communicated and whether its tier has been earned.
-- **Confidence-Based Autonomy Gating** — Persistent trust scoring. Tracks per-domain success/failure ratios; those scores feed directly into the rule evaluation above. The two patterns share `autonomyTracker` as a common substrate.
-- **Deliberative Alignment** — Tiebreaker for the middle ground. When confidence falls in the notify band (0.50–0.85), multi-model voting resolves whether to execute or queue. This is the innermost layer — it handles ambiguous cases that neither dynamic rules nor tracker history can resolve alone.
 
 ## Related Patterns
 
 - [Confidence-Based Autonomy Gating](./confidence-based-autonomy-gating.md)
+- [Worker Permission Escalation](./satellite-permission-escalation.md)
 - [Deliberative Alignment](./deliberative-alignment.md)
-- [Capability Manifest Registration](./capability-manifest-registration.md)
 - [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
-- [Error Triage and Recovery](./error-triage-and-recovery.md)

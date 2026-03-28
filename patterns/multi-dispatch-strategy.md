@@ -1,193 +1,254 @@
 # Multi-Dispatch Strategy
 
-> A single dispatcher selects from three execution strategies — synchronous, runner-based, and fire-and-forget — based on task metadata, while all strategies share the same lifecycle state machine.
+> A weighted-priority dispatcher that collects work from multiple sources (`work-sources.js`), scores candidates, and routes them through runner-based or async execution paths while enforcing repo-level concurrency locks.
 
 ## Problem
 
-Not all tasks have the same execution requirements. Some need immediate results and ordered execution — a user-facing request that must complete before the next step begins. Others need persistent workers that pick up tasks from a queue without being explicitly invoked each time. Still others need to run in the background without blocking the dispatch cycle at all. Using a single execution model forces trade-offs: if everything is synchronous, background work blocks foreground work; if everything is async, you lose result tracking where it matters.
+Not all tasks have the same execution requirements. Some need immediate results — a user-requested coding task that must start running right away. Others are background work discovered by scanning GitHub issues or project health. The dispatcher must collect work from diverse sources, rank it fairly, and route it to the right execution path — all while preventing two workers from clobbering the same repository simultaneously.
 
 ## Context
 
-- A dispatcher that receives work from multiple sources: scheduled tasks, manual triggers, API requests, and agent-initiated work
-- Tasks vary in urgency, result requirements, and whether a persistent worker process is available
-- Worker availability is not guaranteed — some task types have dedicated runner processes, others do not
-- A priority queue already orders work by weight; the dispatch strategy governs how the selected work actually executes
-- All tasks share a common lifecycle state machine and DB persistence layer regardless of execution path
+- A dispatcher that receives work from multiple sources: user requests, retryable failed tasks, GitHub issues, coding todos, and project health scans
+- Tasks vary in urgency, source, and whether a persistent worker process is available
+- Worker availability is bounded by `MAX_PARALLEL_WORKERS` (default 3)
+- A single repository should not have two concurrent workers to avoid git conflicts
+- All tasks share a common DB record structure (`worker_tasks` table) regardless of execution path
+- The system uses Claude Code satellites as worker processes
 
 ## Solution
 
-### Three Dispatch Strategies
+### Work Source Collection
 
-The dispatcher exposes three modules, each implementing the same task intake interface but with different execution behavior.
-
-**`dispatch.js` — Synchronous dispatch**
-
-Used for tasks that need immediate result tracking and sequential execution. The dispatcher `await`s completion before moving to the next item. Appropriate for user-facing requests or tasks where the result must be known before subsequent work can proceed.
+The `work-sources.js` module identifies dispatchable work from five sources. Each source returns candidates with metadata that feeds into scoring:
 
 ```javascript
-// lib/worker/dispatch.js (illustrative)
-async function dispatchSync(task) {
-  // Transition task to in_progress before execution begins
-  await lifecycle.transition(task, 'in_progress', { strategy: 'sync' });
+// lib/worker/work-sources.js
+// Sources (not "identify-work.js"):
 
-  try {
-    const result = await executeWorker(task);
-    await lifecycle.completeTask(task, result);
-    return result;
-  } catch (err) {
-    await lifecycle.failTask(task, err);
-    throw err;
-  }
+// 1. User requests — tasks manually dispatched via the UI or API
+async function getPendingUserTasks() { /* query worker_tasks WHERE status = 'pending' */ }
+
+// 2. Retryable failures — tasks that failed but have attempts remaining
+async function getRetryableTasks() {
+  return raw(`
+    SELECT * FROM worker_tasks
+    WHERE status = 'attempt_failed'
+      AND attempt_count < 3
+      AND last_activity < NOW() - INTERVAL '30 minutes'
+    ORDER BY created_at ASC LIMIT 5
+  `)
 }
+
+// 3. GitHub issues with worker-ready labels
+async function getWorkerReadyIssues() { /* issues labeled for automated work */ }
+
+// 4. Solvable GitHub issues (scored by heuristic)
+async function getSolvableIssues() { /* scored by labels, title keywords, age */ }
+
+// 5. Coding-related todos from the document system
+async function getCodingTodos() { /* todos matching coding keyword patterns */ }
 ```
 
-**`dispatch-runners.js` — Runner-based dispatch**
+The solvability scorer uses a heuristic that boosts issues labeled `bug`, `good-first-issue`, or `help-wanted`, and penalizes `refactor`, `redesign`, or `breaking` changes.
 
-Used for persistent worker processes that monitor a queue and self-assign tasks. Rather than spawning a new process per task, the dispatcher posts a task to a known slot and a long-lived runner picks it up. This avoids process spawn overhead for high-frequency work types and gives workers control over their own pacing.
+### Weighted Priority Scoring
+
+The dispatcher (`lib/worker/dispatcher.js`) assigns each candidate a score combining source weight and item-specific scoring:
 
 ```javascript
-// lib/worker/dispatch-runners.js (illustrative)
-async function dispatchToRunner(task, runnerId) {
-  // Persist task to queue slot; runner polls and claims it
-  await db.tasks.insert({
-    ...task,
-    state: 'queued',
-    assignedRunner: runnerId,
-    strategy: 'runner',
-    queuedAt: Date.now(),
-  });
-
-  // Runner process polls this slot and calls lifecycle.transition(task, 'in_progress') on claim
-  audit.log('dispatch:runner_queued', { taskId: task.id, runnerId });
+// lib/worker/dispatcher.js
+const SOURCE_WEIGHTS = {
+  user_request:       90,
+  retry_failed:       80,
+  github_issue_ready: 70,
+  coding_todo:        50,
+  github_issue:       40,
+  health_check:       30,
 }
-```
 
-**`dispatch-async.js` — Async fire-and-forget dispatch**
-
-Used for background tasks that don't need immediate results. The dispatcher spawns the worker and continues without waiting. Task state is persisted so results can be queried later, but nothing blocks on them. Suitable for maintenance work, ambient processing, and low-urgency agent-initiated tasks.
-
-```javascript
-// lib/worker/dispatch-async.js (illustrative)
-function dispatchAsync(task) {
-  // Transition to in_progress and spawn — do not await
-  lifecycle.transition(task, 'in_progress', { strategy: 'async' }).then(() => {
-    spawnWorker(task).catch(err => lifecycle.failTask(task, err));
-  });
-
-  audit.log('dispatch:async_spawned', { taskId: task.id });
-  // Returns immediately; result is tracked via DB, not return value
-}
-```
-
-### Work-Source Abstraction
-
-Tasks enter the dispatcher through a work-source abstraction that normalizes different origins into a common task format. Sources include scheduled cron tasks, manual triggers from the API, incoming API requests from external systems, and agent-initiated work from satellites. Each source attaches metadata (urgency, expected result handling, preferred strategy hint) that the dispatcher uses for strategy selection.
-
-```javascript
-// lib/worker/identify-work.js (illustrative)
 async function identifyWork() {
-  const [scheduled, manual, apiRequests, agentWork] = await Promise.all([
-    sources.scheduled.pending(),
-    sources.manual.pending(),
-    sources.api.pending(),
-    sources.agent.pending(),
-  ]);
+  const running = await workerTasks.getRunning()
+  if (running.length >= MAX_PARALLEL_WORKERS) return []
 
-  // Normalize all sources into the same task shape
-  return [...scheduled, ...manual, ...apiRequests, ...agentWork].map(normalize);
+  const work = []
+  const sources = [
+    { fn: getPendingUserTasks,  source: 'user_request',       scoreBase: 90, scoreFn: (t) => t.priority || 0 },
+    { fn: getRetryableTasks,    source: 'retry_failed',       scoreBase: 80, scoreFn: (t) => -(t.attempt_count || 0) * 10 },
+    { fn: getWorkerReadyIssues, source: 'github_issue_ready', scoreBase: 70, scoreFn: () => 0 },
+    { fn: getSolvableIssues,    source: 'github_issue',       scoreBase: 40, scoreFn: (i) => i.solvabilityScore * 2 },
+    { fn: getCodingTodos,       source: 'coding_todo',        scoreBase: 50, scoreFn: (t) => priorityBonus(t) },
+  ]
+
+  for (const src of sources) {
+    const items = await src.fn()
+    for (const item of items) {
+      work.push({
+        source: src.source,
+        item,
+        score: src.scoreBase + src.scoreFn(item),
+        estimatedCost: src.cost,
+      })
+    }
+  }
+
+  return work.sort((a, b) => b.score - a.score)
 }
 ```
 
-### Strategy Selection
+User requests always win (base 90), followed by retries (80) and labeled issues (70). Within each tier, item-specific scoring provides finer ordering.
 
-After the priority queue has ordered work by weight, the dispatcher inspects each task's metadata to select the appropriate execution strategy:
+### Repo-Level Concurrency Lock
+
+Before dispatching, the dispatcher checks which repositories already have running workers. Any candidate targeting a repo with active work is filtered out:
 
 ```javascript
-// lib/worker/dispatcher.js (illustrative)
-async function routeTask(task) {
-  const runnerAvailable = await runners.hasAvailable(task.taskType);
+// lib/worker/dispatcher.js
+const runningRepos = new Set()
+for (const task of running) {
+  const params = typeof task.params === 'string' ? JSON.parse(task.params) : task.params
+  const repo = params?.owner && params?.repo ? `${params.owner}/${params.repo}` : params?.repo
+  if (repo) runningRepos.add(repo)
+}
 
-  if (task.requiresResult || task.urgency === 'high') {
-    // User is waiting or result feeds into next step
-    return dispatchSync(task);
+const filteredWork = work.filter((item) => {
+  const repo = extractRepo(item)
+  if (repo && runningRepos.has(repo)) return false
+  return true
+})
+```
+
+A separate `repo-lock.js` module provides `canWorkOnRepo()`, `registerRepoWork()`, and `unregisterRepoWork()` for formal lock management.
+
+### Dispatch Routing
+
+The dispatcher module (`dispatch.js`) routes tasks to typed workers based on task type and worker availability. Task types are normalized to handle LLM-hallucinated types:
+
+```javascript
+// lib/worker/dispatch.js
+const VALID_TASK_TYPES = new Set([
+  'solve-issue', 'ask-codebase', 'run-command', 'git-operation',
+  'self-improve', 'headless-gemini', 'doctl', 'coding', 'code-review',
+])
+
+function normalizeTaskType(taskType) {
+  if (!taskType) return 'coding'
+  const normalized = taskType.toLowerCase().replace(/_/g, '-')
+  if (VALID_TASK_TYPES.has(normalized)) return normalized
+  return 'coding'  // Unknown types run through the general-purpose runner
+}
+
+async function dispatchToWorker(task, workerType = null) {
+  const effectiveWorkerType = workerType || workerTypes.findWorkerTypeForTask(task.taskType)
+  const effectiveTaskType = normalizeTaskType(task.taskType)
+
+  const taskRecord = await workerTasks.create({
+    taskType: effectiveTaskType,
+    workerType: effectiveWorkerType,
+    description: task.description,
+    params: task.params || {},
+    priority: task.priority || 0,
+    dedupeKey: task.dedupeKey,
+  })
+
+  // Notify connected worker via Socket.io
+  const available = findAvailableWorker(effectiveWorkerType)
+  if (available) {
+    notifyWorkerOfTask(available.id, taskRecord)
   }
 
-  if (runnerAvailable) {
-    // Persistent worker process is ready to pick up this task type
-    return dispatchToRunner(task, runners.assign(task.taskType));
-  }
-
-  // Background work — spawn and move on
-  return dispatchAsync(task);
+  return { success: true, taskId: taskRecord.task_id, queued: !available }
 }
 ```
 
-### Shared Lifecycle and Persistence
+### Execution Paths
 
-All three strategies call into the same lifecycle module (`lib/task-lifecycle.js`) for state transitions, persistence, and event emission. The execution path is invisible to the lifecycle layer — a task that went through `dispatchAsync` has the same DB record structure and valid transitions as one that went through `dispatchSync`.
+Three execution modules handle the actual work:
+
+- **`dispatch-runners.js`** — Creates task records and kicks off async execution for each source type. Handles document linking, worker execution initialization, and source-specific setup.
+- **`dispatch-async.js`** — Contains the async execution functions that actually run tasks (code review, issue solving, etc.) using Claude Code satellites.
+- **`dispatch.js`** — Routes tasks to typed workers and handles socket-based notification when workers are connected.
+
+Worker notification uses Socket.io:
 
 ```javascript
-// lib/task-lifecycle.js is strategy-agnostic
-// All three dispatch paths call the same transition/complete/fail functions
-await lifecycle.transition(task, 'in_progress', { strategy: task.meta.strategy });
-await lifecycle.completeTask(task, result);
-await lifecycle.failTask(task, error);
+// lib/worker/dispatch.js
+function notifyWorkerOfTask(workerId, task) {
+  const worker = state.getWorker(workerId)
+  if (!worker?.socket) return
+
+  worker.socket.emit('task:available', {
+    taskId: task.task_id,
+    taskType: task.task_type,
+    workerType: task.worker_type,
+    description: task.description,
+    priority: task.priority || 0,
+  })
+}
+```
+
+### Health-Based Work Discovery
+
+The dispatcher also checks project health via `health-scanner.js`, which scans tracked projects for failing CI runs, stale PRs, and security advisories. Health issues enter the work queue at priority 30 (lowest tier):
+
+```javascript
+// lib/worker/dispatcher.js
+const healthIssues = await healthScanner.scanAllProjects()
+for (const issue of healthIssues.slice(0, 3)) {
+  work.push({
+    source: 'health_check',
+    item: issue,
+    score: SOURCE_WEIGHTS.health_check + issue.score,
+    estimatedCost: issue.type === 'ci_failure' ? 20 : 15,
+  })
+}
 ```
 
 ## Implications
 
-- Adding a fourth strategy requires only a new module implementing the same intake interface — the dispatcher's routing logic is the only change point.
-- Fire-and-forget dispatch reduces dispatch cycle latency but shifts result visibility to polling or event listeners on the DB; callers that need results must use sync dispatch explicitly.
-- Runner-based dispatch introduces a dependency on runner availability — if a runner crashes and is not restarted, queued tasks accumulate without being claimed until the runner recovers.
-- Strategy selection based on task metadata means metadata must be accurate at enqueue time; stale or incorrect urgency flags will cause misrouted work.
-- Shared lifecycle state ensures consistent observability (dashboards, audits, alerts) across all three paths, but requires strict discipline — no strategy should update task state directly in the DB, always via lifecycle functions.
-- The distinction between this pattern and the priority queue is intentional: the queue answers "what to do next," this pattern answers "how to do it."
+- Weighted scoring creates a clear priority hierarchy (user > retry > issue > todo > health) while allowing individual item quality to influence ordering within tiers
+- Repo-level locking prevents git conflicts but means a busy repository blocks all other work on that repo until the current task completes
+- Task type normalization handles the reality that LLMs hallucinate task types — `bug_investigation` becomes `coding` rather than failing
+- Source-specific limits (e.g., max 3 GitHub issues per cycle) prevent any single source from monopolizing worker capacity
+- The dispatcher runs on a periodic tick — it does not respond to individual task creation events. This creates bounded dispatch cycles but introduces latency between task creation and execution.
+- `MAX_PARALLEL_WORKERS` is a hard cap that prevents cost overruns but means excess work queues until a slot opens
+- Error handling is per-source — one source failing does not prevent other sources from contributing work
 
 ## Code Example
 
 ```javascript
-// Dispatcher selects strategy after priority queue has ranked work
+// The dispatch cycle (called periodically)
 async function dispatchCycle() {
-  const candidates = sortByPriority(await identifyWork());
-  const available = getAvailableWorkerCount();
+  const candidates = await identifyWork()
+  if (candidates.length === 0) return
 
-  for (const task of candidates.slice(0, available)) {
-    if (!canDispatch(task, runningRepos)) continue;
+  const budget = await ccUsage.getRemainingBudget()
+  if (!budget.available) return
 
-    trackRepo(task);
-
-    // Strategy selection based on task metadata and runner availability
-    const runnerAvailable = await runners.hasAvailable(task.taskType);
-
-    if (task.requiresResult || task.urgency === 'high') {
-      // Sync: await result before continuing dispatch loop iteration
-      await dispatchSync(task).finally(() => untrackRepo(task));
-    } else if (runnerAvailable) {
-      // Runner: post to queue slot, persistent worker claims it
-      await dispatchToRunner(task, runners.assign(task.taskType));
-      untrackRepo(task);
-    } else {
-      // Async: spawn and move on
-      dispatchAsync(task);
-      task.promise.finally(() => untrackRepo(task));
+  for (const candidate of candidates.slice(0, MAX_PARALLEL_WORKERS)) {
+    // Source-specific dispatch via dispatch-runners.js
+    switch (candidate.source) {
+      case 'user_request':
+        await dispatchUserRequest(candidate.item)
+        break
+      case 'coding_todo':
+        await dispatchCodingTodo(candidate.item)
+        break
+      case 'github_issue':
+        await dispatchGitHubIssue(candidate.item)
+        break
+      case 'retry_failed':
+        await dispatchRetry(candidate.item)
+        break
+      case 'health_check':
+        await dispatchHealthFix(candidate.item)
+        break
     }
-
-    audit.log('dispatch:routed', {
-      taskId: task.id,
-      strategy: task.meta.strategy,
-      source: task.source,
-      urgency: task.urgency,
-    });
-
-    recordDispatchCost(task);
   }
 }
-
-setInterval(dispatchCycle, DISPATCH_TICK_MS);
 ```
 
 ## Related Patterns
 
 - [Worker Dispatcher and Priority Queue](./worker-dispatcher-and-priority-queue.md)
-- [Orchestrator-Worker Communication](./orchestrator-satellite-communication.md)
+- [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
 - [Task Lifecycle and State Machine](./task-lifecycle-and-state-machine.md)

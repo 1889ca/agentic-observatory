@@ -174,5 +174,5 @@ const memories = await searchMemories(
 ## Related Patterns
 
 - [Knowledge Graph and Relationship Discovery](./knowledge-graph-and-relationship-discovery.md)
-- [Unified Search Across KBs](./unified-search-across-kbs.md)
+- [Embedding Pipeline and Async Vectorization](./embedding-pipeline-and-async-vectorization.md)
 - [Context Assembly Pipeline](./context-assembly-pipeline.md)

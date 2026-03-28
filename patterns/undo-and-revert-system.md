@@ -1,211 +1,260 @@
 # Undo and Revert System
 
-> Tool-level undo declarations with action log tracking, enabling reversible agent operations through before/after state capture and time-bounded revert windows.
+> DB-backed undo stack with entity-type reversers, enabling users to reverse agent mutations through tenant-scoped before/after state tracking and type-specific reversal logic.
 
 ## Problem
 
-Agents execute actions with real consequences — updating records, modifying files, changing configurations. Users need the ability to reverse mistakes, but agent systems typically treat every action as final. Without structured undo support, reverting a bad action requires manual intervention: finding what changed, figuring out the previous state, and manually restoring it. This is especially painful when the agent made a chain of related changes.
+Agents execute actions with real consequences -- creating tasks, updating notes, deleting reminders, completing events. Users need the ability to reverse mistakes, but agent systems typically treat every action as final. Without structured undo support, reverting a bad action requires manual intervention: finding what changed, figuring out the previous state, and manually restoring it. This is especially painful when the agent misinterprets intent and creates the wrong task or completes something that wasn't finished.
 
 ## Context
 
-- An agent system where tools perform stateful operations (database writes, file modifications, API calls)
+- An agent system where tools perform stateful operations across multiple entity types (todos, notes, reminders, events)
 - Users interact conversationally and may say "undo that" or "revert the last change"
-- Some operations are inherently irreversible (sending a message, triggering a deploy)
-- The system needs to distinguish between what *can* be undone and what *cannot*
-- Undo should be time-bounded — reverting something from two weeks ago is a different problem than reverting the last action
+- Operations span CRUD actions plus domain-specific actions like "complete" and "cancel"
+- The undo stack must survive process restarts -- in-memory logs are insufficient for production
+- Stack depth must be bounded to prevent unbounded database growth
+- Different entity types require different reversal logic (deleting a todo vs. restoring a note's content)
 
 ## Solution
 
-### Tool-Level Undo Declarations
+### DB-Backed Undo Stack
 
-Each tool declares whether it supports undo, and if so, provides an undo handler alongside its execute handler. This keeps undo logic co-located with the action logic:
-
-```javascript
-// lib/undo/tool-with-undo.js
-function defineTool({ name, execute, undo = null, undoable = false }) {
-  return {
-    name,
-    execute,
-    undo,
-    undoable: undoable && typeof undo === 'function',
-  };
-}
-
-const updateTask = defineTool({
-  name: 'update_task',
-  undoable: true,
-
-  execute: async (args) => {
-    const before = await db.getTask(args.id);
-    const after = await db.updateTask(args.id, args.changes);
-    return { result: after, beforeState: before, afterState: after };
-  },
-
-  undo: async (args, beforeState) => {
-    await db.updateTask(args.id, beforeState);
-    return { restored: beforeState };
-  },
-});
-```
-
-### Action Log
-
-Every tool execution is recorded in an action log with enough context to support undo. The log captures before/after state, the arguments used, and whether the action is undoable:
+The undo stack is a PostgreSQL table (`undo_stack`) scoped to tenants, with a configurable depth limit. Every mutation records the action type, entity type, entity ID, and before/after state snapshots:
 
 ```javascript
-// lib/undo/action-log.js
-const actionLog = [];
+// lib/undo/stack.js
+const STACK_LIMIT = 50;
 
-function recordAction({ toolName, args, result, beforeState, afterState, undoable }) {
-  const entry = {
-    id: crypto.randomUUID(),
-    toolName,
-    args,
-    result,
-    beforeState,
-    afterState,
-    undoable,
-    timestamp: Date.now(),
-    undone: false,
-  };
+async function push(action) {
+  const tenantId = 1;
 
-  actionLog.push(entry);
-  return entry;
-}
+  // Enforce stack limit by removing oldest entries
+  await enforceLimit(tenantId);
 
-function getUndoableActions(windowMs = 60 * 60 * 1000) {
-  const cutoff = Date.now() - windowMs;
-  return actionLog
-    .filter(a => a.undoable && !a.undone && a.timestamp > cutoff)
-    .reverse(); // Most recent first
-}
-```
-
-### Undo Execution
-
-When a user requests undo, the system finds the most recent undoable action (or a specific one by reference), runs the undo handler, and marks the action as undone. The undo itself is logged as a new action:
-
-```javascript
-// lib/undo/undo-executor.js
-async function undoLastAction(toolRegistry) {
-  const candidates = getUndoableActions();
-
-  if (candidates.length === 0) {
-    return { success: false, reason: 'No undoable actions in the current window' };
-  }
-
-  const action = candidates[0];
-  const tool = toolRegistry.get(action.toolName);
-
-  if (!tool?.undo) {
-    return { success: false, reason: `Tool ${action.toolName} has no undo handler` };
-  }
-
-  const undoResult = await tool.undo(action.args, action.beforeState);
-
-  // Mark original action as undone
-  action.undone = true;
-
-  // Log the undo itself as an action
-  recordAction({
-    toolName: `undo:${action.toolName}`,
-    args: { originalActionId: action.id },
-    result: undoResult,
-    beforeState: action.afterState,
-    afterState: action.beforeState,
-    undoable: false, // Undo of undo is not supported — use redo semantics if needed
+  const id = await insert('undo_stack', {
+    tenant_id: tenantId,
+    user_id: action.userId || null,
+    action_type: action.actionType,    // 'create', 'update', 'delete', 'complete'
+    entity_type: action.entityType,    // 'todo', 'note', 'reminder', 'event'
+    entity_id: String(action.entityId),
+    before_state: action.beforeState ? JSON.stringify(action.beforeState) : null,
+    after_state: action.afterState ? JSON.stringify(action.afterState) : null,
+    tool_name: action.toolName || null,
   });
 
-  return { success: true, restored: undoResult };
+  return id;
+}
+
+async function pop() {
+  const action = await select('undo_stack')
+    .where('tenant_id = ?', tenantId)
+    .orderBy('created_at DESC')
+    .limit(1)
+    .one();
+
+  if (!action) return null;
+
+  await del('undo_stack', 'id = ?', action.id);
+  return parseAction(action);
 }
 ```
 
-### Non-Undoable Tool Marking
-
-Some tools are inherently irreversible. These are marked explicitly so the system can communicate this to users upfront rather than failing silently:
+The stack enforces its limit with a single SQL statement that deletes the oldest entries beyond the threshold:
 
 ```javascript
-const sendMessage = defineTool({
-  name: 'send_message',
-  undoable: false, // Cannot unsend
-
-  execute: async (args) => {
-    const result = await messenger.send(args.channel, args.content);
-    // Still logged for audit trail, but undoable=false
-    return { result, beforeState: null, afterState: null };
-  },
-});
-
-const deployService = defineTool({
-  name: 'deploy',
-  undoable: false, // Rollback is a different operation, not undo
-
-  execute: async (args) => {
-    const result = await deployer.deploy(args.service, args.version);
-    return { result, beforeState: null, afterState: null };
-  },
-});
+async function enforceLimit(tenantId) {
+  await raw(
+    `DELETE FROM undo_stack
+     WHERE id IN (
+       SELECT id FROM undo_stack
+       WHERE tenant_id = $1
+       ORDER BY created_at DESC
+       OFFSET $2
+     )`,
+    [tenantId, STACK_LIMIT - 1]
+  );
+}
 ```
 
-### Time-Bounded Window
+### Entity-Type Reversers
 
-Undo availability expires after a configurable window. This prevents stale state conflicts — undoing an action from hours ago when the data has been modified multiple times since would cause corruption:
+Rather than co-locating undo logic with each tool, reversal logic is organized by entity type in a `REVERSERS` map. Each entity type defines handlers for each action type, creating a clear matrix of what can be undone and how:
 
 ```javascript
-// lib/undo/config.js
-const UNDO_WINDOW_MS = parseInt(process.env.UNDO_WINDOW_MS) || 60 * 60 * 1000; // 1 hour default
+// lib/undo/reverser.js
+const REVERSERS = {
+  todo: {
+    // Undo create -> delete the created task
+    create: async (action) => {
+      await tasksV2.remove(action.entityId);
+      return { reversed: 'create', message: `Deleted task "${action.afterState?.title}"` };
+    },
 
-function isWithinUndoWindow(action) {
-  return Date.now() - action.timestamp < UNDO_WINDOW_MS;
+    // Undo update -> restore previous state
+    update: async (action) => {
+      const { beforeState } = action;
+      if (!beforeState) throw new Error('No before state to restore');
+
+      await entityService.update('task', action.entityId, {
+        title: beforeState.title,
+        description: beforeState.description,
+        priority: beforeState.priority,
+        dueAt: beforeState.due_at || beforeState.due_date,
+      });
+
+      return { reversed: 'update', message: `Restored task "${beforeState.title}"` };
+    },
+
+    // Undo delete -> recreate from before state
+    delete: async (action) => {
+      const { beforeState } = action;
+      if (!beforeState) throw new Error('No before state to restore');
+
+      const newTask = await entityService.create('task', {
+        title: beforeState.title,
+        priority: beforeState.priority || 'normal',
+      }, { source: 'undo' });
+
+      return { reversed: 'delete', message: `Restored task "${beforeState.title}"`, newId: newTask.id };
+    },
+
+    // Undo complete -> reopen
+    complete: async (action) => {
+      await entityService.update('task', action.entityId, {
+        status: action.beforeState?.status || 'pending',
+      });
+      return { reversed: 'complete', message: `Reopened task "${action.beforeState?.title}"` };
+    },
+  },
+
+  note: {
+    create: async (action) => {
+      await documents.remove(action.entityId);
+      return { reversed: 'create', message: `Deleted note "${action.afterState?.data?.title}"` };
+    },
+
+    update: async (action) => {
+      await documents.update(action.entityId, action.beforeState.data, { replace: true });
+      return { reversed: 'update', message: `Restored note "${action.beforeState.data?.title}"` };
+    },
+
+    delete: async (action) => {
+      const newDoc = await documents.create('note', action.beforeState.data, {
+        parentId: action.beforeState.parent_id,
+      });
+      return { reversed: 'delete', message: `Restored note`, newId: newDoc.id };
+    },
+  },
+
+  reminder: { /* cancel, create reversal handlers */ },
+  event:    { /* create, update, delete reversal handlers */ },
+};
+```
+
+### Undo Execution with Failure Recovery
+
+The undo operation pops the most recent action, runs the appropriate reverser, and re-pushes the action if reversal fails (so the user can retry):
+
+```javascript
+// lib/undo/index.js
+async function undo() {
+  const action = await stack.pop();
+
+  if (!action) {
+    return { success: false, message: 'Nothing to undo' };
+  }
+
+  try {
+    const result = await reverse(action);
+    return {
+      success: true,
+      undone: describeAction(action),
+      ...result,
+    };
+  } catch (err) {
+    // Push the action back since we couldn't undo it
+    await stack.push({
+      actionType: action.actionType,
+      entityType: action.entityType,
+      entityId: action.entityId,
+      beforeState: action.beforeState,
+      afterState: action.afterState,
+      toolName: action.toolName,
+    });
+
+    return {
+      success: false,
+      message: `Failed to undo: ${err.message}`,
+      action: describeAction(action),
+    };
+  }
+}
+```
+
+### Human-Readable Descriptions
+
+Every action gets a description for user-facing messages:
+
+```javascript
+function describeAction(action) {
+  const entityName = action.afterState?.title || action.beforeState?.title || action.entityId;
+  const descriptions = {
+    create: `Created ${action.entityType} "${entityName}"`,
+    update: `Updated ${action.entityType} "${entityName}"`,
+    delete: `Deleted ${action.entityType} "${entityName}"`,
+    complete: `Completed ${action.entityType} "${entityName}"`,
+    cancel: `Cancelled ${action.entityType} "${entityName}"`,
+  };
+  return descriptions[action.actionType] || `${action.actionType} ${action.entityType}`;
 }
 ```
 
 ## Implications
 
-- Before/after state capture adds overhead to every tool execution — tools must return `beforeState` explicitly, which means an extra read before every write
-- The action log grows linearly with tool executions; periodic cleanup of entries outside the undo window is necessary
-- Undo handlers are the tool author's responsibility — if the undo logic is wrong, it can corrupt state just as easily as the original action
-- Time-bounding prevents stale-state conflicts but means users lose undo capability after the window expires
-- Non-undoable marking is honest UX — better to tell users upfront than to promise reversibility and fail
-- The action log doubles as an audit trail, useful for debugging agent behavior independent of undo
-- Undo-of-undo is intentionally not supported to avoid infinite chains; a separate redo mechanism would be needed for that
+- DB-backed stack survives process restarts -- unlike in-memory logs, nothing is lost if the server crashes between action and undo
+- Entity-type reversers create a clear, extensible matrix: adding undo for a new entity type means adding one object to `REVERSERS`, not modifying every tool
+- The 50-entry stack limit prevents unbounded growth while covering typical undo depth; the oldest entries are pruned automatically via SQL
+- Before/after state capture adds overhead to every tool execution -- tools must snapshot state before writes, meaning an extra read before every mutation
+- Failure recovery (re-pushing the action on undo failure) prevents the stack from losing entries when external services are temporarily down
+- Undo of delete operations creates new entities with new IDs (`newId`) -- the original ID is gone, which may break references from other entities
+- The `parseAction` function handles both JSON string and object formats for before/after state, tolerating schema evolution in the stack table
+- Tenant scoping means multi-tenant deployments get isolated undo stacks without cross-contamination
 
 ## Code Example
 
 ```javascript
-// Wrapping tool execution with action logging and undo support
-async function executeTool(toolRegistry, toolName, args) {
-  const tool = toolRegistry.get(toolName);
-  if (!tool) throw new Error(`Unknown tool: ${toolName}`);
+const undo = require('./lib/undo');
 
-  const { result, beforeState, afterState } = await tool.execute(args);
-
-  const entry = recordAction({
-    toolName,
-    args,
-    result,
-    beforeState,
-    afterState,
-    undoable: tool.undoable,
-  });
-
-  return { ...result, actionId: entry.id, undoable: tool.undoable };
-}
+// Record an action when a tool executes
+await undo.push({
+  actionType: 'create',
+  entityType: 'todo',
+  entityId: 123,
+  beforeState: null,
+  afterState: { title: 'Buy groceries', priority: 2 },
+  toolName: 'add_todo',
+});
 
 // User says "undo that"
-async function handleUndoRequest(toolRegistry) {
-  const result = await undoLastAction(toolRegistry);
+const result = await undo.undo();
+// → { success: true, undone: 'Created todo "Buy groceries"', reversed: 'create',
+//    message: 'Deleted task "Buy groceries"' }
 
-  if (result.success) {
-    return `Reverted the last action. Restored previous state.`;
-  } else {
-    return `Cannot undo: ${result.reason}`;
-  }
-}
+// Peek at what would be undone next
+const desc = await undo.peekDescription();
+// → 'Updated note "Meeting notes"'
+
+// List recent undo stack
+const recent = await undo.list(5);
+// → [{ actionType: 'update', entityType: 'note', toolName: 'update_note', ... }]
+
+// Check stack depth
+const depth = await undo.count();
+// → 12
 ```
 
 ## Related Patterns
 
+- [Action Coordination and Conflict Prevention](./action-coordination-and-conflict-prevention.md)
 - [Tool Interceptor and Pre-Execution Correction](./tool-interceptor-and-pre-execution-correction.md)
-- [Agent Recovery and Escalation](./agent-recovery-and-escalation.md)
-- [Planning and Verification Layer](./planning-and-verification-layer.md)
+- [Entity Service and Universal CRUD](./entity-service-and-universal-crud.md)

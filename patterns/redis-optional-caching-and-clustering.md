@@ -1,293 +1,236 @@
 # Redis Optional Caching and Clustering
 
-> Optional Redis integration with exponential backoff reconnection, Socket.io multi-instance adapter, health checks, and graceful in-memory fallback for every consumer.
+> Optional Redis integration that reads `REDIS_URL` directly, uses the `redis` client's built-in reconnect strategy with exponential backoff, and exposes a lazy singleton client — no in-memory fallback cache, no host/port assembly.
 
 ## Problem
 
-Redis is extremely useful for caching, pub/sub, and distributed coordination — but making it a hard dependency creates fragility. If Redis goes down, the entire application goes down. If Redis is slow to start, the application hangs on boot. In development, requiring Redis running locally adds friction to onboarding. And when Redis recovers after an outage, aggressive reconnection attempts can overwhelm it with a thundering herd of connections before it's ready to serve traffic. The system needs Redis when it's available, but must survive without it.
+Redis is extremely useful for caching, pub/sub, and distributed coordination — but making it a hard dependency creates fragility. If Redis goes down, the entire application goes down. If Redis is slow to start, the application hangs on boot. In development, requiring Redis running locally adds friction to onboarding. The system needs Redis when it's available, but must survive without it.
 
 ## Context
 
-- A Node.js orchestrator that benefits from Redis for caching, pub/sub, and distributed locking
-- Multiple instances of the application may run behind a load balancer, needing Socket.io message coordination
+- A Node.js orchestrator that benefits from Redis for caching, distributed job locking, and Socket.io pub/sub
+- Multiple instances may run behind a load balancer, needing coordinated state
 - Redis availability varies across environments — always present in production, often absent in local development
 - Some features degrade without Redis (distributed locks become local-only) but the core system must keep running
 - Redis outages should be recoverable without application restarts
-- Health check endpoints need to report Redis status accurately
 
 ## Solution
 
-### Optional Connection with Environment Configuration
+### Simple URL-Based Configuration
 
-The Redis module initializes only when configured. The entire module API works regardless — consumers never check whether Redis is available before calling methods:
+The Redis module checks a single environment variable. No host/port/password assembly — just `REDIS_URL` or nothing:
 
-```typescript
-// lib/redis.ts
-import { createClient, RedisClientType } from 'redis';
+```javascript
+// lib/redis.js
+const { createClient } = require('redis')
+const logger = require('./logger').child({ module: 'redis' })
 
-let client: RedisClientType | null = null;
-let isConnected = false;
-let reconnectAttempts = 0;
+let client = null
+let initPromise = null
 
-const MAX_RECONNECT_DELAY = 30000; // 30 seconds cap
-const BASE_RECONNECT_DELAY = 1000; // 1 second initial
+const MAX_RECONNECT_ATTEMPTS = 10
+const BASE_RECONNECT_DELAY = 1000   // 1 second
+const MAX_RECONNECT_DELAY = 30000   // 30 seconds
 
-function getRedisUrl(): string | null {
-  if (process.env.REDIS_URL) return process.env.REDIS_URL;
-
-  const host = process.env.REDIS_HOST;
-  const port = process.env.REDIS_PORT || '6379';
-  const password = process.env.REDIS_PASSWORD;
-
-  if (!host) return null;
-
-  return password
-    ? `redis://:${password}@${host}:${port}`
-    : `redis://${host}:${port}`;
+function getRedisUrl() {
+  return process.env.REDIS_URL || null
 }
 
-async function init(): Promise<void> {
-  const url = getRedisUrl();
-  if (!url) {
-    logger.info('Redis not configured — using in-memory fallbacks');
-    return;
-  }
+function isEnabled() {
+  return !!getRedisUrl()
+}
+```
 
-  client = createClient({ url });
+If `REDIS_URL` is not set, `isEnabled()` returns false and `getClient()` returns null. Every consumer checks this before attempting Redis operations.
 
-  client.on('connect', () => {
-    isConnected = true;
-    reconnectAttempts = 0;
-    logger.info('Redis connected');
-  });
+### Lazy Singleton with Built-In Reconnect
 
-  client.on('error', (err) => {
-    logger.warn({ err: err.message }, 'Redis error');
-  });
+The client is created on first use and reused for all subsequent calls. Reconnection is handled by the `redis` client's own `reconnectStrategy` socket option — no custom `scheduleReconnect` function:
 
-  client.on('end', () => {
-    isConnected = false;
-    logger.warn('Redis disconnected');
-    scheduleReconnect();
-  });
+```javascript
+// lib/redis.js
+async function getClient() {
+  const url = getRedisUrl()
+  if (!url) return null
 
+  // Return existing healthy client
+  if (client && client.isOpen) return client
+
+  // Return in-flight connection attempt
+  if (initPromise) return initPromise
+
+  initPromise = (async () => {
+    try {
+      client = createClient({
+        url,
+        socket: {
+          reconnectStrategy: (retries) => {
+            if (retries > MAX_RECONNECT_ATTEMPTS) {
+              logger.error({ retries }, 'Max reconnection attempts reached')
+              return false // Stop reconnecting
+            }
+            const delay = Math.min(
+              BASE_RECONNECT_DELAY * Math.pow(2, retries),
+              MAX_RECONNECT_DELAY
+            )
+            logger.warn({ delayMs: delay, attempt: retries + 1 }, 'Reconnecting')
+            return delay
+          },
+        },
+      })
+
+      client.on('error', (err) => logger.error({ err }, 'Client error'))
+      client.on('ready', () => logger.info('Connected and ready'))
+      client.on('end', () => logger.warn('Connection closed'))
+
+      await client.connect()
+      logger.info('Initial connection established')
+      return client
+    } catch (err) {
+      logger.error({ err }, 'Initial connection failed')
+      client = null
+      initPromise = null
+      throw err
+    } finally {
+      initPromise = null
+    }
+  })()
+
+  return initPromise
+}
+```
+
+The `initPromise` guard prevents multiple concurrent initialization attempts — if two callers hit `getClient()` simultaneously, both await the same connection.
+
+### Client Duplication for Pub/Sub
+
+Some consumers need dedicated connections (e.g., Socket.io pub/sub requires separate publish and subscribe clients). The module exposes a `duplicateClient()` helper:
+
+```javascript
+// lib/redis.js
+async function duplicateClient() {
+  const base = await getClient()
+  if (!base) return null
+  const dup = base.duplicate()
+  dup.on('error', (err) => logger.error({ err }, 'Duplicate client error'))
+  await dup.connect()
+  return dup
+}
+```
+
+### Separate Cache Layer
+
+The caching API lives in a separate `lib/cache.js` module that composes Redis, not extends it. It adds key prefixing, JSON serialization, TTL management, and prefix-based deletion:
+
+```javascript
+// lib/cache.js
+const redis = require('./redis')
+const { CACHE_ENABLED, CACHE_TTL_SECONDS } = require('./config')
+
+const PREFIX = process.env.RILEY_CACHE_PREFIX || 'riley:cache:'
+
+function isEnabled() {
+  return CACHE_ENABLED !== false && redis.isEnabled()
+}
+
+async function getJson(key) {
+  const client = await getClient()
+  if (!client) return null
   try {
-    await client.connect();
-  } catch (err) {
-    logger.warn({ err }, 'Redis initial connection failed — will retry');
-    scheduleReconnect();
-  }
-}
-```
-
-### Exponential Backoff Reconnection
-
-When Redis disconnects, reconnection uses exponential backoff with jitter. This prevents thundering herd on Redis recovery and avoids log spam from tight retry loops:
-
-```typescript
-function scheduleReconnect(): void {
-  if (!client) return;
-
-  const delay = Math.min(
-    BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempts),
-    MAX_RECONNECT_DELAY
-  );
-
-  // Add jitter: +/- 25% of the delay
-  const jitter = delay * 0.25 * (Math.random() * 2 - 1);
-  const actualDelay = Math.round(delay + jitter);
-
-  reconnectAttempts++;
-
-  logger.info(
-    { attempt: reconnectAttempts, delayMs: actualDelay },
-    'Scheduling Redis reconnection'
-  );
-
-  setTimeout(async () => {
-    try {
-      await client?.connect();
-    } catch {
-      scheduleReconnect(); // Keep trying
-    }
-  }, actualDelay);
-}
-```
-
-### In-Memory Fallback for Every Operation
-
-Every Redis operation has an in-memory fallback. The cache API is the most critical — it uses a `Map` with TTL tracking when Redis isn't available:
-
-```typescript
-const localCache = new Map<string, { value: string; expiresAt: number }>();
-
-async function cacheGet(key: string): Promise<string | null> {
-  if (isConnected && client) {
-    try {
-      return await client.get(key);
-    } catch {
-      // Redis failed mid-operation — fall through to local
-    }
-  }
-
-  const entry = localCache.get(key);
-  if (!entry) return null;
-  if (Date.now() > entry.expiresAt) {
-    localCache.delete(key);
-    return null;
-  }
-  return entry.value;
+    const raw = await client.get(key)
+    return raw ? JSON.parse(raw) : null
+  } catch { return null }
 }
 
-async function cacheSet(key: string, value: string, ttlMs: number): Promise<void> {
-  if (isConnected && client) {
-    try {
-      await client.set(key, value, { PX: ttlMs });
-      return;
-    } catch {
-      // Fall through to local
-    }
-  }
-
-  localCache.set(key, { value, expiresAt: Date.now() + ttlMs });
-}
-
-async function cacheDel(key: string): Promise<void> {
-  localCache.delete(key);
-
-  if (isConnected && client) {
-    try {
-      await client.del(key);
-    } catch {
-      // Best-effort
-    }
-  }
-}
-```
-
-### Socket.io Adapter for Multi-Instance Pub/Sub
-
-When multiple application instances run behind a load balancer, Socket.io events emitted on one instance need to reach clients connected to other instances. Redis acts as the pub/sub backbone:
-
-```typescript
-import { createAdapter } from '@socket.io/redis-adapter';
-
-async function attachSocketAdapter(io: SocketIOServer): Promise<void> {
-  if (!isConnected || !client) {
-    logger.info('Redis unavailable — Socket.io running in single-instance mode');
-    return;
-  }
-
-  const pubClient = client.duplicate();
-  const subClient = client.duplicate();
-
-  await Promise.all([pubClient.connect(), subClient.connect()]);
-
-  io.adapter(createAdapter(pubClient, subClient));
-  logger.info('Socket.io Redis adapter attached — multi-instance pub/sub enabled');
-}
-```
-
-Without Redis, Socket.io defaults to in-process event distribution — functional for single-instance deployments, degraded for multi-instance.
-
-### Health Check Integration
-
-The Redis module exposes its status for the health check endpoint. This is informational, not a gate — the application is "healthy" even without Redis, but operators need visibility:
-
-```typescript
-function getHealthStatus(): { available: boolean; latencyMs?: number } {
-  if (!client || !isConnected) {
-    return { available: false };
-  }
-
-  return { available: true };
-}
-
-async function ping(): Promise<number | null> {
-  if (!isConnected || !client) return null;
-
-  const start = Date.now();
+async function setJson(key, value, ttlSeconds = CACHE_TTL_SECONDS) {
+  const client = await getClient()
+  if (!client) return false
   try {
-    await client.ping();
-    return Date.now() - start;
-  } catch {
-    return null;
+    const payload = JSON.stringify(value)
+    if (ttlSeconds > 0) {
+      await client.setEx(key, ttlSeconds, payload)
+    } else {
+      await client.set(key, payload)
+    }
+    return true
+  } catch { return false }
+}
+
+async function delPrefix(prefix) {
+  const client = await getClient()
+  if (!client) return 0
+  let deleted = 0
+  for await (const key of client.scanIterator({ MATCH: `${prefix}*`, COUNT: 100 })) {
+    deleted += await client.del(key)
   }
+  return deleted
 }
 ```
 
-### Local Cache Eviction
+When Redis is unavailable, every cache operation returns null/false — no in-memory fallback Map. Callers that need local caching use a separate `TTLCache` utility (`lib/utils/ttl-cache.js`) explicitly.
 
-The in-memory fallback needs periodic cleanup to prevent unbounded growth. A sweep runs on an interval, removing expired entries:
+### Graceful Disconnect
 
-```typescript
-setInterval(() => {
-  const now = Date.now();
-  let evicted = 0;
+The module provides a clean shutdown path for the server shutdown sequence:
 
-  for (const [key, entry] of localCache) {
-    if (now > entry.expiresAt) {
-      localCache.delete(key);
-      evicted++;
+```javascript
+// lib/redis.js
+async function disconnect() {
+  if (client && client.isOpen) {
+    try {
+      await client.quit()
+      logger.info('Disconnected gracefully')
+    } catch (err) {
+      logger.warn({ err }, 'Error during disconnect')
     }
   }
-
-  if (evicted > 0) {
-    logger.debug({ evicted, remaining: localCache.size }, 'Local cache sweep');
-  }
-}, 60_000); // Every minute
+  client = null
+  initPromise = null
+}
 ```
 
 ## Implications
 
-- Every Redis consumer must handle the "no Redis" case — this is a design constraint that prevents accidental hard dependencies
-- The in-memory fallback is single-instance only — distributed features like cross-instance pub/sub genuinely degrade, they don't just slow down
-- Exponential backoff with jitter prevents thundering herd but means recovery after an outage takes time (up to 30 seconds worst case)
-- The local cache has no size limit beyond TTL expiration — for high-cardinality caching, this could become a memory concern
-- Socket.io in single-instance mode means sticky sessions are required at the load balancer level, or clients may miss events
-- Redis connection state transitions (connected/disconnected) can happen mid-request — every operation needs its own try/catch, not a single upfront check
+- No in-memory fallback means cache misses are silent when Redis is down — callers must handle null returns naturally, which they already do for normal cache misses
+- The `reconnectStrategy` callback is the single point of reconnection policy — no separate reconnect scheduling, no event-driven retry loops
+- `REDIS_URL` as the only config surface means no accidental misconfiguration from partial host/port/password combinations
+- Client duplication for pub/sub creates additional connections — in production this is fine, but connection limits should account for duplicates
+- The cache module's `delPrefix` uses `SCAN` iteration, which is safe for production (no `KEYS *` blocking) but may be slow for very large keyspaces
+- Redis is not required for the application to start or run — it is a pure enhancement layer for caching and distributed coordination
 
 ## Code Example
 
-```typescript
-// Usage: a module that caches expensive API responses, unaware of Redis internals
-import { cacheGet, cacheSet, isEnabled } from '../lib/redis';
+```javascript
+// Usage: a module that caches expensive computations
+const cache = require('../cache')
 
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const CACHE_TTL = 300 // 5 minutes
 
-async function getProjectSummary(projectId: string): Promise<ProjectSummary> {
-  const cacheKey = `project:summary:${projectId}`;
+async function getProjectSummary(projectId) {
+  const cacheKey = cache.buildKey(['project', 'summary', projectId])
 
-  // Try cache first
-  const cached = await cacheGet(cacheKey);
-  if (cached) {
-    return JSON.parse(cached);
-  }
+  // Try cache first — returns null if Redis unavailable or miss
+  const cached = await cache.getJson(cacheKey)
+  if (cached) return cached
 
-  // Cache miss — compute the expensive result
-  const summary = await computeProjectSummary(projectId);
+  // Compute expensive result
+  const summary = await computeProjectSummary(projectId)
 
-  // Cache for next time (works with or without Redis)
-  await cacheSet(cacheKey, JSON.stringify(summary), CACHE_TTL);
+  // Cache for next time — no-op if Redis unavailable
+  await cache.setJson(cacheKey, summary, CACHE_TTL)
 
-  return summary;
+  return summary
 }
 
-// Health endpoint integration
-app.get('/health', async (req, res) => {
-  const redisLatency = await ping();
-  res.json({
-    status: 'ok',
-    redis: {
-      available: isEnabled(),
-      latencyMs: redisLatency,
-    },
-  });
-});
+// Invalidate all project caches
+async function invalidateProjectCaches(projectId) {
+  const prefix = cache.buildPrefix(['project', 'summary', projectId])
+  await cache.delPrefix(prefix)
+}
 ```
 
 ## Related Patterns
 
 - [Distributed Job Locking](./distributed-job-locking.md)
 - [Graceful Degradation and Optional Init](./graceful-degradation-and-optional-init.md)
-- [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
+- [Stale State Recovery on Startup](./stale-state-recovery-on-startup.md)

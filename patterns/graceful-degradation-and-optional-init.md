@@ -1,6 +1,6 @@
 # Graceful Degradation and Optional Init
 
-> Non-blocking startup with per-service .catch() handlers, multi-provider LLM fallback chains, and optional service initialization for resilient orchestrator operation.
+> Non-blocking startup combining `Promise.allSettled()` for schema initializers with per-service `.catch()` handlers, a Gemini-primary LLM fallback chain (Gemini -> Claude -> OpenAI), and optional service initialization for resilient orchestrator operation.
 
 ## Problem
 
@@ -16,148 +16,170 @@ An orchestrator depends on many services — Redis, PostgreSQL, LLM providers, e
 
 ## Solution
 
-### Per-Service .catch() Startup
+### Mixed Startup Strategy
 
-Rather than a single `Promise.allSettled()` call, each service has its own try/catch or `.catch()` handler. This achieves the same non-blocking intent but gives each service its own error handling context:
+The actual startup combines two patterns: `Promise.allSettled()` for groups of related schema initializers, and individual `.catch()` handlers for independent service connections. This is not one or the other — it's both:
 
 ```javascript
 // index.js — startup sequence
-async function start() {
-  // Critical: must succeed
-  await db.connect();
 
-  // Non-critical: each service handles its own failure
-  await recoverySchema.initSchema().catch(err => {
-    logger.warn({ err }, 'Recovery schema init failed — running without it');
-  });
+// Critical: must succeed
+db.init()
+  .then(async () => {
+    // Late schema initializers grouped with Promise.allSettled()
+    const recoverySchema = require('./lib/agent/recovery/schema');
+    const antiPatterns = require('./lib/learning/anti-patterns');
 
-  await antiPatterns.initSchema().catch(err => {
-    logger.warn({ err }, 'Anti-patterns schema init failed — running without it');
-  });
+    await Promise.allSettled([
+      recoverySchema.initSchema(),
+      antiPatterns.initSchema(),
+    ]);
+  })
+  .catch(e => logger.warn({ err: e }, 'DB init warning'));
 
-  await redis.connect().catch(err => {
-    logger.warn({ err }, 'Redis connect failed — using in-memory fallback');
-  });
-
-  await embeddings.init().catch(err => {
-    logger.warn({ err }, 'Embeddings init failed — falling back to keyword search');
-  });
-
-  await calendar.connect().catch(err => {
-    logger.warn({ err }, 'Calendar connect failed — running without it');
-  });
-
-  // Continue startup with whatever succeeded
-  await startServer();
-}
+// Independent services with individual .catch() handlers
+uiCache.init().catch(e => logger.warn({ err: e }, 'UI cache init warning'));
+google.init();
+github.init();
+embeddings.init().catch(e => logger.warn({ err: e }, 'Embeddings init warning'));
 ```
 
-Each service knows its own failure implications. The per-service pattern makes it clear which service failed and what the degraded behavior will be, without aggregating results into an indexed array.
-
-### LLM Provider Fallback Chain
-
-When the primary LLM provider is unavailable (rate-limited, down, or erroring), the system transparently falls back through alternatives:
-
-```javascript
-async function generate(context, options = {}) {
-  // Primary: Claude
-  try {
-    return await claude.generate(context, options);
-  } catch (err) {
-    if (!isRetryable(err)) throw err;
-    logger.warn('Claude unavailable, falling back to Gemini');
-  }
-
-  // Secondary: Gemini
-  try {
-    return await gemini.generate(context, options);
-  } catch (err) {
-    if (!isRetryable(err)) throw err;
-    logger.warn('Gemini unavailable, falling back to OpenAI');
-  }
-
-  // Tertiary: OpenAI
-  return await openai.generate(context, options);
-}
-```
-
-The fallback is transparent to callers — they get a response regardless of which provider served it. Quality may vary between providers, but the system stays operational.
-
-### Redis Optional with In-Memory Fallback
-
-Redis is used for distributed locking and caching, but every Redis-dependent feature has an in-memory fallback:
-
-```javascript
-let client = null;
-
-async function connect() {
-  const url = process.env.REDIS_URL;
-  if (!url) {
-    logger.info('Redis URL not configured — using in-memory fallback');
-    return null;
-  }
-
-  try {
-    client = createClient({ url });
-    client.on('error', (err) => logger.warn({ err }, 'Redis error'));
-    await client.connect();
-    return client;
-  } catch (err) {
-    logger.warn({ err }, 'Redis connect failed — using in-memory fallback');
-    return null;
-  }
-}
-```
+The `Promise.allSettled()` call groups schema initializers that share a dependency (database must be ready) and should run concurrently. Individual `.catch()` handlers wrap independent services that can fail without affecting others. This combination gives each failure its own error context while allowing related initializers to parallelize.
 
 ### Unhandled Rejection Safety Net
 
-A global handler catches unhandled rejections (often database timeouts) without crashing:
+A global handler catches unhandled rejections — particularly database timeouts during startup — without crashing:
 
 ```javascript
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error({ reason }, 'Unhandled rejection — not crashing');
-  errorStats.record('unhandled_rejection', reason);
+  const message = reason?.message || String(reason);
+  // Database connection errors are recoverable
+  if (message.includes('Connection terminated') || message.includes('timeout')) {
+    logger.error({ reason }, '[Startup] Database connection error (will retry)');
+    return;
+  }
+  logger.fatal({ reason }, '[Unhandled Rejection]');
 });
+```
+
+### LLM Provider Fallback Chain
+
+The LLM system uses Gemini as the primary provider (not Claude). When Gemini is rate-limited, the system transparently falls back through Claude, then OpenAI:
+
+```javascript
+// lib/llm/index.js
+async function generate(request) {
+  const routing = router.route(request);
+  const provider = providers[routing.provider] || gemini;
+
+  try {
+    response = await retryWithBackoff(
+      () => provider.generate(enrichedRequest),
+      request.maxRetries ?? 2
+    );
+  } catch (err) {
+    const isRateLimitError =
+      err.message?.includes('429') ||
+      err.message?.includes('RESOURCE_EXHAUSTED') ||
+      err.message?.includes('quota');
+
+    if (isRateLimitError && routing.provider === 'gemini') {
+      // Fallback 1: Claude
+      if (claude.isAvailable()) {
+        logger.warn('Gemini rate limited; falling back to Claude');
+        response = await claude.generate({ ...enrichedRequest, model: models.CLAUDE_MODEL });
+        usedFallback = true;
+      }
+      // Fallback 2: OpenAI
+      else if (openai.isAvailable()) {
+        logger.warn('Gemini rate limited; falling back to OpenAI');
+        response = await openai.generate({ ...enrichedRequest, model: models.OPENAI_MODEL });
+        usedFallback = true;
+      }
+      else throw err;
+    } else throw err;
+  }
+}
+```
+
+The fallback chain is Gemini -> Claude -> OpenAI. Fallback is only triggered by rate limit errors (429, RESOURCE_EXHAUSTED, quota). Other errors propagate normally. The response includes routing metadata so callers can detect when a fallback was used.
+
+### Provider Validation at Startup
+
+The system validates that at least one LLM provider is configured before starting:
+
+```javascript
+const USE_CLAUDE = process.env.PREFER_CLAUDE === 'true' && process.env.ANTHROPIC_API_KEY;
+const USE_GEMINI = process.env.GEMINI_API_KEY && !USE_CLAUDE;
+
+if (!USE_CLAUDE && !USE_GEMINI) {
+  logger.fatal('Missing API keys - need either ANTHROPIC_API_KEY or GEMINI_API_KEY');
+  process.exit(1);
+}
+```
+
+### Tenant Initialization
+
+Even the tenant system uses optional init — the default tenant is created if missing, but failure is a warning, not a crash:
+
+```javascript
+const tenantReady = tenants.getOrCreateDefault()
+  .then(t => logger.info({ tenant: t.name }, 'Tenant ready'))
+  .catch(e => logger.warn({ err: e }, 'Tenant init warning'));
 ```
 
 ## Implications
 
-- Per-service `.catch()` handlers give each service its own error context — clearer than indexing into a `Promise.allSettled()` results array
-- Services initialize sequentially in the shown pattern, not in parallel — this is simpler but slightly slower than `Promise.allSettled()`. Services that are independent could be parallelized if startup time becomes a concern.
-- The LLM fallback chain changes response quality transparently — users may notice but the system stays up
-- In-memory fallbacks for Redis work for single-instance deployments but lose distributed coordination
-- The unhandled rejection handler is a safety net, not a fix — recurring unhandled rejections should be investigated and properly caught
+- `Promise.allSettled()` for schema inits means both recovery schema and anti-patterns table can fail independently without blocking each other or the rest of startup
+- Per-service `.catch()` handlers for independent services give each service its own error context and degraded behavior description
+- The LLM fallback chain is Gemini-primary (not Claude-primary) — Gemini handles the majority of traffic including chat and tool calling, with Claude reserved for complex reasoning
+- Fallback only triggers on rate limit errors — other errors (authentication, network) propagate immediately rather than cascading through providers
+- The `retryWithBackoff` wrapper provides within-provider retry before cross-provider fallback
+- OpenAI is available as tertiary fallback but requires explicit `RILEY_OPENAI_ENABLED=true` opt-in
+- The unhandled rejection handler distinguishes database timeouts (recoverable, logged as error) from other rejections (logged as fatal) — it's a safety net, not a fix
 
 ## Code Example
 
 ```javascript
-// Complete resilient startup sequence
-async function startOrchestrator() {
-  // 1. Critical dependency — must succeed
-  await db.connect();
-  logger.info('Database connected');
+// Complete resilient startup sequence from index.js
 
-  // 2. Optional dependencies — each handles its own failure
-  await redis.connect().catch(err => {
-    logger.warn('Running without Redis — using in-memory locks and caches');
-  });
+// 1. Global safety net
+process.on('unhandledRejection', (reason) => {
+  if (reason?.message?.includes('Connection terminated')) {
+    logger.error({ reason }, 'Database connection error (will retry)');
+    return;
+  }
+  logger.fatal({ reason }, '[Unhandled Rejection]');
+});
 
-  await embeddings.init().catch(err => {
-    logger.warn('Running without embeddings — falling back to keyword search');
-  });
+// 2. Critical dependency
+db.init()
+  .then(async () => {
+    // Schema inits grouped with Promise.allSettled()
+    await Promise.allSettled([
+      recoverySchema.initSchema(),
+      antiPatterns.initSchema(),
+    ]);
+  })
+  .catch(e => logger.warn({ err: e }, 'DB init warning'));
 
-  await calendar.connect().catch(err => {
-    logger.warn('Running without calendar integration');
-  });
+// 3. Independent services — each handles its own failure
+uiCache.init().catch(e => logger.warn({ err: e }, 'UI cache init warning'));
+google.init();
+github.init();
+embeddings.init().catch(e => logger.warn({ err: e }, 'Embeddings init warning'));
 
-  // 3. Start server
-  await startServer();
-  logger.info('Orchestrator ready (degraded services logged above)');
-}
+// 4. Tenant readiness
+tenants.getOrCreateDefault()
+  .then(t => logger.info({ tenant: t.name }, 'Tenant ready'))
+  .catch(e => logger.warn({ err: e }, 'Tenant init warning'));
+
+// 5. LLM: Gemini primary, Claude fallback, OpenAI tertiary
+// Validated at startup: at least one of GEMINI_API_KEY or ANTHROPIC_API_KEY required
 ```
 
 ## Related Patterns
 
+- [Model Selection and LLM Fallback](./model-selection-and-llm-fallback.md)
 - [Distributed Job Locking](./distributed-job-locking.md)
 - [Error Triage and Recovery](./error-triage-and-recovery.md)
-- [Unified Search Across KBs](./unified-search-across-kbs.md)

@@ -1,250 +1,196 @@
 # Request-Scoped Context Propagation
 
-> AsyncLocalStorage-based per-request context (correlation IDs, embedding caches, tenant isolation stub) avoiding parameter drilling through async chains. Note: multi-tenancy is completely inactive — `tenantId` is hardcoded to `1` in `unified-events.ts`, meaning all data shares a single tenant namespace.
+> AsyncLocalStorage-based per-request context with `runWithRequestContext` for correlation IDs and embedding caches, while tenant context has been stripped of AsyncLocalStorage entirely — `getCurrentTenantId()` always returns `1`.
 
 ## Problem
 
-In a multi-tenant orchestrator handling concurrent requests, deeply nested async functions need access to request-scoped data — the current tenant, a correlation ID for log tracing, per-request embedding caches, user preferences. The naive solution is parameter drilling: passing a `context` object through every function in the call chain. This works at first, then metastasizes. Every function signature grows a `ctx` parameter. Utility functions that previously had clean interfaces now need request context they don't logically care about, just to pass it deeper. Refactoring becomes painful because adding a new piece of context means touching every intermediate function. Worse, a single missed parameter in the chain silently breaks tracing or tenant isolation.
+In an orchestrator handling concurrent requests, deeply nested async functions need access to request-scoped data — correlation IDs for log tracing, per-request embedding caches, user IDs. The naive solution is parameter drilling: passing a `context` object through every function in the call chain. This works at first, then metastasizes. Every function signature grows a `ctx` parameter. Utility functions that previously had clean interfaces now need request context they don't logically care about, just to pass it deeper. Refactoring becomes painful because adding a new piece of context means touching every intermediate function.
 
 ## Context
 
 - Node.js async operations (HTTP handlers, WebSocket messages, job dispatchers)
-- Multi-tenant system where tenant isolation is structurally prepared (currently a stub hardcoded to tenant 1)
-- Correlation IDs needed in every log line for distributed tracing
+- Correlation IDs needed in every audit log for distributed tracing
 - Per-request embedding caches that must not leak between requests
-- Middleware-based request lifecycle (Express, Fastify, or custom)
 - Deep call stacks: handler -> service -> repository -> cache -> external API
+- Multi-tenancy has been completely removed — tenant context is a no-op stub
 
 ## Solution
 
 ### The Store
 
-`AsyncLocalStorage` provides a store scoped to the current async execution context. It follows `await` boundaries, `setTimeout` callbacks, and `Promise` chains automatically — anything that Node.js tracks as part of the same async resource gets the same store.
+`AsyncLocalStorage` provides a store scoped to the current async execution context. The function is named `runWithRequestContext` (not `runWithContext`):
 
 ```javascript
 // lib/request-context.js
-const { AsyncLocalStorage } = require('node:async_hooks');
+const { AsyncLocalStorage } = require('async_hooks');
 
-const requestStore = new AsyncLocalStorage();
+const storage = new AsyncLocalStorage();
 
-function runWithContext(contextData, fn) {
-  return requestStore.run(contextData, fn);
+function runWithRequestContext(values, fn) {
+  const parent = storage.getStore();
+  const next = parent ? { ...parent, ...values } : { ...(values || {}) };
+
+  // Lazily create a per-request embedding cache
+  if (!next.embeddingCache) next.embeddingCache = new Map();
+
+  return storage.run(next, fn);
 }
 
-function getContext() {
-  return requestStore.getStore();
+function getStore() {
+  return storage.getStore() || null;
 }
 
-function get(key) {
-  const store = requestStore.getStore();
-  return store?.[key];
+function getEmbeddingCache() {
+  return storage.getStore()?.embeddingCache || null;
 }
 
-function set(key, value) {
-  const store = requestStore.getStore();
-  if (store) store[key] = value;
+function getCorrelationId() {
+  return storage.getStore()?.correlationId || null;
 }
 
-module.exports = { runWithContext, getContext, get, set };
-```
-
-### Middleware Initialization
-
-Every inbound request is wrapped in a `runWithContext` call that creates the store before any async work begins. This is the critical invariant — if async work starts before the store is initialized, it won't have access to context.
-
-```javascript
-// middleware/request-context.js
-const { randomUUID } = require('node:crypto');
-const reqCtx = require('../lib/request-context');
-
-function requestContextMiddleware(req, res, next) {
-  const context = {
-    correlationId: req.headers['x-correlation-id'] || randomUUID(),
-    tenantId: req.tenant?.id || null,
-    userId: req.user?.id || null,
-    startedAt: Date.now(),
-    cache: new Map(),  // Per-request cache, GC'd when request ends
-  };
-
-  // Set correlation ID on response for downstream tracing
-  res.setHeader('x-correlation-id', context.correlationId);
-
-  reqCtx.runWithContext(context, () => next());
+function getUserId() {
+  return storage.getStore()?.userId || null;
 }
 ```
 
-The `cache` field is a fresh `Map` per request. Functions that perform expensive operations (embedding lookups, permission checks) can cache results here without worrying about cross-request leakage — the entire store is garbage collected when the request's async chain completes.
-
-### Correlation ID in Logging
-
-With the store in place, loggers pull the correlation ID without any parameter passing:
-
-```javascript
-// lib/logger.js
-const reqCtx = require('./request-context');
-
-function createLogger(module) {
-  return {
-    info(message, data = {}) {
-      const correlationId = reqCtx.get('correlationId');
-      console.log(JSON.stringify({
-        level: 'info',
-        module,
-        correlationId: correlationId || 'no-request',
-        message,
-        ...data,
-        timestamp: Date.now(),
-      }));
-    },
-    // warn, error follow same pattern
-  };
-}
-```
-
-Every log line across every module in the async chain includes the same correlation ID. No parameter drilling needed. Grep a single ID in your log aggregator and you get the full request trace.
-
-### Tenant Isolation (Completely Inactive)
-
-The tenant isolation infrastructure exists in code but is completely inactive. In `unified-events.ts`, `tenantId` is hardcoded to `1` — there is no runtime tenant resolution, no per-tenant data separation, and all data shares a single tenant namespace. The AsyncLocalStorage pattern is real and functional for correlation IDs and embedding caches, but multi-tenancy is a dead code path. The code below shows the prepared abstraction, but none of it is exercised with real multi-tenant data today:
-
-```javascript
-// lib/tenant-context.ts
-import * as reqCtx from './request-context';
-
-export function getTenantId(): string {
-  const tenantId = reqCtx.get('tenantId');
-  if (!tenantId) {
-    throw new Error('No tenant context — operation requires tenant scope');
-  }
-  return tenantId;
-}
-
-export function getTenantPrefix(): string {
-  return `tenant:${getTenantId()}`;
-}
-
-export function scopeKey(key: string): string {
-  return `${getTenantPrefix()}:${key}`;
-}
-```
-
-Database queries, cache keys, and external API calls all use `getTenantId()` to enforce isolation in theory. In practice, `tenantId` is always `1` (hardcoded in `unified-events.ts`), so the isolation plumbing is never exercised with real multi-tenant data. The throw-on-missing pattern catches cases where code runs outside a request context, but with the hardcoded tenant ID, this is effectively a no-op safety net.
+Key design points:
+- Parent context is merged, not replaced — nested `runWithRequestContext` calls inherit outer values
+- The embedding cache is lazily created as a `Map` storing Promises, so parallel callers dedupe embedding work within the same request
+- Accessors return `null` (not `undefined`) when outside a context, making missing-context checks explicit
 
 ### Per-Request Embedding Cache
 
-Embedding operations are expensive. Within a single request, the same text may need to be embedded multiple times (semantic search, similarity check, classification). The per-request cache prevents redundant API calls:
+The embedding cache stores Promises, not resolved values. This means if two async paths within the same request both call `getEmbedding("hello")` concurrently, the second call gets the same Promise as the first — deduplicating the API call:
 
 ```javascript
-// lib/embedding.js
-const reqCtx = require('./request-context');
-
+// lib/unified-memory/embeddings.js (illustrative usage)
 async function getEmbedding(text) {
-  const cache = reqCtx.get('cache');
-  const cacheKey = `embedding:${text}`;
+  const cache = requestContext.getEmbeddingCache();
+  if (cache?.has(text)) return cache.get(text);
 
-  if (cache?.has(cacheKey)) {
-    return cache.get(cacheKey);
-  }
+  const promise = embeddingProvider.embed(text);
+  if (cache) cache.set(text, promise);
 
-  const embedding = await embeddingProvider.embed(text);
-
-  if (cache) {
-    cache.set(cacheKey, embedding);
-  }
-
-  return embedding;
+  return promise;
 }
 ```
 
-The cache lives only for the request duration. No TTL management, no invalidation logic, no size limits to worry about — the garbage collector handles cleanup when the request's async context is released.
+### Correlation ID in Audit Logging
+
+The audit system pulls the correlation ID from request context without any parameter passing:
+
+```javascript
+// lib/audit/core.js
+function log(operation, data = {}, options = {}) {
+  const corrId =
+    options.correlationId ||
+    data.correlationId ||
+    requestContext.getCorrelationId();  // Falls through to AsyncLocalStorage
+
+  const entry = {
+    id: `aud_${ulid()}`,
+    ts: new Date().toISOString(),
+    op: operation,
+    corrId,
+    data: sanitize(data),
+  };
+
+  buffer.push(entry);
+}
+```
+
+### Tenant Context (Stripped of AsyncLocalStorage)
+
+The tenant context module has been completely stripped of AsyncLocalStorage. It's a no-op stub where `getCurrentTenantId()` always returns `1` and `runWithTenant()` calls its callback directly:
+
+```javascript
+// lib/tenant-context.js (compiled from TypeScript)
+function runWithTenant(_tenantId, callback) {
+  return callback();  // No AsyncLocalStorage, no scoping
+}
+
+function getCurrentTenantId() {
+  return 1;  // Always single tenant
+}
+
+function shouldBypassScoping() {
+  return false;
+}
+```
+
+This is a deliberate simplification — multi-tenancy was removed entirely, not just disabled. There is no AsyncLocalStorage overhead for tenant resolution, no per-tenant data separation, and no runtime tenant context. The functions exist for interface compatibility but do nothing.
 
 ### WebSocket and Job Contexts
 
-HTTP requests aren't the only entry point. WebSocket messages and background jobs need their own context wrapping:
+HTTP requests aren't the only entry point. WebSocket messages and background jobs wrap their work in `runWithRequestContext`:
 
 ```javascript
 // For WebSocket messages
 socket.on('message', (msg) => {
-  reqCtx.runWithContext({
-    correlationId: msg.correlationId || randomUUID(),
-    tenantId: socket.tenantId,
+  requestContext.runWithRequestContext({
+    correlationId: msg.correlationId || newCorrelationId(),
     userId: socket.userId,
-    cache: new Map(),
   }, () => handleMessage(msg));
 });
 
 // For background jobs
-async function runJob(jobName, tenantId, jobFn) {
-  return reqCtx.runWithContext({
-    correlationId: `job:${jobName}:${randomUUID()}`,
-    tenantId,
-    userId: null,
-    cache: new Map(),
+async function runJob(jobName, jobFn) {
+  return requestContext.runWithRequestContext({
+    correlationId: `job:${jobName}:${ulid()}`,
   }, jobFn);
 }
 ```
 
-The same `getContext()` / `get()` / `set()` accessors work identically regardless of whether the context was created by HTTP middleware, a WebSocket handler, or a job dispatcher.
-
 ## Implications
 
-- **Minor performance overhead** — `AsyncLocalStorage` adds a small cost per async operation (microseconds). For typical request workloads this is negligible; for tight loops processing thousands of async operations per request, measure first.
-- **Invisible data flow** — The store is implicit. Reading the code, you can't see where `correlationId` comes from without knowing about the middleware. This trades explicit parameter passing for implicit context. The tradeoff is worth it, but new contributors need to understand the pattern.
-- **Must initialize before async work** — If `runWithContext` is called after an `await`, the store won't propagate to work that started before it. Middleware must wrap the entire request handler, not just part of it.
-- **Garbage collected per request** — The store (including the cache `Map`) is eligible for GC once all async operations in the context complete. No manual cleanup needed, but large caches in long-running requests could temporarily increase memory pressure.
-- **No cross-process propagation** — `AsyncLocalStorage` is process-local. For distributed tracing across services, the correlation ID must be explicitly forwarded in outbound HTTP headers or message payloads.
-- **Testing requires wrapping** — Tests that call functions relying on `get()` must wrap the call in `runWithContext` or the values will be `undefined`. A test helper simplifies this.
-- **TypeScript strictness** — The generic `get(key)` accessor returns `any`. For type safety, `tenant-context.ts` wraps specific fields with typed accessors rather than exposing the raw store.
+- `runWithRequestContext` (not `runWithContext`) is the correct function name — the module exports this specific name
+- Parent context merging means nested contexts inherit outer values — useful for jobs that spawn sub-requests
+- The embedding cache stores Promises for deduplication, not resolved values — this is critical for parallel embedding lookups within a request
+- Tenant context is a completely separate module (`tenant-context.js`) that does NOT use AsyncLocalStorage — it's a stub returning `1`
+- There is no `set()` or `get()` by key — the module exports specific typed accessors (`getCorrelationId`, `getUserId`, `getEmbeddingCache`)
+- The store is eligible for GC once all async operations in the context complete — no manual cleanup needed
+- Testing requires wrapping calls in `runWithRequestContext` or accessors return `null`
 
 ## Code Example
 
 ```javascript
 // Full request lifecycle showing context propagation
+const requestContext = require('./lib/request-context');
+const audit = require('./lib/audit');
 
-// 1. Middleware initializes context
-app.use(requestContextMiddleware);
+// 1. HTTP middleware initializes context
+app.use((req, res, next) => {
+  requestContext.runWithRequestContext({
+    correlationId: req.headers['x-correlation-id'] || audit.newCorrelationId(),
+    userId: req.user?.id,
+  }, () => next());
+});
 
 // 2. Route handler — no context parameters needed
 app.post('/api/search', async (req, res) => {
-  const logger = createLogger('search');
-  logger.info('Search request received', { query: req.body.query });
+  // audit.log automatically picks up correlationId from context
+  audit.log('search:start', { query: req.body.query });
 
-  // 3. Service layer reads context implicitly
   const results = await searchService.search(req.body.query);
 
-  logger.info('Search complete', { resultCount: results.length });
+  audit.log('search:complete', { resultCount: results.length });
   res.json({ results });
 });
 
-// 4. Service uses tenant isolation and embedding cache
-// searchService.js
+// 3. Deep in the stack, embedding cache deduplicates work
 async function search(query) {
-  const tenantId = getTenantId();  // From context — throws if missing
-  const embedding = await getEmbedding(query);  // Cached per-request
-
-  const results = await vectorStore.query({
-    embedding,
-    filter: { tenantId },
-    limit: 10,
-  });
-
-  // Second call to getEmbedding with same text hits cache
-  const reranked = await rerank(results, query);
-  return reranked;
+  const embedding1 = await getEmbedding(query);  // API call
+  const embedding2 = await getEmbedding(query);  // Cache hit (same Promise)
+  // embedding1 === embedding2 (same Promise reference)
 }
 
-// 5. Deep in the stack, logger still has correlation ID
-// vectorStore.js
-async function query({ embedding, filter, limit }) {
-  const logger = createLogger('vector-store');
-  logger.info('Querying vectors', { filter, limit });
-  // correlationId automatically included in log output
-  // ...
-}
+// 4. Tenant context is completely separate and always returns 1
+const { getCurrentTenantId } = require('./lib/tenant-context');
+getCurrentTenantId();  // Always 1, no AsyncLocalStorage involved
 ```
 
 ## Related Patterns
 
+- [Audit Trail with PII Sanitization](./audit-trail-with-pii-sanitization.md)
 - [Unified Event System](./unified-event-system.md)
 - [Context Assembly Pipeline](./context-assembly-pipeline.md)
-- [Audit Trail with PII Sanitization](./audit-trail-with-pii-sanitization.md)

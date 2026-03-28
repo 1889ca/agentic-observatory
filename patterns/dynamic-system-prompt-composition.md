@@ -1,6 +1,6 @@
 # Dynamic System Prompt Composition
 
-> Multi-layer system prompt assembled from hardcoded persona, a vibe subsystem with preference synthesis and confidence tracking, skill injection based on message content, capability manifest, and anti-patterns — all composed at dispatch time.
+> Multi-layer system prompt assembled via template string concatenation from hardcoded persona, user profile, behavioral rules, capability manifest, anti-patterns, triggered skills, and a vibe subsystem with preference synthesis and confidence tracking.
 
 ## Problem
 
@@ -10,7 +10,8 @@ A static system prompt becomes stale as the orchestrator evolves. New capabiliti
 
 - An orchestrator with a growing set of capabilities and integrations
 - Persona and behavioral guidelines that form a stable base
-- A vibe subsystem (`lib/vibe/`) with multiple specialized modules for preference synthesis, confidence tracking, knowledge-gap detection, and outcome reactions
+- A user profile layer (`lib/user-profile.js`) that enriches the prompt with identity facts, active projects, and preferences
+- A vibe subsystem (`lib/vibe/`) with modules for preference synthesis, confidence tracking, and knowledge-gap detection
 - Dynamic skill injection that surfaces relevant skills based on message content
 - Anti-patterns learned from operational mistakes that should prevent recurrence
 - A capability manifest that grows as tools are added
@@ -19,184 +20,192 @@ A static system prompt becomes stale as the orchestrator evolves. New capabiliti
 
 ### Prompt Structure
 
-The system prompt is assembled from multiple layers, some static and some dynamically composed per-message:
+The system prompt is assembled using template string concatenation (not `---` separators) from multiple layers. Each section is a string that may be empty if its data source fails:
 
 ```
-Hardcoded Persona → Vibe Context (dynamic subsystem) → Skill Injection (dynamic) → Capability Manifest → Anti-Patterns → Final Prompt
+Persona + User Profile + Behaviors + Capability Manifest + Anti-Patterns + Skills + Vibe Context
 ```
 
 ### Persona and Behavioral Rules (Base Layer)
 
-The base personality and role definition are hardcoded strings that form the stable foundation:
+The base personality and behavioral guidelines are hardcoded string constants:
 
 ```javascript
-const PERSONA = `# Identity
-Riley — orchestrator and project manager
+// lib/system-prompt.js
+const PERSONA = `You are Riley, a friendly and capable personal assistant.
+You help users organize their work, track information, and stay on top of their responsibilities.
 
-# Core Behaviors
-- Be concise and action-oriented
-- Always confirm before destructive operations
-- Log decisions for auditability
-- When unsure, ask rather than guess`;
+Your personality:
+- Warm and conversational, but not overly effusive
+- Proactive - anticipate what users need
+- Transparent - tell users what you're doing and why
+- Honest about limitations`;
+
+const BEHAVIORS = `IMPORTANT BEHAVIORS:
+
+ACT DECISIVELY - NEVER ASK UNNECESSARY PERMISSION:
+- "Dentist Thursday 3pm" → Create the event immediately, then confirm what you did
+- WRONG: "Would you like me to add that?"
+- RIGHT: Just do it, then report what you did
+...`;
 ```
 
-### Vibe Subsystem (Dynamic Layer)
+### User Profile Layer
 
-The vibe layer is not a single function but a subsystem (`lib/vibe/`) composed of multiple specialized modules:
-
-**Synthesizer** — aggregates user communication patterns into a preference profile:
+The `getUserProfile()` function queries unified memory for identity facts, active projects, and preferences, then formats them into a prompt section. Results are cached for 5 minutes per tenant:
 
 ```javascript
-// lib/vibe/synthesizer.js
-function synthesizePreferences(conversation) {
-  const patterns = analyzePatterns(conversation);
-  return {
-    summary: buildStyleSummary(patterns),
-    detailLevel: patterns.preferredDetailLevel,
-    formality: patterns.formality,
-    proactivity: patterns.proactivityPreference,
-  };
-}
-```
+// lib/user-profile.js
+async function getUserProfile() {
+  const sections = [];
 
-**Confidence Tracker** — maintains domain-level confidence scores based on operational history. Higher confidence in a domain means more autonomous behavior; lower confidence triggers caution:
-
-```javascript
-// lib/vibe/confidence.js
-function getDomainConfidenceLevels() {
-  const domains = getAllTrackedDomains();
-  return Object.fromEntries(
-    domains.map(d => [d.name, d.confidenceScore])
-  );
-}
-// Returns: { 'billing-api': 0.87, 'auth-service': 0.42, 'infra': 0.65 }
-```
-
-**Knowledge-Gap Detection** — identifies areas where confidence is low and generates questions the agent should ask to fill gaps:
-
-```javascript
-// lib/vibe/knowledge-gaps.js
-function identifyKnowledgeGaps(domainConfidence) {
-  return Object.entries(domainConfidence)
-    .filter(([, score]) => score < CONFIDENCE_THRESHOLD)
-    .map(([domain, score]) => ({
-      domain,
-      score,
-      question: generateGapQuestion(domain),
-    }));
-}
-```
-
-**Outcome Reactor** — adjusts vibe state based on action outcomes. Successes reinforce confidence; failures trigger reassessment:
-
-```javascript
-// lib/vibe/outcome-reactor.js
-function reactToOutcome(domain, outcome) {
-  if (outcome.success) {
-    incrementConfidence(domain, SMALL_INCREMENT);
-  } else {
-    decrementConfidence(domain, LARGE_DECREMENT); // asymmetric: failures hit harder
-    recordKnowledgeGap(domain, outcome.context);
+  // Identity facts (name, role, timezone)
+  const identityFacts = await facts.search('name role timezone occupation', {
+    category: 'fact', limit: 10,
+  });
+  if (identityFacts.length > 0) {
+    sections.push(`Identity:\n${identityFacts.slice(0, 5).map(f => `- ${f.content}`).join('\n')}`);
   }
-}
-```
 
-**Combined Vibe Context** — the subsystem modules are composed into the prompt section:
-
-```javascript
-// lib/vibe/index.js
-function getVibeContext(conversation) {
-  const preferenceProfile = synthesizePreferences(conversation);
-  const domainConfidence = getDomainConfidenceLevels();
-  const knowledgeGaps = identifyKnowledgeGaps(domainConfidence);
-
-  return `# Communication Style
-${preferenceProfile.summary}
-
-# Domain Confidence
-${Object.entries(domainConfidence)
-  .map(([domain, level]) => `- ${domain}: ${level.toFixed(2)}`)
-  .join('\n')}
-
-# Knowledge Gaps — Ask About
-${knowledgeGaps.map(g => `- ${g.question} (domain: ${g.domain})`).join('\n')}`;
+  // Active projects, clients, preferences...
+  return sections.length > 0 ? `\n${sections.join('\n\n')}\n` : '';
 }
 ```
 
 ### Skill Injection (Dynamic Layer)
 
-Before composing the final prompt, the system searches for skills relevant to the current user message and injects their descriptions so the LLM knows they're available:
+Before composing the final prompt, the system searches for skills relevant to the current user message using trigger matching. Matched skills are formatted into a section:
 
 ```javascript
-async function getSkillContext(userMessage) {
-  const relevant = await skills.findRelevantSkills(userMessage);
-  if (relevant.length === 0) return '';
-
-  return `# Relevant Skills
-${relevant.map(s => `## ${s.name}\n${s.description}\nTrigger: ${s.trigger}`).join('\n\n')}`;
+let skillsSection = '';
+if (userMessage) {
+  const relevantSkills = skills.findRelevantSkills(userMessage);
+  if (relevantSkills.length > 0) {
+    skillsSection = skills.formatForPrompt(relevantSkills);
+  }
 }
 ```
 
-### Capability Manifest and Anti-Patterns (Appended)
+The formatted output includes skill names, descriptions, and content bodies under an `## Active Skills` header.
 
-Capability categories summarize available tools, and learned anti-patterns are appended to prevent recurrence:
+### Vibe Context (Dynamic Layer)
+
+The vibe layer composes three subsystems into a single prompt section:
+
+**Pending Questions** — knowledge gaps detected by the vibe engine, surfaced as questions to weave into conversation:
 
 ```javascript
-async function buildAntiPatterns() {
-  const patterns = await antiPatterns.getActive();
-  if (patterns.length === 0) return '';
+const questions = await vibe.knowledgeGaps.getPendingQuestions(3);
+// "QUESTIONS TO EXPLORE (weave naturally into conversation when relevant):
+//  - What timezone does the user prefer for scheduling?"
+```
 
-  return `# Anti-Patterns (DO NOT)
-${patterns.map(p => `- ${p.description} → Instead: ${p.correction}`).join('\n')}`;
+**Learned Preferences** — vibes synthesized from observed behavior patterns:
+
+```javascript
+const vibeProfile = await vibe.synthesizer.getVibeProfile();
+// "LEARNED PREFERENCES (from observed behavior):
+//  - Prefers concise responses over detailed explanations"
+```
+
+**Confidence Levels** — domain-specific confidence that modulates autonomous behavior:
+
+```javascript
+const summary = await vibe.confidence.getConfidenceSummary();
+// "YOUR CONFIDENCE LEVELS:
+//  Act more autonomously in confident domains.
+//  Be more careful and ask more in learning domains."
+```
+
+### Anti-Patterns (Appended)
+
+Learned anti-patterns from protocol errors are formatted and appended to prevent recurrence:
+
+```javascript
+let antiPatterns = '';
+if (includeAntiPatterns) {
+  antiPatterns = await formatAntiPatternsForPrompt();
 }
 ```
 
 ### Final Assembly
 
+All sections are concatenated using template strings. Empty sections are naturally excluded because empty strings don't contribute visible content:
+
 ```javascript
-async function composeSystemPrompt(userMessage, conversation) {
-  const vibeContext = getVibeContext(conversation);
-  const skillContext = await getSkillContext(userMessage);
-  const capabilities = buildCapabilitySummary();
-  const antiPatternSection = await buildAntiPatterns();
+async function generateSystemPrompt(options = {}) {
+  const { includeAntiPatterns = true, userMessage, activeSkills } = options;
 
-  const sections = [PERSONA, vibeContext, skillContext, capabilities, antiPatternSection];
+  const capabilityContext = capabilityManifest.generateLLMContext();
+  const antiPatterns = includeAntiPatterns ? await formatAntiPatternsForPrompt() : '';
+  const skillsSection = /* ... trigger matching ... */;
+  const userProfile = await getUserProfile();
+  const vibeContext = await getVibeContext();
 
-  return sections.filter(Boolean).join('\n\n---\n\n');
+  return `${PERSONA}
+${userProfile}
+${BEHAVIORS}
+
+${capabilityContext}${antiPatterns}${skillsSection}${vibeContext}
+
+Remember: Users trust you to actually do things, not just describe what you could do.`;
+}
+```
+
+Note the assembly uses direct template string concatenation, not `---` separators between sections. This keeps the prompt format natural for the LLM.
+
+### Sync Fallback
+
+A synchronous version is available for contexts where async isn't possible, omitting anti-patterns, skills, user profile, and vibe context:
+
+```javascript
+function getSystemPromptSync() {
+  const capabilityContext = capabilityManifest.generateLLMContext();
+  return `${PERSONA}\n\n${BEHAVIORS}\n\n${capabilityContext}\n\n...`;
 }
 ```
 
 ## Implications
 
-- The prompt varies per message — vibe context adapts to conversation history, skill injection adapts to message content
+- The prompt varies per message — skill injection adapts to message content, vibe context adapts to operational history
+- Template string concatenation (not `---` delimiters) keeps the format natural — empty sections don't leave visible markers
+- The user profile layer adds personalization but depends on unified memory being populated — a fresh instance has no profile context
 - The vibe subsystem creates a feedback loop: operational outcomes adjust confidence, which adjusts the prompt, which adjusts agent behavior
-- Domain confidence levels make the agent more autonomous in high-confidence areas and more cautious (asking questions) in low-confidence ones
-- Asymmetric outcome reactions (failures hit harder) create a conservative drift — the agent becomes cautious faster than it becomes confident
-- Preference synthesis means the agent's communication style drifts over time as it observes user patterns
-- Skill injection adds relevant context but increases token usage — the skill search must be fast and selective
+- Domain confidence levels make the agent more autonomous in high-confidence areas and more cautious in low-confidence ones
+- Each dynamic section has its own try/catch with `logger.warn` — a failure in any one section degrades the prompt but doesn't crash composition
+- The sync fallback ensures the prompt is always available, even if degraded, for non-async code paths
 - Anti-patterns grow over time and need periodic pruning to stay within token budgets
-- The prompt is rebuilt on every dispatch with multiple async fetches (skills, anti-patterns)
-- More dynamic layers means more potential for unexpected interactions between sections
+- Multiple async fetches per dispatch (skills, anti-patterns, user profile, vibe) add latency — results are not parallelized in the current implementation
 
 ## Code Example
 
 ```javascript
-// Dispatch with full dynamic composition
+// Full dispatch with dynamic prompt composition
+const { getSystemPrompt } = require('./lib/system-prompt');
+
 async function dispatch(message, conversation) {
-  const systemPrompt = await composeSystemPrompt(message, conversation);
+  const systemPrompt = await getSystemPrompt({
+    userMessage: message.text,
+    includeAntiPatterns: true,
+  });
 
   const response = await model.generate({
     systemInstruction: systemPrompt,
     contents: conversation.messages,
-    tools: capabilities.getDeclarations()
+    tools: capabilities.getDeclarations(),
   });
-
-  // After execution, feed outcome back into vibe subsystem
-  const domain = detectDomain(message);
-  reactToOutcome(domain, { success: response.success, context: message });
 
   return response;
 }
+
+// The generated prompt structure:
+// 1. PERSONA — "You are Riley, a friendly..."
+// 2. USER PROFILE — "Identity: Mike, Eastern timezone..."
+// 3. BEHAVIORS — "ACT DECISIVELY..."
+// 4. CAPABILITY MANIFEST — tool categories and descriptions
+// 5. ANTI-PATTERNS — "DO NOT: call entity() without searching first"
+// 6. ACTIVE SKILLS — matched skill content for current message
+// 7. VIBE CONTEXT — questions, preferences, confidence levels
 ```
 
 ## Related Patterns
@@ -204,5 +213,4 @@ async function dispatch(message, conversation) {
 - [Context Assembly Pipeline](./context-assembly-pipeline.md)
 - [Declarative Capability System](./declarative-capability-system.md)
 - [Anti-Pattern Learning Loop](./anti-pattern-learning-loop.md)
-- [Message Processing Pipeline](./message-processing-pipeline.md)
 - [Skill Extraction and Fast-Path Routing](./skill-extraction-and-fast-path-routing.md)

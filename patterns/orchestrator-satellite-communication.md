@@ -1,151 +1,177 @@
 # Orchestrator-Worker Communication
 
-> Worker-type-based task routing where the orchestrator matches tasks to workers by type and availability, dispatching work to the first suitable idle worker.
+> Multi-source weighted scoring dispatcher that collects work from heterogeneous sources, scores each item by source weight plus item-specific factors, and dispatches to typed workers with repo-locking and budget checks.
 
 ## Problem
 
-An orchestrator needs to dispatch heterogeneous work (code generation, issue solving, maintenance tasks, API-triggered jobs) to AI agent workers. Different tasks require different worker capabilities, and workers may be busy or unavailable. Without a routing layer that understands worker types and their current availability, the system either dispatches to the wrong worker type (causing failures) or dispatches to busy workers (creating queues where none are needed while idle workers sit unused).
+An orchestrator needs to dispatch heterogeneous work (user requests, GitHub issues, retryable failures, coding todos, health fixes) to AI agent workers. Work arrives from many sources with wildly different urgency: a user request should jump ahead of a speculative GitHub issue triage. Without a scoring model that accounts for source priority, item-specific factors, repo contention, and API budget, the dispatcher either starves urgent work or burns budget on low-value tasks while a user waits.
 
 ## Context
 
 - A central orchestrator dispatching work to Claude Code CLI processes
-- Work arrives from multiple sources: scheduled cron tasks, manual operator triggers, agent-initiated sub-tasks, and inbound API requests
-- Workers are typed — different worker types handle different categories of work
-- Workers have availability states: idle workers can accept new tasks, busy workers cannot
-- The dispatcher must match task requirements to the correct worker type and only dispatch to available workers
+- Work arrives from 6+ sources: user requests, retryable failed tasks, worker-ready GitHub issues, solvable GitHub issues, coding todos, and health checks
+- Workers are typed (research, code-review, communication, data, coding) with per-type capabilities, autonomy tiers, system prompts, and timeouts
+- Multiple workers can run in parallel, but two non-isolated workers cannot work on the same repository simultaneously
+- API budget is finite and tracked per task
 
 ## Solution
 
 ### Architecture Overview
 
-Work arrives at the dispatcher, which inspects the task to determine the required worker type. It then queries available workers of that type and routes the task to an idle one. If no workers of the required type are available, the task waits until one becomes free.
+The dispatcher runs a collect-score-filter-dispatch pipeline. It gathers candidate work from all sources, scores each item using a base weight for the source plus item-specific adjustments, filters out repo-locked items, sorts by score, then dispatches the top N items that fit within available worker slots and budget.
 
 ```
-Work Sources
-  scheduled tasks
-  manual triggers       -->  dispatch.js (router)
-  agent-initiated work         |
-  API requests           worker type check
-                               |
-                        availability check
-                               |
-                        route to idle worker
+Work Sources                    Dispatcher Pipeline
+  user requests  ─┐
+  retry failures ─┤
+  GH issues      ─┤──→  identifyWork()
+  coding todos   ─┤       │
+  health checks  ─┘       ├─ score = SOURCE_WEIGHT + itemFn(item)
+                          ├─ filter repo-locked items
+                          ├─ sort by score DESC
+                          │
+                      dispatch()
+                          ├─ check worker slot capacity
+                          ├─ check budget per item
+                          └─ route to typed dispatch runner
 ```
 
-### dispatch.js — Worker-Type Routing
+### Source Weights and Scoring
 
-The dispatcher is the single entry point for task execution. It determines the required worker type from task metadata and finds an available worker of that type:
+Each work source has a base weight. Items within a source get additional scoring from an item-specific function:
 
 ```javascript
-// lib/worker/dispatch.js (illustrative)
-async function dispatch(task) {
-  await db.query(
-    `UPDATE tasks SET status = 'dispatched', dispatched_at = NOW() WHERE id = $1`,
-    [task.id]
-  );
+// lib/worker/dispatcher.js
+const SOURCE_WEIGHTS = {
+  user_request: 90,
+  retry_failed: 80,
+  github_issue_ready: 70,
+  coding_todo: 50,
+  github_issue: 40,
+  health_check: 30,
+};
 
-  const workerType = resolveWorkerType(task);
-  const worker = await findAvailableWorker(workerType);
+// Each source defines its scoring function
+const sources = [
+  {
+    fn: getPendingUserTasks,
+    source: 'user_request',
+    scoreBase: SOURCE_WEIGHTS.user_request,
+    scoreFn: (t) => t.priority || 0,       // User-set priority adds to base
+    cost: 20,
+    taskType: (t) => t.task_type,
+  },
+  {
+    fn: getRetryableTasks,
+    source: 'retry_failed',
+    scoreBase: SOURCE_WEIGHTS.retry_failed,
+    scoreFn: (t) => -(t.attempt_count || 0) * 10,  // Penalize repeated failures
+    cost: 20,
+  },
+  {
+    fn: getSolvableIssues,
+    source: 'github_issue',
+    scoreBase: SOURCE_WEIGHTS.github_issue,
+    scoreFn: (i) => i.solvabilityScore * 2,  // Solvability score boosts ranking
+    cost: 25,
+  },
+  // ... coding_todo, github_issue_ready, health_check
+];
+```
 
-  if (!worker) {
-    // No available worker of the right type — task stays queued
-    await db.query(
-      `UPDATE tasks SET status = 'queued' WHERE id = $1`,
-      [task.id]
-    );
-    return null;
-  }
+The final score for any item is `scoreBase + scoreFn(item)`. A user request with priority 5 scores 95; a GitHub issue with solvability 4 scores 48.
 
-  return assignTaskToWorker(worker, task);
-}
+### Worker Type Registry
 
-function resolveWorkerType(task) {
-  // Task metadata or type determines which worker category handles it
-  return task.workerType || task.type || 'default';
+Workers are typed with explicit capabilities, autonomy tiers, system prompts, and concurrency limits. Task types are mapped to worker types through direct mappings and capability matching:
+
+```javascript
+// lib/worker/worker-types.js
+const WORKER_TYPES = {
+  research: {
+    capabilities: ['web_search', 'document_analysis', 'summarization', 'research'],
+    autonomyTier: APPROVAL_TIERS.AUTO,  // Read-only, safe to auto-execute
+    timeout: 600000,   // 10 minutes
+    maxParallel: 2,
+    systemPrompt: `You are a research specialist...`,
+  },
+  coding: {
+    capabilities: ['code_execution', 'bug_fix', 'feature_implementation', 'solve_issue'],
+    autonomyTier: APPROVAL_TIERS.NOTIFY,
+    timeout: 1800000,  // 30 minutes
+    maxParallel: 3,
+    systemPrompt: `You are a coding specialist...`,
+  },
+  // communication, code-review, data...
+};
+
+function findWorkerTypeForTask(taskTypeOrCapability) {
+  // Direct mapping first: solve_issue -> coding, pr_review -> code-review
+  if (directMappings[normalized]) return directMappings[normalized];
+  // Then capability scan, then default to 'coding'
+  return 'coding';
 }
 ```
 
-### Worker Availability Tracking
+### Repo Locking
 
-Workers register their type and report availability. The dispatcher queries this state when routing:
+The dispatcher prevents two non-isolated workers from operating on the same repository simultaneously. Before dispatching, it builds a set of repos with active tasks and filters out items targeting those repos:
 
 ```javascript
-// lib/worker/availability.js (illustrative)
-const workers = new Map(); // workerId -> { type, status, currentTask }
+// lib/worker/repo-lock.js
+const activeRepos = new Map(); // repo -> Set<taskId>
 
-function registerWorker(workerId, type) {
-  workers.set(workerId, { type, status: 'idle', currentTask: null });
+function canWorkOnRepo(repo, taskId, hasWorktreeIsolation = false) {
+  if (!repo) return true;
+  const active = activeRepos.get(repo);
+  if (!active || active.size === 0) return true;
+  if (active.has(taskId)) return true;
+  if (hasWorktreeIsolation) return true;  // Worktrees can run in parallel
+  return false;
+}
+```
+
+In `identifyWork()`, the dispatcher builds the running repo set from active tasks and filters candidates:
+
+```javascript
+const runningRepos = new Set();
+for (const task of running) {
+  const repo = extractRepo(task.params);
+  if (repo) runningRepos.add(repo);
 }
 
-function findAvailableWorker(workerType) {
-  for (const [id, worker] of workers) {
-    if (worker.type === workerType && worker.status === 'idle') {
-      return { id, ...worker };
+const filteredWork = work.filter((item) => {
+  const repo = extractRepo(item);
+  if (repo && runningRepos.has(repo)) return false;
+  return true;
+});
+
+return filteredWork.sort((a, b) => b.score - a.score);
+```
+
+### Budget-Gated Dispatch
+
+Each work item carries an estimated cost. Before dispatching, the system checks whether budget allows the task:
+
+```javascript
+async function dispatch() {
+  const work = await identifyWork();
+  const slotsAvailable = MAX_PARALLEL_WORKERS - running.length;
+
+  for (const workItem of work.slice(0, slotsAvailable)) {
+    const budgetCheck = ccUsage.shouldExecuteTask(2, workItem.estimatedCost);
+    if (!budgetCheck.allowed) {
+      audit.log('dispatcher:budget_blocked', {
+        source: workItem.source,
+        estimatedCost: workItem.estimatedCost,
+      });
+      break;  // Budget exhausted — stop dispatching
     }
-  }
-  return null;
-}
 
-function markBusy(workerId, taskId) {
-  const worker = workers.get(workerId);
-  if (worker) {
-    worker.status = 'busy';
-    worker.currentTask = taskId;
-  }
-}
-
-function markIdle(workerId) {
-  const worker = workers.get(workerId);
-  if (worker) {
-    worker.status = 'idle';
-    worker.currentTask = null;
-  }
-}
-```
-
-### Task Assignment
-
-Once a suitable idle worker is found, the task is assigned and the worker is marked busy:
-
-```javascript
-// lib/worker/dispatch.js (continued)
-async function assignTaskToWorker(worker, task) {
-  markBusy(worker.id, task.id);
-
-  try {
-    const result = await executeOnWorker(worker, task);
-    await db.query(
-      `UPDATE tasks SET status = 'completed', result = $1, completed_at = NOW() WHERE id = $2`,
-      [JSON.stringify(result), task.id]
-    );
-    return result;
-  } catch (err) {
-    await db.query(
-      `UPDATE tasks SET status = 'failed', error = $1 WHERE id = $2`,
-      [err.message, task.id]
-    );
-    throw err;
-  } finally {
-    markIdle(worker.id);
-  }
-}
-```
-
-### Dispatch Loop
-
-The dispatch loop periodically checks for queued tasks and attempts to route them:
-
-```javascript
-async function drainQueue() {
-  const tasks = await db.query(
-    `SELECT * FROM tasks WHERE status = 'queued' ORDER BY created_at ASC`
-  );
-
-  for (const task of tasks.rows) {
-    const workerType = resolveWorkerType(task);
-    const worker = findAvailableWorker(workerType);
-    if (worker) {
-      await dispatch(task);
+    const handler = dispatchers[workItem.source];
+    const result = await handler(workItem.item);
+    if (result.success) {
+      ccUsage.logTaskExecution('worker_dispatch', workItem.estimatedCost, 2);
     }
   }
 }
@@ -153,48 +179,46 @@ async function drainQueue() {
 
 ## Implications
 
-- Worker-type routing ensures tasks reach workers with the right capabilities — a code-generation task goes to a coding worker, not a triage worker
-- Availability checking prevents overloading busy workers while idle workers of the same type exist
-- If all workers of a required type are busy, tasks queue naturally without blocking other worker types
-- Adding a new worker type is a configuration change — register workers with the new type and tasks that resolve to it will route automatically
-- DB-persisted task state survives orchestrator restarts — queued tasks can be re-dispatched on startup
-- The simplicity of type + availability routing avoids the complexity of strategy-based dispatch while covering the common case well
+- Source weights make priority explicit and tunable: user requests (90) always outrank health checks (30) regardless of item-specific scoring
+- Item-specific scoring allows nuance within a source: a retried task with 2 prior failures is penalized (-20) relative to a fresh retry
+- Repo locking prevents git conflicts but can create starvation: if a long-running coding task holds a repo, all other items for that repo queue behind it
+- Worktree isolation is the escape hatch: tasks that use git worktrees bypass repo locking entirely
+- Budget checking is a hard gate with early termination: once budget is exhausted, no more items dispatch in that cycle, even if worker slots are available
+- `MAX_PARALLEL_WORKERS` (default 3) is the global concurrency cap, while each worker type has its own `maxParallel` for finer control
+- The solvability scorer for GitHub issues uses label heuristics (bug: +2, good-first-issue: +3) and title keywords (typo: +2, redesign: -3), meaning it can be gamed by label conventions
 
 ## Code Example
 
 ```javascript
-// End-to-end: task arrives, dispatcher routes by type and availability
+// End-to-end dispatch cycle
 
-// --- A coding task arrives ---
-const task = await createTask({
-  id: 'task-42',
-  type: 'solve-issue',
-  workerType: 'coding',
-  prompt: 'Fix the null reference in billing-api/invoices.js',
-});
+// 1. identifyWork() collects from all sources:
+//    user_request (priority 5)  → score: 90 + 5  = 95
+//    retry_failed (attempt 2)   → score: 80 - 20 = 60
+//    github_issue (solvability 4) → score: 40 + 8 = 48
+//    health_check (ci_failure)  → score: 30 + 5  = 35
 
-// --- Dispatcher resolves worker type: 'coding' ---
-// Checks availability: worker-3 (type: coding, status: idle) found.
-// Assigns task-42 to worker-3. Marks worker-3 as busy.
+// 2. Repo filter removes github_issue (repo already has active task)
 
-// --- Meanwhile, a triage task arrives ---
-const triageTask = await createTask({
-  id: 'task-43',
-  type: 'triage',
-  workerType: 'triage',
-  prompt: 'Review new GitHub issues for billing-api.',
-});
+// 3. Sorted: [user_request:95, retry_failed:60, health_check:35]
 
-// --- Dispatcher resolves worker type: 'triage' ---
-// worker-1 (type: triage, status: idle) found.
-// Assigns task-43 to worker-1. Different worker type, no conflict.
+// 4. dispatch() with 2 slots available:
+//    - user_request: budget check passes → dispatched via dispatchUserRequest()
+//    - retry_failed: budget check passes → dispatched via dispatchRetry()
+//    - health_check: no slots left → waits for next cycle
 
-// --- Worker-3 finishes task-42, marked idle ---
-// Next drain cycle can assign new coding tasks to worker-3.
+// 5. Status endpoint reports:
+const status = await dispatcher.getStatus();
+// {
+//   runningTasks: 2,
+//   availableWork: 1,
+//   topWork: [{ source: 'health_check', score: 35 }],
+//   budget: { remaining: 60, status: 'ok' }
+// }
 ```
 
 ## Related Patterns
 
-- [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
 - [Worker Dispatcher and Priority Queue](./worker-dispatcher-and-priority-queue.md)
+- [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
 - [Distributed Job Locking](./distributed-job-locking.md)

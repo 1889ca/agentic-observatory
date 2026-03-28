@@ -6,13 +6,13 @@ const PATTERNS = [
   {
     slug: "orchestrator-satellite-communication",
     title: "Orchestrator-Worker Communication",
-    summary: "Worker-type-based task routing where the orchestrator matches tasks to workers by type and availability, dispatching to the first suitable idle worker.",
+    summary: "Multi-source weighted scoring dispatcher that collects work from heterogeneous sources, scores each item by source weight plus item-specific factors, and dispatches to typed workers with repo-locking and budget checks.",
     status: "published",
   },
   {
     slug: "satellite-permission-escalation",
     title: "Worker Permission Escalation",
-    summary: "Static string-based autonomy tiers (AUTO/NOTIFY/ASK/NEVER) per capability for deterministic worker permission routing.",
+    summary: "Confidence-scored permission decisions where numeric tool tiers (1-4) combine with user autonomy level and runtime confidence signals to produce an effective score that determines execute, notify, or queue behavior.",
     status: "published",
   },
   {
@@ -24,7 +24,7 @@ const PATTERNS = [
   {
     slug: "multi-model-deliberation",
     title: "Multi-Model Deliberation",
-    summary: "Combining multiple AI models for higher-confidence decisions through structured debate.",
+    summary: "Round-robin multi-AI deliberation where Claude, Gemini, and Codex take turns responding to a shared transcript, building iteratively toward consensus over configurable rounds.",
     status: "published",
   },
   {
@@ -36,7 +36,7 @@ const PATTERNS = [
   {
     slug: "context-assembly-pipeline",
     title: "Context Assembly Pipeline",
-    summary: "Modular context gathering where independent context-gatherer modules each assemble their own context slice, combined at dispatch time.",
+    summary: "Token-budgeted context assembler with lazy-loaded modules, priority-ordered parts, and parallel async fetching that allocates a finite token budget across 10+ context sources based on query analysis.",
     status: "published",
   },
   {
@@ -54,7 +54,7 @@ const PATTERNS = [
   {
     slug: "evolution-and-self-improvement",
     title: "Evolution and Self-Improvement",
-    summary: "Success-driven learning cycle with coactivation tracking, secondary corrections processing, and preference synthesis from operational data.",
+    summary: "Four-stage pipeline (observe, analyze, propose, apply) that formalizes self-improvement through bounded observation, pattern detection, formal proposals with risk assessment, and safety-gated application with revert capability.",
     status: "published",
   },
   {
@@ -84,7 +84,7 @@ const PATTERNS = [
   {
     slug: "decision-gating-and-autonomy-tiers",
     title: "Decision Gating and Autonomy Tiers",
-    summary: "Dynamic autonomy rules evaluating domain confidence and action fingerprints to route decisions through AUTO/NOTIFY/ASK tiers with autonomy-boost promotion.",
+    summary: "User-defined conditional rule engine that elevates or restricts tool autonomy tiers based on pattern matching against action context, layered on top of the static tier system.",
     status: "published",
   },
   {
@@ -96,37 +96,37 @@ const PATTERNS = [
   {
     slug: "plugin-system-and-hot-reload",
     title: "Plugin System and Hot-Reload",
-    summary: "Manifest-driven plugin loading via plugin.json declarations with fs.watch hot-reload, lifecycle states, and capability registration.",
+    summary: "Manifest-driven plugin architecture with plugin.json discovery from local directories and npm packages, permission-gated context injection, semver compatibility checking, and fs.watch-based hot-reload.",
     status: "published",
   },
   {
     slug: "skill-extraction-and-fast-path-routing",
     title: "Skill Extraction and Fast-Path Routing",
-    summary: "File-based YAML skill discovery with frontmatter trigger matching for fast-path dispatch and designed (not yet operational) reflex promotion.",
+    summary: "Markdown-based skill files with YAML frontmatter, embedding-based vector similarity matching for fast-path dispatch, and a reflex promotion pipeline that can bypass LLM composition for high-confidence patterns.",
     status: "published",
   },
   {
     slug: "autonomous-agent-cycle",
     title: "Autonomous Agent Cycle",
-    summary: "2-hour periodic loop that reviews active objectives, generates strategies, and produces actionable tasks for goal-directed autonomous behavior.",
+    summary: "Periodic autonomous thinking loop running every 30 minutes during work hours, currently disabled and consolidated into the proactive intelligence job group.",
     status: "published",
   },
   {
     slug: "dynamic-system-prompt-composition",
     title: "Dynamic System Prompt Composition",
-    summary: "Multi-layer prompt with hardcoded persona, vibe subsystem (synthesizer, confidence, knowledge-gaps, outcome-reactor), per-message skill injection, capability manifest, and anti-patterns.",
+    summary: "Multi-layer system prompt assembled via template string concatenation from hardcoded persona, user profile, behavioral rules, capability manifest, anti-patterns, triggered skills, and vibe subsystem.",
     status: "published",
   },
   {
     slug: "knowledge-graph-and-relationship-discovery",
     title: "Knowledge Graph and Relationship Discovery",
-    summary: "Generic entity relationships stored in the documents table with relationship scoring and multi-hop traversal for context enrichment.",
+    summary: "Document-based entity relationships with dedicated scoring, enrichment, and query modules for multi-hop traversal, relationship ranking, and context assembly integration.",
     status: "published",
   },
   {
     slug: "anticipation-engine",
     title: "Anticipation Engine",
-    summary: "Domain-level confidence tracking with asymmetric scoring where successes slowly build confidence and failures rapidly reduce it via 1.25x correction multiplier.",
+    summary: "Proactive intelligence system that predicts user needs using temporal, sequential, calendar, and behavioral predictors — preparing context before the user asks.",
     status: "published",
   },
   {
@@ -138,7 +138,7 @@ const PATTERNS = [
   {
     slug: "unified-trigger-system",
     title: "Unified Trigger System",
-    summary: "Plain EventEmitter-style event bus with namespaced events and subscriber management for decoupled inter-module communication.",
+    summary: "DB-backed automation engine with CRUD management, cooldown tracking, 11 action types, wildcard event matching, cron scheduling, and resumable approval workflows.",
     status: "published",
   },
   {
@@ -156,7 +156,7 @@ const PATTERNS = [
   {
     slug: "connector-registry-and-capability-discovery",
     title: "Connector Registry and Capability Discovery",
-    summary: "Aspirational pattern for unified service integration with capability discovery. Currently uses direct per-service modules without a shared registry.",
+    summary: "Fully implemented connector system with a base class, auto-loading implementation directory, per-tenant instance caching, and a priority-based resolver that routes operations to the best available connector.",
     status: "published",
   },
   {
@@ -174,7 +174,7 @@ const PATTERNS = [
   {
     slug: "worker-dispatcher-and-priority-queue",
     title: "Worker Dispatcher and Priority Queue",
-    summary: "Worker-availability-based dispatch where tasks are routed to idle workers based on capacity, with parallel limits and audit logging.",
+    summary: "Weighted priority scoring with budget gating where work items from 6 sources are scored by SOURCE_WEIGHTS plus item-specific factors, then dispatched in score order with per-item budget checks and repo-lock filtering.",
     status: "published",
   },
   {
@@ -186,13 +186,13 @@ const PATTERNS = [
   {
     slug: "graceful-degradation-and-optional-init",
     title: "Graceful Degradation and Optional Init",
-    summary: "Non-blocking startup with per-service .catch() handlers, multi-provider LLM fallback chains, and optional service initialization.",
+    summary: "Non-blocking startup combining Promise.allSettled() for schema initializers with per-service .catch() handlers, a Gemini-primary LLM fallback chain, and optional service initialization.",
     status: "published",
   },
   {
     slug: "deliberative-alignment",
     title: "Deliberative Alignment",
-    summary: "Standalone multi-model voting module invoked explicitly for high-stakes decisions, not tied to autonomy band thresholds.",
+    summary: "General-purpose round-robin multi-model deliberation where Claude, Gemini, and Codex debate a topic across multiple rounds, building on each other's ideas to reach natural language consensus.",
     status: "published",
   },
   {
@@ -216,13 +216,13 @@ const PATTERNS = [
   {
     slug: "situation-detection-and-context-awareness",
     title: "Situation Detection and Context Awareness",
-    summary: "Runtime situation tracking with detection rules, behavioral modifications, situation stacking, and TTL-based expiry.",
+    summary: "Runtime detection of user situations (in a meeting, deep work, traveling, stressed) that adjusts agent behavior through structured behavior objects and priority-based merging.",
     status: "published",
   },
   {
     slug: "implicit-approval-parsing",
     title: "Implicit Approval Parsing",
-    summary: "Natural language approval and denial detection with context-gated activation. Batch and qualified approval parsing designed but not yet implemented.",
+    summary: "Natural language parsing of simple approval and denial responses using exact Set.has() matching against normalized input, with context gating that only activates on a single pending action match.",
     status: "published",
   },
   {
@@ -234,19 +234,19 @@ const PATTERNS = [
   {
     slug: "undo-and-revert-system",
     title: "Undo and Revert System",
-    summary: "Tool-level undo declarations with action log tracking before/after state for time-bounded reversible agent operations.",
+    summary: "DB-backed undo stack with entity-type reversers, enabling users to reverse agent mutations through tenant-scoped before/after state tracking and type-specific reversal logic.",
     status: "published",
   },
   {
     slug: "embedding-pipeline-and-async-vectorization",
     title: "Embedding Pipeline and Async Vectorization",
-    summary: "Non-blocking embedding generation via queue-based batch processing with graceful degradation to keyword search.",
+    summary: "In-memory queue with batch processing and dual storage routing, decoupling document writes from vector computation so ingestion stays fast while embeddings converge asynchronously.",
     status: "published",
   },
   {
     slug: "request-scoped-context",
     title: "Request-Scoped Context Propagation",
-    summary: "AsyncLocalStorage-based per-request context carrying correlation IDs and embedding caches through async chains. Multi-tenancy hardcoded to tenant 1.",
+    summary: "AsyncLocalStorage-based per-request context with runWithRequestContext for correlation IDs and embedding caches, while tenant context is hardcoded to tenant 1.",
     status: "published",
   },
   {
@@ -264,7 +264,7 @@ const PATTERNS = [
   {
     slug: "audit-trail-with-pii-sanitization",
     title: "Audit Trail with PII Sanitization",
-    summary: "Correlation-ID traced audit logging with batched non-blocking DB persistence and key-based sensitive field redaction before storage.",
+    summary: "Correlation-ID traced audit logging with 5-second batched non-blocking persistence and PII scrubbing using .includes() substring matching with long string truncation.",
     status: "published",
   },
   {
@@ -282,13 +282,13 @@ const PATTERNS = [
   {
     slug: "tools-factory-and-declarative-tool-definition",
     title: "Tools Factory and Declarative Tool Definition",
-    summary: "Declarative tool definitions with parameter schemas, automatic validation, entity resolution, error wrapping, and Gemini-compatible declaration generation.",
+    summary: "Modular factory system split across 8+ files with declarative tool definitions using a custom PARAM_TYPES format, automatic Gemini declaration generation, entity resolution, and three factory variants.",
     status: "published",
   },
   {
     slug: "task-lifecycle-and-state-machine",
     title: "Task Lifecycle and State Machine",
-    summary: "Strict state machine for task transitions (todo/in_progress/done/blocked/cancelled) with transient failure auto-retry and progressive backoff.",
+    summary: "Document-based task state machine with states pending/in_progress/in_review/changes_needed/done/failed/cancelled, validated transitions, worker integration, and automated review/rework cycles.",
     status: "published",
   },
   {
@@ -300,61 +300,61 @@ const PATTERNS = [
   {
     slug: "model-selection-and-llm-fallback",
     title: "Model Selection and LLM Fallback",
-    summary: "Role-based model routing across Gemini (primary), Claude (complex reasoning), and OpenAI (optional) with separate models for interactive chat, background workers, and deep thinking.",
+    summary: "Task-type and feature-name based routing across a three-provider stack (Gemini primary, Claude for complex reasoning, OpenAI optional) using flat key-value config with date-suffixed Claude model IDs.",
     status: "published",
   },
   {
     slug: "document-type-system",
     title: "Document Type System",
-    summary: "Type-based document handling with property validation, cross-type properties, and bidirectional task-document relationships.",
+    summary: "DB-backed, tenant-aware document type definitions with UI configuration (title templates, status colors, layouts), TTL-cached lookups, field inference, and a unified config API.",
     status: "published",
   },
   {
     slug: "database-abstraction-and-schema-management",
     title: "Database Abstraction and Schema Management",
-    summary: "PostgreSQL abstraction with lazy pool initialization, advisory-lock-protected schema migrations, connection pooling, and dual read/write API.",
+    summary: "PostgreSQL abstraction with a TypeScript query handler compiled to JS, a fluent SelectQuery builder, domain-specific schema modules, and file-based migrations managed by node-pg-migrate.",
     status: "published",
   },
   {
     slug: "redis-optional-caching-and-clustering",
     title: "Redis Optional Caching and Clustering",
-    summary: "Optional Redis layer with exponential backoff reconnection, in-memory fallback, Socket.io adapter for multi-instance pub/sub, and health checks.",
+    summary: "Optional Redis integration that reads REDIS_URL directly, uses the redis client's built-in reconnect strategy with exponential backoff, and exposes a lazy singleton client.",
     status: "published",
   },
   {
     slug: "rate-limiting-and-api-protection",
     title: "Rate Limiting and API Protection",
-    summary: "Sliding-window rate limiter on /api/* routes with per-endpoint configurable limits, custom key extraction, and Redis or in-memory backends.",
+    summary: "In-memory timestamp-array rate limiter with standard and heavy endpoint tiers, burst detection, configurable window/max via environment, and automatic periodic cleanup.",
     status: "published",
   },
   {
     slug: "structured-logging-with-child-loggers",
     title: "Structured Logging with Child Loggers",
-    summary: "Pino-based JSON logging with per-module child loggers, configurable levels, PID/env metadata, and AsyncLocalStorage correlation ID integration.",
+    summary: "Pino-based JSON logging with a single global LOG_LEVEL, per-module child loggers created via child({ module }), environment-aware pretty printing, and stdout-only output.",
     status: "published",
   },
   {
     slug: "llm-adapter-facade",
     title: "LLM Adapter Facade",
-    summary: "Type normalization layer converting between Gemini and Claude message formats, enabling seamless model switching without changing the message processor.",
+    summary: "Unified multi-provider LLM facade with task-type routing, complexity-based model selection, automatic fallback chains, cost tracking, and one-directional Gemini-to-Claude tool format conversion.",
     status: "published",
   },
   {
     slug: "semantic-query-routing",
     title: "Semantic Query Routing",
-    summary: "Three-tier confidence-based routing: reflexes (>0.90, auto-execute), skills (>0.85, pattern-matched), and novel composition (<0.85, LLM-generated).",
+    summary: "Embedding-similarity skill matching with pgvector, two confidence thresholds (0.90 reflex, 0.85 skill), automatic hit/success tracking, and a graduation path from trial to reflex status.",
     status: "published",
   },
   {
     slug: "multi-dispatch-strategy",
     title: "Multi-Dispatch Strategy",
-    summary: "Multiple dispatch runners (synchronous, runner-based, async) with work-source abstraction for supporting different execution modes from a single dispatcher.",
+    summary: "A weighted-priority dispatcher that collects work from multiple sources (work-sources.js), scores candidates, and routes them through runner-based or async execution paths with repo-level concurrency locks.",
     status: "published",
   },
   {
     slug: "ops-metrics-and-health-monitoring",
     title: "Ops Metrics and Health Monitoring",
-    summary: "Express middleware collecting event loop lag, p50/p95/p99 latency histograms, vector operation counters, and per-endpoint metrics with health check aggregation.",
+    summary: "Dedicated metrics module using perf_hooks for high-resolution timing, time-windowed sample buffers with configurable retention, and per-route/DB/job/dispatcher metrics aggregated into a single snapshot.",
     status: "published",
   },
   {
@@ -372,13 +372,13 @@ const PATTERNS = [
   {
     slug: "tunable-runtime-configuration",
     title: "Tunable Runtime Configuration",
-    summary: "DB-backed runtime-adjustable parameters with startup warm-up, in-memory caching, and hot updates without process restart.",
+    summary: "Sync-read, async-write registry with three-tier resolution (DB preference > environment variable > code default), typed definitions with validation, and warmCache() at startup.",
     status: "published",
   },
   {
     slug: "stale-state-recovery-on-startup",
     title: "Stale State Recovery on Startup",
-    summary: "Startup-time cleanup of orphaned locks, stuck tasks, and stale workflow executions left behind by ungraceful shutdowns.",
+    summary: "Redis TTL-based lock cleanup that clears immortal locks on startup and via periodic sweep, with local lock map reset — no PID-based DB lock checks or bulk task resets.",
     status: "published",
   },
   {
@@ -390,43 +390,67 @@ const PATTERNS = [
   {
     slug: "retry-utility-with-non-retryable-detection",
     title: "Retry Utility with Non-Retryable Detection",
-    summary: "Generic makeRetryable() wrapper with configurable exponential backoff that short-circuits on non-retryable error patterns like auth failures and 404s.",
+    summary: "Generic withRetry() wrapper with configurable exponential backoff, HTTP status code and error code checks, onRetry callback, and circuit breaker integration.",
     status: "published",
   },
   {
     slug: "goal-decomposition-and-objective-planning",
     title: "Goal Decomposition and Objective Planning",
-    summary: "Multi-level goal breakdown (goals, objectives, strategies, actions) with LLM-driven decomposition for autonomous agent work.",
+    summary: "AI-driven goal breakdown directly into actionable todos with dependency tracking, effort estimation, and auto-decomposition on goal creation.",
     status: "published",
   },
   {
     slug: "validation-and-schema-system",
     title: "Validation and Schema System",
-    summary: "Zod-based schema validation with type coercion, reusable domain validators, and tool execution integration for reliable LLM-generated input handling.",
+    summary: "Custom PARAM_TYPES validation for tool parameters with Zod reserved for API route validation, providing type coercion and reusable domain validators.",
     status: "published",
   },
   {
     slug: "contradiction-detection-and-resolution",
     title: "Contradiction Detection and Resolution",
-    summary: "Semantic similarity-based conflict detection for learned behavioral rules with majority voting and recency-weighted resolution to prevent contradictory pattern accumulation.",
+    summary: "LLM-driven detection of conflicting facts and beliefs with DB-stored contradictions, interactive user resolution via buttons, and semantic similarity at 0.6 threshold.",
     status: "published",
   },
   {
     slug: "attention-item-management",
     title: "Attention Item Management",
-    summary: "Priority queue for items requiring user attention with urgency levels, source-based notification throttling, snooze, auto-resolution, and periodic digest generation.",
+    summary: "DB-backed attention items with integer priorities (1-4), domain/itemType classification, Hue light alerts for high-priority items, and source-based deduplication.",
     status: "published",
   },
   {
     slug: "action-coordination-and-conflict-prevention",
     title: "Action Coordination and Conflict Prevention",
-    summary: "Action buffer with conflict checking against pending and recent operations, type-specific conflict rules, and batch approval for preventing duplicate or contradictory agent actions.",
+    summary: "Reversible action buffer with TTL-based undo windows, domain-specific undo handlers, and auto-finalization — enabling a trust-but-verify autonomy model where the agent acts first and the user can revert.",
     status: "published",
   },
   {
     slug: "autonomy-rule-suggestion",
     title: "Autonomy Rule Suggestion",
-    summary: "Pattern detection over historical approval decisions to suggest human-readable autonomy rules, with confidence scoring and explicit user acceptance before activation.",
+    summary: "Action-driven rule generation that creates autonomy rules from individually approved actions using pattern-based condition extraction and explicit single-action approval.",
+    status: "published",
+  },
+  {
+    slug: "query-builder-and-fluent-db-api",
+    title: "Query Builder and Fluent DB API",
+    summary: "Chainable .select().where().orderBy().limit().all() query builder with overloaded entry points, full-text search, vector similarity search, and tenant-scoped CRUD operations.",
+    status: "published",
+  },
+  {
+    slug: "unified-memory-and-fact-store",
+    title: "Unified Memory and Fact Store",
+    summary: "Triple-store facts (subject/predicate/object) combined with vector memory and multi-source search, providing long-term knowledge, semantic recall, and query expansion.",
+    status: "published",
+  },
+  {
+    slug: "budget-aware-task-execution",
+    title: "Budget-Aware Task Execution",
+    summary: "Pre-dispatch budget checking via shouldExecuteTask() that gates autonomous work by urgency, weekly spend, burn rate, and remaining budget — preventing runaway spending while allowing critical tasks through.",
+    status: "published",
+  },
+  {
+    slug: "proactive-intelligence-job",
+    title: "Proactive Intelligence Job",
+    summary: "Consolidated autonomous cycle that replaces multiple standalone scheduled jobs with a single work-hour-aware job group, unifying dispatch, context sync, and stuck task detection.",
     status: "published",
   },
 ];

@@ -1,168 +1,286 @@
 # Worker Dispatcher and Priority Queue
 
-> Worker-availability-based dispatch where tasks are routed to idle workers based on capacity, with parallel worker limits and audit logging.
+> Weighted priority scoring with budget gating where work items from 6 sources are scored by SOURCE_WEIGHTS plus item-specific factors, then dispatched in score order with per-item budget checks and repo-lock filtering.
 
 ## Problem
 
-An orchestrator receives events from many sources — user messages, task results, webhooks, scheduled jobs, ambient activity. These events need to be dispatched to workers for processing, but workers are a limited resource. Without awareness of which workers are available and how many can run concurrently, the dispatcher either overloads the system or leaves capacity on the table while tasks wait.
+An orchestrator receives work from many sources -- user requests, retryable failures, GitHub issues, coding todos, health checks. These vary wildly in urgency and cost. Without explicit priority scoring, the dispatcher either processes items in arrival order (starving urgent user requests behind a queue of speculative issue triages) or uses a single FIFO queue (treating a user request the same as a background health check). The system needs a scoring model that encodes source-level priority, item-level nuance, and budget constraints.
 
 ## Context
 
-- Multiple event types feeding a shared processing pipeline
-- A pool of workers with a configurable concurrency limit
-- Workers have availability states — idle workers can accept tasks, busy workers cannot
-- Need for audit logging to track dispatch decisions
-- Budget tracking to monitor operational cost
+- Work arrives from 6 heterogeneous sources with different urgency profiles
+- A pool of workers with a configurable concurrency limit (default 3)
+- Finite API budget that must be checked before each dispatch
+- Repositories that should not have two non-isolated workers operating simultaneously
+- Need for observability: every dispatch decision and skip must be auditable
 
 ## Solution
 
-### Worker Availability Model
+### SOURCE_WEIGHTS: Explicit Priority by Origin
 
-The dispatcher tracks active workers against a configurable maximum. Dispatch decisions are driven by whether idle capacity exists:
+Each work source has a base weight that establishes its priority tier. This is the foundation of the scoring model:
 
 ```javascript
-// worker/dispatcher.js
-const MAX_PARALLEL_WORKERS = parseInt(process.env.MAX_PARALLEL_WORKERS) || 3;
-
-function getAvailableWorkerCount() {
-  const active = getActiveWorkerCount();
-  return Math.max(0, MAX_PARALLEL_WORKERS - active);
-}
+// lib/worker/dispatcher.js
+const SOURCE_WEIGHTS = {
+  user_request: 90,        // Highest: user is waiting
+  retry_failed: 80,        // High: already failed once, don't let it rot
+  github_issue_ready: 70,  // Medium-high: triaged and tagged for work
+  coding_todo: 50,         // Medium: scheduled but not urgent
+  github_issue: 40,        // Medium-low: speculative, might not be solvable
+  health_check: 30,        // Low: maintenance, not user-facing
+};
 ```
 
-### Dispatch Loop
+### Item-Level Score Adjustments
 
-The dispatcher collects pending work via `identifyWork()`, then dispatches tasks to available workers until capacity is exhausted:
+Within each source, items get additional scoring from source-specific functions. These functions encode domain knowledge about what makes an item more or less urgent:
+
+```javascript
+const sources = [
+  {
+    fn: getPendingUserTasks,
+    source: 'user_request',
+    scoreBase: SOURCE_WEIGHTS.user_request,
+    scoreFn: (t) => t.priority || 0,
+    // User-set priority adds directly: a priority-5 request scores 95
+  },
+  {
+    fn: getRetryableTasks,
+    source: 'retry_failed',
+    scoreBase: SOURCE_WEIGHTS.retry_failed,
+    scoreFn: (t) => -(t.attempt_count || 0) * 10,
+    // Penalize repeated failures: attempt 2 scores 60, attempt 3 scores 50
+  },
+  {
+    fn: getSolvableIssues,
+    source: 'github_issue',
+    scoreBase: SOURCE_WEIGHTS.github_issue,
+    scoreFn: (i) => i.solvabilityScore * 2,
+    // Solvability from label/title heuristics: score 5 → +10, total 50
+  },
+  {
+    fn: getCodingTodos,
+    source: 'coding_todo',
+    scoreBase: SOURCE_WEIGHTS.coding_todo,
+    scoreFn: (t) => (t.priority === 'urgent' ? 20 : t.priority === 'high' ? 10 : 0),
+    // Named priorities: urgent todo scores 70, high scores 60, normal scores 50
+  },
+];
+```
+
+Final score: `sourceBase + scoreFn(item)`. Items are sorted descending by score.
+
+### Solvability Scoring for GitHub Issues
+
+GitHub issues are scored for solvability using a heuristic that considers labels, title keywords, and age:
+
+```javascript
+// lib/worker/work-sources.js
+function scoreSolvability(issue) {
+  let score = 0;
+
+  // Label signals
+  if (issue.labels.includes('bug')) score += 2;
+  if (issue.labels.includes('good-first-issue')) score += 3;
+  if (issue.labels.includes('help-wanted')) score += 2;
+  if (issue.labels.includes('documentation')) score += 2;
+
+  // Title keyword signals
+  if (title.includes('fix')) score += 1;
+  if (title.includes('typo')) score += 2;
+  if (title.includes('refactor')) score -= 2;
+  if (title.includes('redesign')) score -= 3;
+  if (title.includes('breaking')) score -= 3;
+
+  // Age penalty
+  if (ageInDays > 30) score -= 1;
+  if (ageInDays > 90) score -= 2;
+
+  return score;
+}
+
+// Only issues scoring >= 3 are considered dispatchable
+```
+
+### Budget-Gated Dispatch
+
+Each work item carries an estimated cost. Before dispatching, the system checks API budget. If budget is exhausted, dispatch stops entirely for that cycle:
 
 ```javascript
 async function dispatch() {
-  const candidates = await identifyWork();  // Collect pending tasks
-  const available = getAvailableWorkerCount();
+  const autonomyCheck = await canJobRun('worker-dispatch');
+  if (!autonomyCheck.allowed) return { dispatched: false, reason: autonomyCheck.reason };
 
-  let dispatched = 0;
+  const work = await identifyWork();
+  const running = await workerTasks.getRunning();
+  const slotsAvailable = Math.max(0, MAX_PARALLEL_WORKERS - running.length);
 
-  for (const item of candidates) {
-    if (dispatched >= available) break;
+  for (const workItem of work.slice(0, slotsAvailable)) {
+    const budgetCheck = ccUsage.shouldExecuteTask(2, workItem.estimatedCost);
+    if (!budgetCheck.allowed) {
+      audit.log('dispatcher:budget_blocked', {
+        source: workItem.source,
+        estimatedCost: workItem.estimatedCost,
+        reason: budgetCheck.reason,
+      });
+      break;  // Budget exhausted — stop dispatching entirely
+    }
 
-    await dispatchToWorker(item);
-    dispatched++;
+    const handler = dispatchers[workItem.source];
+    const result = await handler(workItem.item);
 
-    recordDispatchCost(item);
+    if (result.success) {
+      audit.log('dispatcher:dispatched', {
+        source: workItem.source,
+        taskId: result.taskId,
+      });
+      ccUsage.logTaskExecution('worker_dispatch', workItem.estimatedCost, 2);
+    }
   }
 }
 ```
 
-The key constraint is worker availability — when all worker slots are occupied, remaining tasks wait for the next dispatch cycle regardless of urgency.
+The `break` on budget exhaustion is deliberate: if the budget can't afford item N, it certainly can't afford item N+1 (items are sorted by priority, not by cost). This prevents the system from skipping an expensive high-priority item to dispatch a cheap low-priority one.
 
-### Budget Tracking
+### Repo-Lock Filtering
 
-Each dispatch records estimated cost to monitor spending:
+Before scoring, the dispatcher filters out items targeting repositories that already have active workers:
 
 ```javascript
-function recordDispatchCost(item) {
-  const modelCost = MODEL_COSTS[item.model || 'sonnet'];
-  budget.record({
-    source: item.source,
-    model: item.model,
-    estimatedCost: modelCost,
-    timestamp: Date.now(),
-  });
+async function identifyWork() {
+  const running = await workerTasks.getRunning();
 
-  // Alert if daily budget threshold exceeded
-  if (budget.dailyTotal() > DAILY_BUDGET_LIMIT) {
-    logger.warn({ total: budget.dailyTotal() }, 'Daily budget threshold exceeded');
+  // Build set of repos currently being worked on
+  const runningRepos = new Set();
+  for (const task of running) {
+    const repo = extractRepo(task.params);
+    if (repo) runningRepos.add(repo);
   }
+
+  // Collect work from all sources...
+  const work = [...];
+
+  // Filter out repo-locked items
+  return work.filter(item => {
+    const repo = extractRepo(item);
+    if (repo && runningRepos.has(repo)) {
+      audit.log('dispatcher:skip_item', { reason: 'repo_in_use', repo, source: item.source });
+      return false;
+    }
+    return true;
+  }).sort((a, b) => b.score - a.score);
 }
 ```
 
-### Audit Logging
+### Estimated Cost by Source
 
-Every dispatch decision is logged for post-mortem analysis:
+Each source carries a default estimated cost (in API credits):
+
+| Source | Estimated Cost | Rationale |
+|--------|---------------|-----------|
+| user_request | 20 | Focused task, usually bounded |
+| retry_failed | 20 | Same scope as original task |
+| github_issue_ready | 25 | May need code analysis + fix |
+| github_issue | 25 | Requires solvability assessment + fix |
+| coding_todo | 20 | Bounded by todo description |
+| health_check (CI failure) | 20 | Diagnosis + fix |
+| health_check (other) | 15 | Usually lighter maintenance |
+
+### Source-Specific Dispatch Runners
+
+Each source has its own dispatch runner that handles the specifics of creating and executing the task:
 
 ```javascript
-audit.log('dispatcher:dispatch', {
-  itemId: item.id,
-  source: item.source,
-  resource: item.resource,
-  model: item.model,
-  queueDepth: pending.length,
-});
+const dispatchers = {
+  user_request: dispatchUserRequest,
+  github_issue_ready: dispatchWorkerReadyIssue,
+  github_issue: dispatchGitHubIssue,
+  retry_failed: dispatchRetry,
+  health_check: dispatchHealthFix,
+  coding_todo: dispatchCodingTodo,
+};
 ```
 
-### Periodic Dispatch Cycle
+### Status Endpoint
 
-The dispatcher runs on a tick interval, checking for pending work and available workers each cycle:
+The dispatcher exposes a status summary that shows running tasks, available work (with scores), and budget state:
 
 ```javascript
-async function dispatchCycle() {
-  const candidates = await identifyWork();
-  const available = getAvailableWorkerCount();
+async function getStatus() {
+  const [running, pending, work] = await Promise.all([
+    workerTasks.getRunning(),
+    workerTasks.getPending(),
+    identifyWork(),
+  ]);
+  const budget = ccUsage.getBudgetStatus();
 
-  for (const item of candidates.slice(0, available)) {
-    audit.log('dispatcher:dispatch', {
-      source: item.source,
-      resource: item.resource,
-    });
-
-    dispatchToWorker(item).finally(() => {
-      // Worker slot freed when task completes
-    });
-
-    recordDispatchCost(item);
-  }
+  return {
+    isActive: running.length > 0,
+    runningTasks: running.length,
+    pendingTasks: pending.length,
+    availableWork: work.length,
+    topWork: work.slice(0, 5).map(w => ({
+      source: w.source, score: w.score,
+      title: w.item.title || w.item.description,
+      estimatedCost: w.estimatedCost,
+    })),
+    budget: { remaining: budget.remaining, status: budget.status },
+  };
 }
-
-// Run on interval
-setInterval(dispatchCycle, DISPATCH_TICK_MS);
 ```
 
 ## Implications
 
-- Worker availability is the primary dispatch constraint — tasks are dispatched when workers are free, not based on task priority weights
-- The tick interval creates a maximum latency of one tick between an event arriving and dispatch. Sub-second dispatch requires a tighter interval at the cost of more CPU
-- Budget tracking is advisory (warns but doesn't stop) — hard budget enforcement would require a policy decision about which events to drop
-- Worker count caps prevent overload but can create backlogs during high-demand periods
-- Audit logging enables replay and diagnosis but generates volume — needs rotation or aggregation
-- Adding worker capacity is a configuration change (increase `MAX_PARALLEL_WORKERS`), not a code change
+- Source weights make inter-source priority explicit and tunable: changing `github_issue` from 40 to 60 would prioritize it over coding todos without touching any other code
+- The `break` on budget exhaustion means a single expensive high-priority item can block all subsequent dispatches in a cycle, even if budget exists for cheaper items. This is a correctness trade-off: it prevents priority inversion at the cost of potential under-utilization
+- Solvability scoring is heuristic: it rewards conventional labels (`good-first-issue`, `bug`) and penalizes ambiguous work (`refactor`, `redesign`). Issues with non-standard labeling will be misjudged
+- Repo locking prevents git conflicts but can create priority inversion: a low-priority health check on repo X blocks a high-priority user request for the same repo
+- Retryable tasks are penalized per attempt, creating a natural decay: a task that fails 3 times scores 50 (vs 80 for a fresh retry), making it less likely to consume a worker slot over newer work
+- The estimated cost per source is static, not computed from the actual task content. A simple typo fix and a complex refactor both cost 25 credits if they're both GitHub issues
+- `MAX_PARALLEL_WORKERS` (default 3) is the hard concurrency cap. Increasing it requires more Claude API budget but reduces queue wait times
+- Every dispatch decision and skip is audit-logged, enabling post-mortem analysis of why specific items waited or were blocked
 
 ## Code Example
 
 ```javascript
-// Complete dispatch cycle driven by worker availability
-async function dispatchCycle() {
-  const candidates = await identifyWork();
-  const available = getAvailableWorkerCount();
+// Dispatch cycle with 3 max workers, 1 currently running
 
-  if (available === 0) {
-    audit.log('dispatcher:skip_cycle', { reason: 'no_available_workers' });
-    return;
-  }
+// identifyWork() returns (sorted by score):
+// 1. user_request  (priority 3) → 90 + 3  = 93
+// 2. retry_failed  (attempt 1)  → 80 - 10 = 70
+// 3. coding_todo   (urgent)     → 50 + 20 = 70  (tie: arrival order)
+// 4. github_issue  (solvab. 5)  → 40 + 10 = 50
+// 5. health_check  (ci_failure) → 30 + 5  = 35
 
-  let dispatched = 0;
-  for (const item of candidates) {
-    if (dispatched >= available) break;
+// 2 slots available (3 max - 1 running)
 
-    audit.log('dispatcher:dispatch', {
-      source: item.source,
-      resource: item.resource,
-      workersAvailable: available - dispatched,
-    });
+// Item 1 (user_request, score 93):
+//   Budget check: 20 credits → allowed
+//   Dispatch via dispatchUserRequest() → success
+//   audit.log('dispatcher:dispatched', { source: 'user_request', ... })
 
-    dispatchToWorker(item).finally(() => {
-      // Slot freed — next cycle can dispatch more
-    });
+// Item 2 (retry_failed, score 70):
+//   Budget check: 20 credits → allowed
+//   Dispatch via dispatchRetry() → success
 
-    recordDispatchCost(item);
-    dispatched++;
-  }
-}
+// Items 3-5: no slots left → wait for next cycle
 
-// Run on interval
-setInterval(dispatchCycle, DISPATCH_TICK_MS);
+// Status after dispatch:
+// {
+//   runningTasks: 3,
+//   availableWork: 3,
+//   topWork: [
+//     { source: 'coding_todo', score: 70 },
+//     { source: 'github_issue', score: 50 },
+//     { source: 'health_check', score: 35 },
+//   ],
+//   budget: { remaining: 60, status: 'ok' }
+// }
 ```
 
 ## Related Patterns
 
-- [Orchestrator-Satellite Communication](./orchestrator-satellite-communication.md)
+- [Orchestrator-Worker Communication](./orchestrator-satellite-communication.md)
 - [Distributed Job Locking](./distributed-job-locking.md)
 - [Intent-Driven Self-Scheduling](./intent-driven-self-scheduling.md)

@@ -1,6 +1,6 @@
 # Plugin System and Hot-Reload
 
-> Manifest-driven plugin architecture where each plugin declares its name, capabilities, dependencies, and lifecycle hooks in a `plugin.json` file, which the loader reads to determine what to load and register.
+> Manifest-driven plugin architecture with `plugin.json` discovery from both local directories and npm packages, permission-gated context injection, semver compatibility checking, and `fs.watch`-based hot-reload.
 
 ## Problem
 
@@ -9,316 +9,275 @@ An AI orchestrator needs to grow its capabilities without modifying core code. H
 ## Context
 
 - An orchestrator that needs to support many independent capability modules
-- Each plugin may contribute tools, event handlers, routes, and lifecycle hooks
-- Plugins may depend on shared services (database, event bus, model dispatch)
-- New capabilities are added by dropping a plugin directory into the plugins directory — no restart required
-- The loader must know what a plugin provides before executing any of its code
+- Each plugin may contribute tools, event handlers, routes, scheduled jobs, and skill directories
+- Plugins may depend on shared services (database, messenger, event bus) but access should be permission-gated
+- New capabilities are added by dropping a plugin directory into `/plugins` or installing an npm package prefixed with `riley-plugin-` — no restart required
+- The loader must validate the manifest schema before executing any plugin code
 
 ## Solution
 
 ### Plugin Structure
 
-Each plugin is a directory containing a `plugin.json` manifest and a corresponding entry point. The manifest is the authoritative declaration of the plugin's identity, capabilities, and dependencies. The loader reads `plugin.json` first to decide whether and how to load the plugin:
+Each plugin is a directory containing a `plugin.json` manifest and a corresponding entry point. The manifest uses `main` (not `entry`) to specify the implementation file, defaulting to `index.js`:
 
 ```json
-// lib/plugins/github-integration/plugin.json (illustrative)
 {
   "name": "github-integration",
   "version": "1.0.0",
-  "entry": "index.js",
-  "capabilities": {
+  "main": "index.js",
+  "description": "GitHub webhooks and PR tools",
+  "provides": {
     "tools": ["github_pr", "github_issue"],
     "events": ["webhook.github.*"],
-    "routes": ["/github/webhook"]
+    "routes": [{ "method": "POST", "path": "/github/webhook" }],
+    "skills": ["./skills"]
   },
-  "dependencies": ["event-bus", "tool-registry"],
-  "hooks": {
-    "init": true,
-    "destroy": true
-  }
+  "permissions": {
+    "messenger": true,
+    "db": true,
+    "config": ["GITHUB_TOKEN"],
+    "events": ["webhook.github.*"]
+  },
+  "dependencies": ["core-tools@1.0.0"],
+  "riley": { "minVersion": "1.0.0" }
 }
 ```
 
-The entry point implements the lifecycle hooks declared in the manifest:
+The entry point implements lifecycle hooks. The `init` function receives a permission-gated context object:
 
 ```javascript
-// lib/plugins/github-integration/index.js (illustrative)
+// plugins/github-integration/index.js
 module.exports = {
-  async init(context) {
-    // context provides access to shared services: db, eventBus, toolRegistry, router
-    this.eventBus = context.eventBus;
-    context.eventBus.on('webhook.github.*', this.handleWebhook);
+  async init(ctx) {
+    // ctx provides permission-gated access to services
+    ctx.registerTool(
+      { name: 'github_pr', description: 'Create a pull request', parameters: { /* ... */ } },
+      async (args) => { /* ... */ }
+    );
+    ctx.registerEventHandler('webhook.github.push', handlePush);
+    ctx.registerSkillsDir('./skills');
   },
 
   async destroy() {
-    this.eventBus.off('webhook.github.*', this.handleWebhook);
-  },
-
-  tools: [
-    {
-      name: 'github_pr',
-      description: 'Create or update a pull request',
-      parameters: { repo: 'string', title: 'string', body: 'string' },
-      handler: async (params) => { /* ... */ },
-    },
-    {
-      name: 'github_issue',
-      description: 'Create or comment on an issue',
-      parameters: { repo: 'string', title: 'string' },
-      handler: async (params) => { /* ... */ },
-    },
-  ],
-
-  routes: (router) => {
-    router.post('/github/webhook', webhookHandler);
+    // Cleanup — called before unload or hot-reload
   },
 };
 ```
 
-### Manifest-Based Discovery
+### Multi-Source Discovery
 
-The loader scans the plugins directory for subdirectories containing a `plugin.json` file. Only directories with a valid manifest are treated as plugins — file conventions alone are not sufficient. The manifest is parsed and validated before any plugin code is executed:
+The loader discovers plugins from two sources: the local `/plugins` directory and npm packages prefixed with `riley-plugin-` (including scoped packages like `@org/riley-plugin-*`):
 
 ```javascript
-// lib/plugins/loader.js (illustrative)
-async function loadAll(pluginsDir, context) {
-  const entries = await fs.readdir(pluginsDir, { withFileTypes: true });
+// lib/plugins/loader.js
+const NPM_PLUGIN_PREFIX = 'riley-plugin-';
 
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
+function loadAll() {
+  const pluginsResult = loadFromPluginsDir();   // /plugins/*
+  const npmResult = loadFromNodeModules();       // node_modules/riley-plugin-*
 
-    const manifestPath = path.join(pluginsDir, entry.name, 'plugin.json');
-
-    let manifest;
-    try {
-      manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
-    } catch {
-      // No plugin.json or invalid JSON — not a plugin directory, skip silently
-      continue;
-    }
-
-    // Validate required manifest fields before loading any code
-    if (!manifest.name || !manifest.entry) {
-      loaded.set(entry.name, { manifestPath, state: 'ERROR', error: 'Invalid manifest' });
-      continue;
-    }
-
-    const entryPath = path.join(pluginsDir, entry.name, manifest.entry);
-
-    try {
-      const plugin = require(entryPath);
-      await registerPlugin(manifest, plugin, context);
-      loaded.set(manifest.name, { manifest, plugin, entryPath, state: 'ACTIVE' });
-    } catch (err) {
-      loaded.set(manifest.name, { manifest, entryPath, state: 'ERROR', error: err.message });
-    }
-  }
-}
-
-async function registerPlugin(manifest, plugin, context) {
-  // Register tool contributions declared in the manifest
-  if (manifest.capabilities?.tools && plugin.tools) {
-    for (const tool of plugin.tools) {
-      context.toolRegistry.register(tool.name, tool.handler, tool);
-    }
-  }
-
-  // Register event patterns declared in the manifest
-  if (manifest.capabilities?.events && plugin.events) {
-    for (const pattern of plugin.events) {
-      context.eventBus.register(pattern, plugin);
-    }
-  }
-
-  // Mount routes declared in the manifest
-  if (manifest.capabilities?.routes && plugin.routes) {
-    plugin.routes(context.router);
-  }
-
-  // Call init lifecycle hook if declared
-  if (manifest.hooks?.init && plugin.init) {
-    await plugin.init(context);
-  }
+  return {
+    loaded: [...pluginsResult.loaded, ...npmResult.loaded],
+    failed: [...pluginsResult.failed, ...npmResult.failed],
+  };
 }
 ```
 
-### Dependency Resolution
-
-Because manifests declare dependencies explicitly, the loader can resolve load order before executing any plugin code. Plugins whose dependencies are not yet active are deferred until their dependencies initialize:
+Each source is scanned for directories containing a `plugin.json`. The manifest `main` field (defaulting to `index.js`) determines which file to `require`:
 
 ```javascript
-// lib/plugins/loader.js (illustrative)
-function resolveDependencyOrder(manifests) {
-  // Topological sort based on manifest.dependencies arrays
-  // Returns an ordered list of plugin names safe to initialize sequentially
+function loadFromPath(pluginPath) {
+  const manifestPath = path.join(pluginPath, 'plugin.json');
+  if (!fs.existsSync(manifestPath)) {
+    return { success: false, error: 'No plugin.json found' };
+  }
+
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+  const mainFile = manifest.main || 'index.js';
+  const mainPath = path.join(pluginPath, mainFile);
+
+  delete require.cache[require.resolve(mainPath)];
+  const implementation = require(mainPath);
+
+  return registry.register(manifest, implementation, { pluginDir: pluginPath });
 }
 ```
+
+### Manifest Schema Validation
+
+Before any plugin code executes, the manifest is validated against a v1.0 schema that checks `provides` and `permissions` sections. Tool names must be lowercase alphanumeric with underscores. Route definitions require valid HTTP methods. Invalid manifests are rejected before loading:
+
+```javascript
+// lib/plugins/manifest-schema.js
+function validateManifestV1(manifest) {
+  const errors = [];
+  if (!manifest.name) errors.push('name is required');
+  if (!manifest.version) errors.push('version is required');
+
+  // Validate provides.tools, provides.routes, provides.events, provides.jobs
+  const providesResult = validateProvides(manifest.provides);
+  errors.push(...providesResult.errors);
+
+  // Validate permissions: messenger (boolean), db (boolean), config (array), events (array)
+  const permissionsResult = validatePermissions(manifest.permissions);
+  errors.push(...permissionsResult.errors);
+
+  return { valid: errors.length === 0, errors };
+}
+```
+
+### Semver Compatibility Checking
+
+Plugins can declare a minimum Riley version and versioned dependencies on other plugins. The registry checks semver compatibility before allowing registration:
+
+```javascript
+// lib/plugins/registry.js
+function checkDependencies(manifest) {
+  const missing = [];
+  for (const dep of manifest.dependencies || []) {
+    const [name, versionReq] = dep.split('@');
+    const plugin = plugins.get(name);
+    if (!plugin) { missing.push(dep); continue; }
+    if (versionReq && !semver.satisfies(plugin.manifest.version, versionReq)) {
+      missing.push(`${name}@${versionReq} (have ${plugin.manifest.version})`);
+    }
+  }
+  return { satisfied: missing.length === 0, missing };
+}
+```
+
+If a manifest declares `riley.minVersion`, the registry validates against the current Riley version before proceeding.
+
+### Permission-Gated Context
+
+Each plugin receives a context object scoped by its declared `permissions`. Services not declared in the manifest are not exposed:
+
+```javascript
+// lib/plugins/context.js
+function buildContext({ manifest, pluginDir, registrations, routeManager }) {
+  const permissions = manifest.permissions || {};
+  const ctx = {
+    manifest,
+    pluginDir,
+    registerTool(declaration, execute) { /* always available */ },
+    registerEventHandler(event, handler) {
+      // Gated: only events matching permissions.events patterns
+      if (permissions.events && !matchesEventPattern(event, permissions.events)) return;
+      /* ... */
+    },
+    registerJob(schedule, handler, options) { /* always available */ },
+    registerSkillsDir(relPath) { /* registers with lib/skills */ },
+    logger: buildLogger(manifest.name),
+  };
+
+  // Gated: only exposed if manifest declares permission
+  if (permissions.messenger) ctx.messenger = require('../messenger');
+  if (permissions.db) ctx.db = require('../db');
+  if (permissions.config) ctx.config = buildConfigProxy(permissions.config);
+
+  return ctx;
+}
+```
+
+The config proxy only exposes env vars explicitly listed in `permissions.config`.
 
 ### Plugin State Machine
 
-Plugins transition through defined states during their lifecycle:
+Plugins transition through defined lifecycle states:
 
 ```
 REGISTERED → INITIALIZING → ACTIVE → ERROR → DESTROYED
 ```
 
-A plugin enters `REGISTERED` when the loader validates its manifest, moves to `INITIALIZING` when `init()` is called, and reaches `ACTIVE` on success. If `init()` throws, the plugin transitions to `ERROR`. On unload or reload, `destroy()` is called and the plugin moves to `DESTROYED`.
+### Dependency-Ordered Initialization
 
-### Hot-Reload via File Watching
-
-The loader uses Node's built-in `fs.watch` to monitor the plugins directory. When a file is added or modified within a plugin directory, the loader re-reads the `plugin.json` manifest first, then clears `require.cache`, calls the plugin's `destroy()` hook, and re-registers the plugin using the updated manifest and code:
+Plugins are initialized in topological order based on their declared dependencies. A plugin whose dependency is not yet `ACTIVE` will fail initialization:
 
 ```javascript
-// lib/plugins/loader.js (illustrative)
-function startWatching(pluginsDir, context) {
-  const watcher = fs.watch(pluginsDir, { recursive: true }, async (eventType, filename) => {
-    // Debounce rapid changes (500ms window)
-    clearTimeout(debounceTimers.get(filename));
-    debounceTimers.set(filename, setTimeout(async () => {
-      const pluginName = filename.split(path.sep)[0];
-      const existing = loaded.get(pluginName);
-
-      if (existing?.plugin?.destroy && existing.manifest?.hooks?.destroy) {
-        await existing.plugin.destroy();
-      }
-
-      const manifestPath = path.join(pluginsDir, pluginName, 'plugin.json');
-      let manifest;
-      try {
-        manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
-      } catch {
-        loaded.set(pluginName, { state: 'ERROR', error: 'Manifest unreadable after reload' });
-        return;
-      }
-
-      const entryPath = path.join(pluginsDir, pluginName, manifest.entry);
-      delete require.cache[require.resolve(entryPath)];
-
-      try {
-        const plugin = require(entryPath);
-        await registerPlugin(manifest, plugin, context);
-        loaded.set(manifest.name, { manifest, plugin, entryPath, state: 'ACTIVE' });
-      } catch (err) {
-        loaded.set(pluginName, { manifestPath, entryPath, state: 'ERROR', error: err.message });
-      }
-    }, 500));
-  });
+function getInitOrder() {
+  const visited = new Set();
+  const result = [];
+  function visit(name) {
+    if (visited.has(name)) return;
+    visited.add(name);
+    const plugin = plugins.get(name);
+    for (const dep of plugin?.manifest.dependencies || []) {
+      visit(dep.split('@')[0]);
+    }
+    result.push(name);
+  }
+  for (const name of pluginOrder) visit(name);
+  return result;
 }
 ```
 
-The 500ms debounce window prevents cascading reloads when editors write multiple files in rapid succession. The reload cycle transitions the plugin through `ACTIVE` -> `DESTROYED` -> `REGISTERED` -> `INITIALIZING` -> `ACTIVE`, calling `destroy()` and `init()` at the appropriate points.
+### Hot-Reload via File Watching
 
-### Context Builder
-
-When the LLM needs its tool declarations, the context builder aggregates across all loaded plugins. Because the manifest declares capabilities statically, the loader can also report what a plugin contributes even before its code has fully initialized:
+The loader uses `fs.watch` with a 500ms debounce to monitor the plugins directory. On change, it reads the `plugin.json`, unregisters the old version (calling `destroy`), clears `require.cache`, and re-loads:
 
 ```javascript
-// lib/plugins/loader.js (illustrative)
-function buildToolContext() {
-  const declarations = [];
-  for (const [name, entry] of loaded) {
-    if (entry.state !== 'ACTIVE' || !entry.plugin.tools) continue;
-    for (const tool of entry.plugin.tools) {
-      declarations.push({
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.parameters,
-        source: name,
-      });
+function startWatching() {
+  fs.watch(PLUGINS_DIR, { recursive: true }, async (eventType, filename) => {
+    // 500ms debounce to prevent cascading reloads
+    const pluginDir = filename.split(path.sep)[0];
+    const manifest = JSON.parse(fs.readFileSync(
+      path.join(PLUGINS_DIR, pluginDir, 'plugin.json'), 'utf-8'
+    ));
+
+    const existing = registry.get(manifest.name);
+    if (existing) {
+      await reload(manifest.name);  // ACTIVE → DESTROYED → REGISTERED → ACTIVE
+    } else {
+      loadFromPath(path.join(PLUGINS_DIR, pluginDir));
+      await registry.init(manifest.name);
     }
-  }
-  return declarations;
+  });
 }
 ```
 
 ## Implications
 
-- The `plugin.json` manifest is the single source of truth for what a plugin provides — mismatches between the manifest and the entry point code are a class of bugs to guard against
-- Manifest validation happens before code execution, so malformed or incomplete plugins fail early without side effects
-- Dependency ordering is possible because dependencies are declared statically in manifests, not inferred from code exports at runtime
+- The `plugin.json` manifest is the single source of truth for what a plugin provides — `main` (not `entry`) specifies the implementation file
+- Manifest schema validation (`validateManifestV1`) catches malformed plugins before any code executes, preventing side effects from broken manifests
+- Semver compatibility checking ensures plugins and their dependencies are version-compatible before initialization
+- Permission gating creates a least-privilege model — plugins only access services they explicitly declare, reducing blast radius
+- npm package discovery (`riley-plugin-*`) enables standard package distribution alongside local plugin development
 - Hot-reload means a malformed plugin can take down registered tools mid-session — error handling during reload is critical
-- The `destroy()` hook is the only cleanup mechanism — plugins that leak resources (open handles, intervals) outside of what `destroy()` cleans up will cause problems on reload
-- Adding a plugin is a matter of dropping a directory with a valid `plugin.json` — no changes to core code required, but the manifest schema must be understood by the plugin author
+- The `destroy()` hook is the only cleanup mechanism — plugins that leak resources outside of what `destroy()` cleans up will cause problems on reload
+- Topological ordering ensures dependencies initialize first, but circular dependencies will deadlock the init sequence
 
 ## Code Example
 
 ```javascript
-// Full plugin lifecycle with manifest-based loading and hot-reload
+// Initialize the plugin system with Express app and hot-reload
+const plugins = require('./lib/plugins');
 
-// --- Loader initialization ---
-const loader = {
-  async init(pluginsDir, context) {
-    await loadAll(pluginsDir, context);
-    startWatching(pluginsDir, context);
-    log.info(`Loaded ${loaded.size} plugins, ${context.toolRegistry.size} tools registered`);
-  },
+async function start(app) {
+  const { loaded, failed } = await plugins.init({
+    app,           // Express app for route mounting
+    hotReload: true,
+  });
 
-  async reloadPlugin(name, context) {
-    // ACTIVE → DESTROYED → REGISTERED → INITIALIZING → ACTIVE
-    const entry = loaded.get(name);
-    if (entry?.plugin?.destroy && entry.manifest?.hooks?.destroy) {
-      await entry.plugin.destroy();
-    }
+  console.log(`Loaded ${loaded.length} plugins, ${failed.length} failed`);
 
-    // Re-read manifest in case it changed
-    const manifest = JSON.parse(await fs.readFile(
-      path.join(pluginsDir, name, 'plugin.json'), 'utf8'
-    ));
-    const entryPath = path.join(pluginsDir, name, manifest.entry);
-    delete require.cache[require.resolve(entryPath)];
+  // Plugin tools are available via plugins.executeTool()
+  const result = await plugins.executeTool('github_pr', { repo: 'acme/app', title: 'Fix bug' });
 
-    const plugin = require(entryPath);
-    await registerPlugin(manifest, plugin, context);
-    loaded.set(name, { manifest, plugin, entryPath, state: 'ACTIVE' });
-  },
+  // Emit events to plugin handlers
+  await plugins.emitEvent('webhook.github.push', { repo: 'acme/app' });
 
-  getTools() {
-    return buildToolContext();
-  },
+  // List all plugins with state
+  const list = plugins.listPlugins({ active: true });
+  // [{ name: 'github-integration', version: '1.0.0', state: 'active', tools: 2 }]
+}
 
-  getPlugins() {
-    return Array.from(loaded.entries()).map(([name, { manifest, state }]) => ({
-      name,
-      version: manifest?.version,
-      capabilities: manifest?.capabilities,
-      state,
-    }));
-  },
-};
-
-// --- Example plugin manifest ---
-// lib/plugins/health-check/plugin.json
-// {
-//   "name": "health-check",
-//   "version": "1.0.0",
-//   "entry": "index.js",
-//   "capabilities": { "tools": ["system_health"] },
-//   "dependencies": ["db"],
-//   "hooks": { "init": true, "destroy": false }
-// }
-
-// --- Example plugin entry point ---
-// lib/plugins/health-check/index.js
-module.exports = {
-  async init(context) {
-    this.db = context.db;
-  },
-  tools: [
-    {
-      name: 'system_health',
-      description: 'Check system health across all registered services',
-      parameters: {},
-      handler: async () => {
-        // ... check DB, event bus, worker pool
-        return { status: 'healthy', uptime: process.uptime() };
-      },
-    },
-  ],
-};
+// Graceful shutdown destroys plugins in reverse dependency order
+process.on('SIGTERM', () => plugins.shutdown());
 ```
 
 ## Related Patterns
 
 - [Declarative Capability System](./declarative-capability-system.md)
 - [Capability Manifest Registration](./capability-manifest-registration.md)
+- [Skill Extraction and Fast-Path Routing](./skill-extraction-and-fast-path-routing.md)
 - [Unified Event System](./unified-event-system.md)

@@ -1,288 +1,162 @@
 # Implicit Approval Parsing
 
-> Natural language parsing of simple approval and denial responses so users can approve or reject pending agent actions without structured commands. Batch and qualified approval parsing are designed but not yet implemented.
+> Natural language parsing of simple approval and denial responses using exact `Set.has()` matching against normalized input, with context gating that only activates on a single pending action match.
 
 ## Problem
 
-Autonomous agents frequently need human approval before executing consequential actions — deploying to production, sending an email, merging a PR. The typical implementation requires structured commands: `/approve 123`, `!confirm deploy`, or clicking a button in a UI. But humans don't think in commands. They say "yeah go ahead", "ship it", "no wait, hold off on that", or "approve the first two but not the third." Forcing users into rigid command syntax creates friction and breaks conversational flow. The agent should understand natural approval language the same way a human colleague would.
+Autonomous agents frequently need human approval before executing consequential actions — deploying to production, sending an email, merging a PR. The typical implementation requires structured commands: `/approve 123`, `!confirm deploy`. But humans don't think in commands. They say "yeah go ahead", "do it", "no wait, hold off on that." Forcing users into rigid command syntax creates friction and breaks conversational flow. The agent should understand natural approval language the same way a human colleague would.
 
 ## Context
 
-- An orchestrator with a pending action queue — actions awaiting human approval before execution
-- Users communicating through conversational channels (chat, Slack, Telegram)
-- Approval responses ranging from simple ("yes") to qualified ("yes but change the timeout first")
-- Multiple pending actions that may need individual or batch approval
-- The need to avoid false positives — accidentally executing an action because the user said "yes" to something unrelated
+- An orchestrator with a pending action queue — tool calls awaiting human approval before execution
+- Users communicating through conversational channels (chat, Telegram, web UI)
+- Two parsing paths: explicit approval (`approve #123`) and implicit natural language (`yes`, `go ahead`)
+- The implicit parser must avoid false positives — accidentally executing an action because the user said "yes" to something unrelated
+- Implicit approval only applies when there is exactly one pending action for the session
 
 ## Solution
 
-### Approval Intent Detection
+### Explicit Approval Parsing
 
-The parser classifies incoming messages into four categories: approve, deny, ambiguous, and not-applicable. It uses keyword matching with guard rails, not an LLM call:
+The explicit parser handles structured `approve #ID` patterns using regex:
 
 ```javascript
-// approval-flow.js
-const APPROVAL_SIGNALS = [
-  'yes', 'yep', 'yeah', 'yup', 'y',
-  'go ahead', 'do it', 'go for it', 'ship it',
-  'approve', 'approved', 'confirm', 'confirmed',
-  'looks good', 'lgtm', 'sounds good',
-  'proceed', 'execute', 'run it', 'send it',
-  'fine', 'ok', 'okay', 'sure', 'absolutely',
-];
-
-const DENIAL_SIGNALS = [
-  'no', 'nope', 'nah', 'n',
-  'don\'t', 'do not', 'cancel', 'stop',
-  'reject', 'rejected', 'deny', 'denied',
-  'hold off', 'hold on', 'wait', 'not yet',
-  'skip', 'abort', 'never mind', 'nevermind',
-];
-
-const AMBIGUOUS_SIGNALS = [
-  'maybe', 'perhaps', 'i think so', 'i guess',
-  'probably', 'not sure', 'hmm', 'let me think',
-];
+// lib/message-processor/approval.js
+function parseApprovalCommand(text) {
+  const approvePattern = /\bapprove\s*#?(\d+)\b/i;
+  const match = text.match(approvePattern);
+  if (match) {
+    return { matched: true, actionId: parseInt(match[1], 10) };
+  }
+  return { matched: false };
+}
 ```
+
+### Implicit Approval via Set.has()
+
+The implicit parser uses exact `Set.has()` matching against normalized input — not regex, not substring matching. The input is trimmed, lowercased, and stripped of trailing punctuation before checking:
+
+```javascript
+function parseImplicitApprovalDecision(text) {
+  if (!text) return { matched: false };
+  const normalized = String(text)
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?]+$/g, '')
+    .replace(/\s+/g, ' ');
+
+  const approve = new Set([
+    'yes', 'yep', 'yeah', 'sure', 'ok', 'okay',
+    'do it', 'go ahead', 'approve', 'approve it',
+    'yes please', 'okay please', 'ok please',
+    'go ahead please', 'do it please', 'sounds good',
+  ]);
+
+  const reject = new Set([
+    'no', 'nope', 'nah', 'dont', "don't", 'do not',
+    'stop', 'cancel', 'reject', 'reject it',
+    'no thanks', 'no thank you',
+  ]);
+
+  if (approve.has(normalized)) return { matched: true, decision: 'approve' };
+  if (reject.has(normalized)) return { matched: true, decision: 'reject' };
+  return { matched: false };
+}
+```
+
+Key design decisions:
+- **Exact match, not substring** — "yes" matches but "yesterday" does not, because the entire normalized string must equal a set entry
+- **Normalization strips punctuation** — "Yes!" becomes "yes", "Go ahead." becomes "go ahead"
+- **Whitespace collapsed** — "go  ahead" becomes "go ahead" and matches
+- **No ambiguous category** — messages either match exactly or fall through to the LLM
 
 ### Context-Gated Activation
 
-The parser only activates when there are pending actions awaiting approval. This prevents false positives — if the user says "yes" in normal conversation with nothing pending, the message flows through to the LLM as usual:
+The implicit parser is only invoked when there are pending approvals for the current session. If the user says "yes" in normal conversation with nothing pending, the message flows through to the LLM as usual. The single-match constraint adds further safety:
 
 ```javascript
-// approval-flow.js
-function parseApprovalIntent(message, pendingActions) {
-  // Gate: only parse if there are actions waiting for approval
-  if (!pendingActions || pendingActions.length === 0) {
-    return { intent: 'not-applicable' };
-  }
+// In the message processing pipeline
+const pendingActions = await agentActions.getPendingToolCalls();
 
-  const normalized = message.trim().toLowerCase();
-
-  // Check for ambiguous signals first — these always trigger clarification
-  if (matchesAny(normalized, AMBIGUOUS_SIGNALS)) {
-    return {
-      intent: 'ambiguous',
-      message: 'I need a clear yes or no to proceed. Want me to go ahead with this?',
-    };
-  }
-
-  // Check for batch approval patterns
-  const batchResult = parseBatchApproval(normalized, pendingActions);
-  if (batchResult) return batchResult;
-
-  // Check for qualified approval
-  const qualifiedResult = parseQualifiedApproval(normalized);
-  if (qualifiedResult) return qualifiedResult;
-
-  // Simple approval/denial
-  if (matchesAny(normalized, APPROVAL_SIGNALS)) {
-    return { intent: 'approve', targets: pendingActions.map(a => a.id) };
-  }
-
-  if (matchesAny(normalized, DENIAL_SIGNALS)) {
-    return { intent: 'deny', targets: pendingActions.map(a => a.id) };
-  }
-
-  // No approval-related intent detected — pass through to normal processing
-  return { intent: 'not-applicable' };
-}
-```
-
-Note: The basic yes/no approval and denial parsing above is fully implemented. The batch approval (`parseBatchApproval`) and qualified approval (`parseQualifiedApproval`) functions called in the flow above are designed but not yet implemented -- messages that would match those paths currently fall through to simple approval/denial or `not-applicable`.
-
-### Signal Matching with Boundary Awareness
-
-Keyword matching uses word boundaries to avoid false positives. "yes" matches, but "yesterday" does not. "no" matches, but "note" does not:
-
-```javascript
-// approval-flow.js
-function matchesAny(text, signals) {
-  return signals.some(signal => {
-    // Short signals (1-3 chars) must be the entire message or bounded by spaces/punctuation
-    if (signal.length <= 3) {
-      const pattern = new RegExp(`(^|\\s|^)${escapeRegex(signal)}($|\\s|[.,!?])`, 'i');
-      return pattern.test(text);
-    }
-    // Longer signals can appear anywhere in the message
-    return text.includes(signal);
-  });
-}
-```
-
-### Batch Approval Parsing
-
-> **Status: Designed, not yet implemented.** The functions below describe the intended behavior.
-
-Users can approve or deny specific subsets of pending actions by referencing IDs, indices, or descriptions:
-
-```javascript
-// approval-flow.js
-function parseBatchApproval(text, pendingActions) {
-  // "approve all" / "deny all"
-  if (/approve\s+all/i.test(text)) {
-    return { intent: 'approve', targets: pendingActions.map(a => a.id) };
-  }
-  if (/(deny|reject|cancel)\s+all/i.test(text)) {
-    return { intent: 'deny', targets: pendingActions.map(a => a.id) };
-  }
-
-  // "approve #123 and #456" — match by ID
-  const idMatches = text.match(/#(\d+)/g);
-  if (idMatches) {
-    const ids = idMatches.map(m => m.slice(1));
-    const matched = pendingActions.filter(a => ids.includes(String(a.id)));
-
-    if (matched.length > 0) {
-      const hasApproval = matchesAny(text, APPROVAL_SIGNALS) || /approve/i.test(text);
-      const hasDenial = matchesAny(text, DENIAL_SIGNALS) || /reject|deny|cancel/i.test(text);
-
-      return {
-        intent: hasApproval ? 'approve' : hasDenial ? 'deny' : 'ambiguous',
-        targets: matched.map(a => a.id),
-      };
+if (pendingActions.length === 1) {
+  // Only auto-apply implicit approval when exactly ONE action is pending
+  const decision = parseImplicitApprovalDecision(message.text);
+  if (decision.matched) {
+    if (decision.decision === 'approve') {
+      return await executeApprovedAction(pendingActions[0].id, ctx, correlationId);
+    } else {
+      return await rejectAction(pendingActions[0].id);
     }
   }
-
-  // "approve the first one" / "approve only the deploy"
-  const ordinalResult = parseOrdinalReference(text, pendingActions);
-  if (ordinalResult) return ordinalResult;
-
-  // "approve the deploy but not the notification"
-  const mixedResult = parseMixedApproval(text, pendingActions);
-  if (mixedResult) return mixedResult;
-
-  return null;
 }
 ```
 
-### Qualified Approval Handling
+When multiple actions are pending, implicit approval is not used — the user must use explicit `approve #ID` syntax to target specific actions.
 
-> **Status: Designed, not yet implemented.** The functions below describe the intended behavior.
+### Approved Action Execution
 
-A qualified approval ("yes but change the timeout first") is detected and routed back to the LLM for interpretation rather than being treated as a simple approval:
-
-```javascript
-// approval-flow.js
-const QUALIFICATION_MARKERS = ['but', 'except', 'only if', 'as long as', 'first', 'after', 'before', 'change', 'modify', 'update', 'with'];
-
-function parseQualifiedApproval(text) {
-  const hasApproval = matchesAny(text, APPROVAL_SIGNALS);
-  if (!hasApproval) return null;
-
-  const hasQualification = QUALIFICATION_MARKERS.some(marker => text.includes(marker));
-  if (!hasQualification) return null;
-
-  // This is a conditional approval — the LLM needs to interpret the condition
-  return {
-    intent: 'qualified',
-    rawText: text,
-    message: 'Detected a conditional approval. Routing to LLM for interpretation.',
-  };
-}
-```
-
-### Pipeline Integration
-
-The approval parser runs as a pre-processing step before the main LLM dispatch. Simple approvals and denials are resolved without an LLM call. Qualified and ambiguous responses are routed through the LLM:
+Once approved, the action is executed through the tool system with timeout protection:
 
 ```javascript
-// message-processor.js
-async function processMessage(message, userId) {
-  const pendingActions = await getPendingActions(userId);
+async function executeApprovedAction(actionId, ctx, correlationId) {
+  const action = await agentActions.getPendingToolCallById(actionId);
+  if (!action) return { executed: false, error: `Action #${actionId} not found` };
 
-  // Pre-LLM: try to resolve as an approval/denial
-  const approvalResult = parseApprovalIntent(message.text, pendingActions);
+  await agentActions.approveAction(actionId);
 
-  switch (approvalResult.intent) {
-    case 'approve':
-      await executeApprovedActions(approvalResult.targets, userId);
-      return { text: `Approved and executing ${approvalResult.targets.length} action(s).` };
+  const result = await agentActions.executeApprovedToolCall(
+    actionId,
+    async (toolName, toolArgs) => executeToolWithTimeout(toolName, toolArgs)
+  );
 
-    case 'deny':
-      await cancelPendingActions(approvalResult.targets, userId);
-      return { text: `Cancelled ${approvalResult.targets.length} pending action(s).` };
+  audit.log('approval:executed', {
+    actionId, toolName: result.toolName, success: result.success,
+  }, { correlationId });
 
-    case 'ambiguous':
-      return { text: approvalResult.message };
-
-    case 'qualified':
-      // Fall through to LLM with the pending action context attached
-      return await dispatchToLLM(message, userId, { pendingActions, qualification: approvalResult.rawText });
-
-    case 'not-applicable':
-      // No pending actions or no approval intent — normal message processing
-      return await dispatchToLLM(message, userId);
-  }
+  return { executed: true, toolName: result.toolName, result: result.result };
 }
 ```
 
 ## Implications
 
-- Pre-LLM parsing avoids burning tokens on simple yes/no responses — approval resolution happens in microseconds with keyword matching instead of milliseconds with an LLM roundtrip
-- Context gating (only activating when actions are pending) eliminates false positives from casual "yes" or "no" in normal conversation
-- Ambiguous responses are never treated as approvals — this is a deliberate safety choice that trades convenience for correctness. Users must be unambiguous to trigger execution
-- Qualified approvals fall through to the LLM, which has the intelligence to interpret conditions like "yes but change the timeout to 30s first" — the parser doesn't try to handle this complexity
-- Word boundary matching prevents substring false positives ("yesterday" does not trigger approval), but very short signals like "y" require strict boundary enforcement
-- Batch approval with ID matching assumes pending actions have stable, user-visible identifiers — without these, users can't reference specific actions
-- The parser is intentionally conservative: when in doubt, it returns `not-applicable` and lets the LLM handle it. False negatives (missed approval) are far less dangerous than false positives (accidental execution)
+- `Set.has()` matching is O(1) and has zero false-positive risk from substring matching — "yesterday" never triggers approval because it's not in the set
+- The normalized-then-exact-match approach means only known phrases trigger approval — there's no fuzzy matching or similarity scoring
+- Single-pending-action gating eliminates ambiguity about which action "yes" refers to — with multiple pending actions, the user must be explicit
+- No ambiguous category exists — the parser returns `matched: false` for anything not in the sets, and the message falls through to normal LLM processing
+- The approval and rejection sets are intentionally small and conservative — about 15 approval phrases and 12 rejection phrases
+- Punctuation stripping (`"Yes!"` -> `"yes"`) handles common conversational patterns without expanding the match set
+- The explicit `approve #ID` path works regardless of how many actions are pending and doesn't require normalization
+- All approvals are audit-logged with correlation IDs for full traceability
 
 ## Code Example
 
 ```javascript
 // Full approval flow lifecycle
 
-// 1. Agent proposes an action and queues it for approval
-async function proposeAction(userId, action) {
-  const pending = {
-    id: generateId(),
-    description: action.description,
-    tool: action.tool,
-    args: action.args,
-    proposedAt: Date.now(),
-    ttlMs: 24 * 60 * 60 * 1000, // expires after 24 hours
-  };
+// 1. Agent proposes a tool call that requires approval
+// (autonomy gating queues it instead of executing)
+// → Pending: { id: 42, toolName: 'send_email', args: { to: 'client@...' } }
 
-  await savePendingAction(userId, pending);
-  return `I'd like to ${action.description}. Shall I go ahead?`;
-}
+// 2. User responds naturally
+// "yes"         → Set.has('yes')        → approve action #42
+// "go ahead"    → Set.has('go ahead')   → approve action #42
+// "nope"        → Set.has('nope')       → reject action #42
+// "sounds good" → Set.has('sounds good') → approve action #42
+// "yesterday"   → not in set            → falls through to LLM
+// "maybe"       → not in set            → falls through to LLM
 
-// 2. User responds naturally — parser handles it before the LLM
-// "yes"                    -> approve all pending
-// "go ahead"               -> approve all pending
-// "approve #42"            -> approve specific action
-// "approve all"            -> approve all pending
-// "no"                     -> deny all pending
-// "hold off"               -> deny all pending
-// "yes but use staging"    -> qualified, routes to LLM
-// "maybe"                  -> ambiguous, asks for clarification
-// "what's the weather?"    -> not-applicable, normal processing
+// 3. With multiple pending actions, implicit matching is skipped
+// User must use: "approve #42" or "approve #43"
+const explicit = parseApprovalCommand('approve #42');
+// { matched: true, actionId: 42 }
 
-// 3. Approved actions execute immediately
-async function executeApprovedActions(actionIds, userId) {
-  const actions = await getPendingActionsByIds(userId, actionIds);
-
-  for (const action of actions) {
-    await executeTool(action.tool, action.args, userId);
-    await removePendingAction(userId, action.id);
-  }
-}
-
-// 4. Expired actions are cleaned up automatically
-async function cleanExpiredActions(userId) {
-  const pending = await getPendingActions(userId);
-  const now = Date.now();
-
-  for (const action of pending) {
-    if (now - action.proposedAt > action.ttlMs) {
-      await removePendingAction(userId, action.id);
-    }
-  }
-}
+// 4. Approved action executes immediately via tool system
+const result = await executeApprovedAction(42, ctx, correlationId);
+// { executed: true, toolName: 'send_email', result: { success: true } }
 ```
 
 ## Related Patterns
 
 - [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
-- [Agent Recovery and Escalation](./agent-recovery-and-escalation.md)
+- [Autonomous Agent Cycle](./autonomous-agent-cycle.md)
 - [Message Processing Pipeline](./message-processing-pipeline.md)

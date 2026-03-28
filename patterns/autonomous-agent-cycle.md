@@ -1,191 +1,161 @@
 # Autonomous Agent Cycle
 
-> Periodic long-interval loop that reviews active objectives, generates strategies, and produces actionable tasks — running every 2 hours to maintain goal-directed behavior without continuous compute.
+> Periodic autonomous thinking loop running every 30 minutes during work hours (weekdays 9 AM - 6 PM) that reflects on current state, identifies actions, executes low-risk ones automatically, and queues high-risk ones for user approval. Currently disabled and consolidated into a semantic job group.
 
 ## Problem
 
-An AI orchestrator that only responds to user messages is reactive — it waits idle between interactions. But a capable system should proactively pursue objectives, generate strategies for achieving them, and produce actions to execute. A continuous loop wastes compute when idle. A fast tick-based event processor is overkill for strategic planning, which only needs periodic review. What's needed is a long-interval cycle that periodically checks in on high-level goals and generates work from them.
+An AI orchestrator that only responds to user messages is reactive — it waits idle between interactions. But a capable system should proactively pursue objectives, identify potential actions, and execute routine work without being asked. A continuous loop wastes compute when idle. A fast tick-based event processor is overkill for autonomous planning. What's needed is a periodic cycle that checks in on current state and generates work from it, with gating to ensure it only acts within acceptable autonomy bounds.
 
 ## Context
 
-- An orchestrator with access to project state, objectives, and external services
-- Strategic planning is a slow process — reviewing objectives and generating strategies does not need sub-second latency
+- An orchestrator with access to todos, goals, projects, emails, and external services
+- Autonomous actions need human approval for high-risk operations
 - The cycle must not interfere with interactive user requests
-- Objectives change infrequently; strategies and actions are derived from them periodically
+- Autonomy is configurable — the job checks an autonomy tier before running
+- The cycle was originally a standalone job but has been consolidated into a broader semantic job group for operational simplicity
 
 ## Solution
 
-### Periodic Objectives Review Loop
+### Schedule and Gating
 
-The agent cycle runs on a 2-hour interval. Each cycle reviews active objectives, evaluates progress, generates or updates strategies, and produces concrete actions:
-
-```javascript
-// agent/cycle.js
-const CYCLE_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
-
-async function runCycle() {
-  const objectives = await db.query(
-    `SELECT * FROM objectives WHERE status = 'active'`
-  );
-
-  for (const objective of objectives.rows) {
-    // Evaluate current progress against the objective
-    const progress = await evaluateProgress(objective);
-
-    // Generate or refine strategies based on current state
-    const strategies = await generateStrategies(objective, progress);
-
-    // Produce concrete actions from strategies
-    const actions = await produceActions(objective, strategies);
-
-    // Queue actions for execution
-    for (const action of actions) {
-      await queueAction(action);
-    }
-  }
-}
-```
-
-### Objective Evaluation
-
-Each objective is assessed for progress. Stalled or completed objectives are flagged:
+The autonomous agent cycle is configured with a cron schedule of `*/30 9-18 * * 1-5` — every 30 minutes during business hours on weekdays. Before any work happens, the job checks the system's autonomy settings to verify it has permission to run:
 
 ```javascript
-async function evaluateProgress(objective) {
-  const recentActions = await db.query(
-    `SELECT * FROM actions WHERE objective_id = $1 AND created_at > NOW() - INTERVAL '48 hours'`,
-    [objective.id]
-  );
+// jobs/autonomous-agent.js
+module.exports = {
+  name: 'autonomous-agent',
+  description: 'Autonomous thinking cycle (every 30 min, work hours weekdays)',
+  schedule: schedules.SCHEDULES.AUTONOMOUS_AGENT,  // */30 9-18 * * 1-5
+  autonomyLevel: 'NOTIFY',
+  enabled: false,  // Consolidated into proactive-intelligence.js
+  run,
+};
 
-  const completedCount = recentActions.rows.filter(a => a.status === 'completed').length;
-  const failedCount = recentActions.rows.filter(a => a.status === 'failed').length;
-
-  if (completedCount === 0 && failedCount > 0) {
-    return { status: 'stalled', reason: 'recent actions all failed' };
-  }
-
-  if (await isObjectiveMet(objective)) {
-    await db.query(`UPDATE objectives SET status = 'completed' WHERE id = $1`, [objective.id]);
-    return { status: 'completed' };
-  }
-
-  return { status: 'in_progress', completedCount, failedCount };
-}
-```
-
-### Strategy Generation
-
-Strategies bridge the gap between high-level objectives and concrete actions. The cycle generates them by considering the objective's current state and what has been tried:
-
-```javascript
-async function generateStrategies(objective, progress) {
-  if (progress.status === 'completed') return [];
-  if (progress.status === 'stalled') {
-    // Stalled objectives need new approaches
-    return await generateAlternativeStrategies(objective);
-  }
-
-  // Normal progress: refine existing strategies
-  const existing = await db.query(
-    `SELECT * FROM strategies WHERE objective_id = $1 AND status = 'active'`,
-    [objective.id]
-  );
-
-  if (existing.rows.length === 0) {
-    return await generateInitialStrategies(objective);
-  }
-
-  return existing.rows;
-}
-```
-
-### Action Production
-
-Strategies are decomposed into concrete, dispatchable actions:
-
-```javascript
-async function produceActions(objective, strategies) {
-  const actions = [];
-
-  for (const strategy of strategies) {
-    const nextSteps = await determineNextSteps(strategy);
-
-    for (const step of nextSteps) {
-      actions.push({
-        objective_id: objective.id,
-        strategy_id: strategy.id,
-        type: step.type,
-        prompt: step.prompt,
-        workdir: step.workdir,
+async function run() {
+  return audit.trackJob('autonomous-agent', async () => {
+    const autonomyCheck = await canJobRun('autonomous-agent');
+    if (!autonomyCheck.allowed) {
+      await orchestrator.logAction({
+        actor: 'job:autonomous-agent',
+        actionType: 'skip',
+        description: `Skipped autonomous cycle: ${autonomyCheck.reason}`,
       });
+      return;
     }
-  }
-
-  return actions;
+    // ... cycle logic
+  });
 }
+```
 
-async function queueAction(action) {
-  await db.query(
-    `INSERT INTO actions (objective_id, strategy_id, type, prompt, workdir, status)
-     VALUES ($1, $2, $3, $4, $5, 'queued')`,
-    [action.objective_id, action.strategy_id, action.type, action.prompt, action.workdir]
+### Cycle Execution
+
+Each cycle invokes the agent's autonomous reasoning loop, which reflects on the current state (todos, goals, projects, emails) and produces two categories of actions:
+
+```javascript
+const agent = require('../lib/agent');
+
+const result = await agent.runAutonomousCycle();
+
+// result.executed — low-risk actions already performed
+// result.queued — high-risk actions awaiting user approval
+```
+
+### Action Classification and Logging
+
+Executed and queued actions are logged through the orchestrator for full audit trail visibility. Each action records its type, reasoning, and whether the user should see it:
+
+```javascript
+for (const action of result.executed || []) {
+  await orchestrator.logAction({
+    actor: 'job:autonomous-agent',
+    actionType: 'auto_execute',
+    actionSubtype: action.action_type,
+    description: action.description || `Executed: ${action.action_type}`,
+    decisionReason: action.reasoning,
+    userVisible: action.tier === 'notify',
+  });
+}
+```
+
+### Pending Approval Notification
+
+When actions are queued for approval, the cycle creates an attention item and notifies the user through the messenger. This bridges the gap between autonomous operation and human oversight:
+
+```javascript
+const pending = await agent.getPendingApprovals();
+if (pending.length > 0) {
+  await orchestrator.createAttentionItem({
+    domain: 'task',
+    itemType: 'pending_approval',
+    title: `${pending.length} autonomous action(s) need approval`,
+    description: pending.slice(0, 3).map(a => a.description).join('; '),
+    priority: 2,
+    urgency: 'normal',
+    sourceType: 'autonomous_actions',
+    metadata: {
+      count: pending.length,
+      actions: pending.slice(0, 5).map(a => ({
+        id: a.id, type: a.action_type, description: a.description,
+      })),
+    },
+  });
+
+  await jobMessenger.text(
+    `*Autonomous Agent*\n\n` +
+    `I have ${pending.length} action(s) waiting for your approval:\n` +
+    pending.slice(0, 3).map(a => `- ${a.description}`).join('\n') +
+    (pending.length > 3 ? `\n...and ${pending.length - 3} more` : '') +
+    `\n\nSay "show pending actions" to review.`
   );
 }
 ```
 
-### Startup and Shutdown
+### Consolidation into Semantic Job Group
 
-The cycle starts with an initial run and then repeats every 2 hours:
+The standalone autonomous agent job is disabled (`enabled: false`) and its functionality has been consolidated into `proactive-intelligence.js`, a semantic job group that bundles related proactive behaviors. This reduces the number of scheduled jobs while maintaining the same autonomous capabilities:
 
 ```javascript
-async function startCycle() {
-  // Run immediately on startup
-  await runCycle();
-
-  // Then repeat on interval
-  const timer = setInterval(runCycle, CYCLE_INTERVAL_MS);
-
-  return {
-    stop() {
-      clearInterval(timer);
-    }
-  };
-}
+// The job module still exists for documentation and potential re-enablement
+module.exports = {
+  enabled: false,  // Consolidated into semantic job group jobs/proactive-intelligence.js
+  // ...
+};
 ```
 
 ## Implications
 
-- The 2-hour interval means strategic changes take up to 2 hours to produce new actions — this is intentional for planning-level work, not real-time operations
-- Separating objectives, strategies, and actions creates a clear hierarchy: objectives are stable, strategies adapt, actions are disposable
-- Stalled objective detection prevents the system from endlessly retrying failed approaches — it triggers strategy regeneration instead
-- The cycle is independent from interactive request handling — user messages are processed immediately through the normal dispatch path, not through this loop
-- Actions produced by the cycle are queued like any other task, flowing through the standard dispatch and worker systems
-- The long interval keeps compute costs minimal — the cycle is dormant 99%+ of the time
+- The 30-minute interval (not 2-hour) balances responsiveness with compute cost — autonomous actions surface within half an hour during business hours
+- Autonomy gating (`canJobRun`) means the cycle does nothing unless the system's autonomy level permits it — this is configurable at runtime
+- The separation between `executed` (low-risk, auto-performed) and `queued` (high-risk, awaiting approval) actions creates a clear trust boundary
+- Attention items and messenger notifications ensure queued actions are visible even if the user isn't actively looking at the dashboard
+- Consolidation into a semantic job group means the autonomous cycle shares scheduling infrastructure with related proactive behaviors (suggestions, follow-ups, etc.)
+- The disabled-but-present pattern allows the job to be re-enabled for debugging or if the semantic group approach is reversed
+- All actions flow through the orchestrator's audit trail, making autonomous behavior fully traceable
 
 ## Code Example
 
 ```javascript
-// Start the autonomous agent cycle
-if (process.env.RUN_AGENT_CYCLE) {
-  const cycle = await startCycle();
-  process.on('SIGTERM', () => cycle.stop());
-}
+// Typical cycle execution flow:
 
-// Example cycle execution:
-// 1. Reviews 3 active objectives
-// 2. Objective "reduce billing-api error rate" — in_progress, 2 completed actions
-//    -> Strategy: "add retry logic to /invoices endpoint"
-//    -> Action queued: { type: 'solve-issue', prompt: 'Add retry logic to...' }
-// 3. Objective "migrate to postgres 16" — stalled, all recent actions failed
-//    -> Generates alternative strategy: "attempt migration with pg_upgrade instead"
-//    -> Action queued: { type: 'coding', prompt: 'Set up pg_upgrade migration...' }
-// 4. Objective "improve test coverage" — completed
-//    -> Marked completed, no actions produced
+// 1. Job fires at 10:30 AM on a Tuesday
+// 2. Autonomy check passes (user has autonomy set to NOTIFY)
+// 3. Agent reflects on current state:
+//    - 3 overdue tasks found
+//    - Email from client needs follow-up
+//    - GitHub PR has been open for 3 days
+// 4. Low-risk actions executed automatically:
+//    - Sent reminder about overdue tasks
+//    - Updated task priorities based on deadlines
+// 5. High-risk actions queued for approval:
+//    - "Send follow-up email to client about project timeline"
+//    - "Post review comment on stale PR"
+// 6. User notified: "I have 2 action(s) waiting for your approval"
+// 7. User responds "yes" → actions execute via implicit approval parsing
 ```
 
 ## Related Patterns
 
 - [Cognitive Processing Loop](./cognitive-processing-loop.md)
-- [Outbound Queue with Backoff](./outbound-queue-with-backoff.md)
-- [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)
 - [Decision Gating and Autonomy Tiers](./decision-gating-and-autonomy-tiers.md)
+- [Implicit Approval Parsing](./implicit-approval-parsing.md)
+- [Scheduled Autonomous Maintenance](./scheduled-autonomous-maintenance.md)

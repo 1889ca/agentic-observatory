@@ -1,6 +1,6 @@
 # Knowledge Graph and Relationship Discovery
 
-> Generic entity relationships stored in the documents table with relationship scoring and multi-hop traversal.
+> Document-based entity relationships with dedicated scoring, enrichment, and query modules for multi-hop traversal, relationship ranking by type/recency/strength, and context assembly integration.
 
 ## Problem
 
@@ -9,206 +9,221 @@ An orchestrator processes conversations containing references to entities and th
 ## Context
 
 - A general-purpose agent that discovers and stores arbitrary entities from conversations
-- Entities appear repeatedly across conversations but aren't explicitly linked
+- Entities are stored as documents in a unified `documents` table with UUID primary keys
+- Relationships are stored in `document_relationships` with typed edges and strength properties
 - Users expect the agent to know relationships between entities it has encountered
-- The agent needs to surface relevant connections when assembling context for a new interaction
-- Knowledge documents already exist with embeddings for semantic search — the graph layer augments rather than replaces them
+- The knowledge graph module is read-oriented — it queries and scores existing relationships rather than performing continuous extraction
+- A modular architecture with separate files for queries, scoring, and enrichment
 
 ## Solution
 
+### Module Architecture
+
+The knowledge graph is organized as a directory with four files:
+
+- `index.js` — main API (`getEntityContext`, `getNeighborhood`, `findPath`, `enrichContext`)
+- `queries.js` — raw SQL queries against `documents` and `document_relationships`
+- `scoring.js` — relationship and fact relevance scoring with type weights and recency decay
+- `enrichment.js` — formats graph data for context assembly with token budget awareness
+
 ### Document-Based Entity Storage
 
-Entities are stored in the `documents` table — the same table used for memory and knowledge. There is no separate fact store or triple-store. Every entity participates in the same semantic search infrastructure:
+Entities are stored in the `documents` table — the same table used for memory and knowledge. Relationships are stored in `document_relationships` with typed edges and strength stored in a JSONB `properties` column:
 
 ```sql
-CREATE TABLE documents (
-  id SERIAL PRIMARY KEY,
-  type TEXT NOT NULL,          -- 'entity', 'memory', 'knowledge', etc.
-  title TEXT NOT NULL,
-  content TEXT NOT NULL,
-  embedding VECTOR(1536),
-  metadata JSONB DEFAULT '{}', -- { entity_type: 'generic', tags: [...], ... }
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
+-- documents table (UUID primary keys)
+SELECT id, type, data->>'name' as name, data FROM documents WHERE id = $1;
 
-CREATE TABLE document_relationships (
-  id SERIAL PRIMARY KEY,
-  source_id INTEGER REFERENCES documents(id),
-  target_id INTEGER REFERENCES documents(id),
-  relationship TEXT NOT NULL,   -- related-to, part-of, depends-on
-  strength FLOAT DEFAULT 1.0,
-  metadata JSONB DEFAULT '{}',
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE(source_id, target_id, relationship)
-);
+-- document_relationships with strength in properties
+SELECT
+  r.id, r.source_id, r.target_id, r.relationship_type,
+  COALESCE((r.properties->>'strength')::real, 1.0) as strength,
+  r.created_at as last_seen,
+  CASE WHEN r.source_id = $1 THEN 'outgoing' ELSE 'incoming' END as direction,
+  d.id as related_entity_id, d.data->>'name' as related_name, d.type as related_type
+FROM document_relationships r
+JOIN documents d ON (
+  (r.source_id = $1 AND r.target_id = d.id) OR
+  (r.target_id = $1 AND r.source_id = d.id)
+)
+WHERE (r.source_id = $1 OR r.target_id = $1)
+  AND COALESCE((r.properties->>'strength')::real, 1.0) >= $2
 ```
 
-### Generic Entity and Relationship Types
+### Relationship Type Scoring
 
-The system stores arbitrary entities and relationships with no domain-specific type constraints. Entity types and relationship labels are freeform strings determined at extraction time:
+The scoring module assigns weights to relationship types and calculates composite scores from strength, type weight, and recency:
 
 ```javascript
-// No fixed entity type enum — entities are stored with whatever type
-// the extraction prompt identifies (e.g., 'person', 'project', 'concept')
-
-const RELATIONSHIP_TYPES = {
-  RELATED_TO: 'related-to',     // general association
-  PART_OF: 'part-of',           // containment / membership
-  DEPENDS_ON: 'depends-on',     // dependency
-  CREATED_BY: 'created-by',     // authorship / origin
-  REFERENCES: 'references',     // citation / mention
+// lib/knowledge-graph/scoring.js
+const TYPE_WEIGHTS = {
+  works_on: 1.0,
+  owns: 0.95,
+  client_of: 0.9,
+  employed_by: 0.85,
+  works_with: 0.8,
+  manages: 0.75,
+  depends_on: 0.6,
+  related_to: 0.4,
+  mentioned_with: 0.3,
 };
-```
 
-### Entity Extraction and Storage
+function scoreRelationship(relationship) {
+  const strength = relationship.strength || 0.5;
+  const typeWeight = TYPE_WEIGHTS[relationship.relationship_type] || 0.4;
+  const recencyFactor = calculateRecencyDecay(relationship.last_seen, 30); // 30-day half-life
 
-Extraction uses a generic prompt that discovers entities and relationships without domain-specific constraints:
-
-```javascript
-async function extractAndStore(message, conversationId) {
-  const extraction = await model.send(`
-    Extract from this message:
-    1. entities: [{ name, type, description }]
-    2. relationships: [{ from, to, type }]
-    Use descriptive entity types (person, project, concept, tool, etc.).
-    Use descriptive relationship types (related-to, part-of, depends-on, created-by, references, etc.).
-  `, { content: message });
-
-  const parsed = JSON.parse(extraction);
-
-  // Upsert entities as documents
-  const docIds = {};
-  for (const entity of parsed.entities) {
-    docIds[entity.name] = await upsertEntityDocument(entity);
-  }
-
-  // Upsert relationships with strength reinforcement
-  for (const rel of parsed.relationships) {
-    await upsertRelationship(docIds[rel.from], docIds[rel.to], rel.type);
-  }
+  // Composite: 50% strength, 30% type weight, 20% recency
+  return strength * 0.5 + typeWeight * 0.3 + recencyFactor * 0.2;
 }
 ```
 
-### Relationship Strength Scoring
-
-Strength is reinforced on each observation. The scoring is simpler than a generic system — reinforcement on repeat observations, basic time decay:
+Recency uses exponential decay with a configurable half-life (30 days for relationships, 60 days for facts):
 
 ```javascript
-async function upsertRelationship(sourceId, targetId, type) {
-  await db.query(`
-    INSERT INTO document_relationships (source_id, target_id, relationship, strength)
-    VALUES ($1, $2, $3, 1.0)
-    ON CONFLICT (source_id, target_id, relationship) DO UPDATE SET
-      strength = LEAST(document_relationships.strength + 0.3, 5.0),
-      updated_at = NOW()
-  `, [sourceId, targetId, type]);
+function calculateRecencyDecay(lastSeen, halfLifeDays = 30) {
+  if (!lastSeen) return 0.5;
+  const daysSince = (Date.now() - new Date(lastSeen).getTime()) / (1000 * 60 * 60 * 24);
+  return Math.max(0.1, Math.min(1.0, Math.pow(0.5, daysSince / halfLifeDays)));
+}
+```
+
+### Entity Context (Read-Oriented)
+
+The main `getEntityContext()` function is read-oriented — it queries an entity's direct relationships, scores and ranks them, and fetches related facts. It does not perform extraction:
+
+```javascript
+// lib/knowledge-graph/index.js
+async function getEntityContext(documentId, options = {}) {
+  const { depth = 1, minStrength = 0.3, limit = 10 } = options;
+
+  const doc = await query(
+    "SELECT id, type, data->>'name' as name, data FROM documents WHERE id = $1",
+    [documentId]
+  );
+
+  // Get direct relationships (more than needed, then score and filter)
+  const rawRelationships = await queries.getDirectRelationships(documentId, {
+    minStrength, limit: limit * 2,
+  });
+
+  // Score and rank
+  const relationships = scoring.rankRelationships(rawRelationships, {
+    minScore: 0.2, limit,
+  });
+
+  // Get facts for related entities
+  const relatedDocIds = relationships.map(r => r.related_entity_id);
+  const relatedFacts = relatedDocIds.length > 0
+    ? await queries.getRelatedFacts(relatedDocIds, 3) : [];
+
+  // Score facts by relationship relevance and depth
+  const scoredFacts = scoring.rankFacts(relatedFacts, entityScores, entityDepths, {
+    minScore: 0.15, limit: 10,
+  });
+
+  return { entity: { id, name, type }, relationships, relatedFacts: scoredFacts };
 }
 ```
 
 ### Multi-Hop Traversal
 
-To discover indirect connections (e.g., "what entities are two hops away from this one?"), traverse relationships multiple hops:
+The `getNeighborhood()` function expands outward from seed entities through multiple hops, tracking path strength at each level:
 
 ```javascript
-async function expandGraph(documentId, maxHops = 2, minStrength = 0.3) {
-  const visited = new Set();
-  const connections = [];
-
-  async function traverse(docId, depth, pathStrength) {
-    if (depth > maxHops || visited.has(docId)) return;
-    visited.add(docId);
-
-    const rels = await db.query(`
-      SELECT dr.*, d.title, d.metadata
-      FROM document_relationships dr
-      JOIN documents d ON d.id = CASE
-        WHEN dr.source_id = $1 THEN dr.target_id
-        ELSE dr.source_id
-      END
-      WHERE (dr.source_id = $1 OR dr.target_id = $1)
-        AND dr.strength >= $2
-      ORDER BY dr.strength DESC
-      LIMIT 20
-    `, [docId, minStrength]);
-
-    for (const rel of rels.rows) {
-      connections.push({
-        entity: rel.title,
-        type: rel.metadata?.entity_type,
-        relationship: rel.relationship,
-        strength: rel.strength,
-        hops: depth
-      });
-      const nextId = rel.source_id === docId ? rel.target_id : rel.source_id;
-      await traverse(nextId, depth + 1, rel.strength);
-    }
-  }
-
-  await traverse(documentId, 1, 1.0);
-  return connections.sort((a, b) => b.strength - a.strength);
+async function getNeighborhood(documentId, options = {}) {
+  const { depth = 2, minStrength = 0.3, limit = 50 } = options;
+  return queries.getNeighborhood([documentId], { depth, minStrength, limit });
 }
 ```
 
 ### Context Enrichment
 
-When assembling context for a new interaction, query document relationships for the mentioned entities:
+The enrichment module transforms raw graph data into formatted context suitable for inclusion in the system prompt. It accepts a token budget and truncates if needed:
 
 ```javascript
-async function enrichWithGraph(message, contextBudget) {
-  const entities = await extractEntities(message);
-  const graphContext = [];
+// lib/knowledge-graph/enrichment.js
+async function getEnrichedContext(mentionedEntities, options = {}) {
+  const { depth = 1, minStrength = 0.5, tokenBudget = 300 } = options;
 
-  for (const entity of entities) {
-    const doc = await findEntityDocument(entity.name);
-    if (!doc) continue;
+  const entityIds = mentionedEntities.map(e => e.id).filter(Boolean);
+  const neighborhood = await queries.getNeighborhood(entityIds, { depth, minStrength, limit: 20 });
 
-    const connections = await expandGraph(doc.id, 2);
+  // Get and score relationships, then facts
+  // Format into human-readable context
+  const formatted = formatForContext({ relationships, facts });
 
-    graphContext.push({
-      entity: entity.name,
-      connections: connections.slice(0, 5),
-    });
+  // Estimate tokens (1 token per 4 chars) and truncate if over budget
+  const tokens = Math.ceil(formatted.length / 4);
+  if (tokens > tokenBudget) {
+    return { content: formatted.substring(0, tokenBudget * 4) + '...', tokens: tokenBudget };
   }
-
-  return formatGraphContext(graphContext, contextBudget);
+  return { content: formatted, tokens };
 }
+```
+
+The formatted output groups relationships by source entity and includes related facts:
+
+```
+[Related context from knowledge graph]
+- Connections: Sarah Chen (is a client of), Website Redesign (works on)
+- Sarah Chen: Prefers email communication, timezone PST
+```
+
+### Graph Utilities
+
+Additional graph operations support relationship exploration:
+
+```javascript
+// Find shortest path between two entities
+async function findPath(documentA, documentB) { /* ... */ }
+
+// Find common connections between entities
+async function findCommonConnections(documentA, documentB) { /* ... */ }
+
+// Get strongest relationships for an entity
+async function getStrongestRelationships(documentId, limit = 10) { /* ... */ }
 ```
 
 ## Implications
 
-- Entity extraction is imperfect — the model will miss entities or create duplicates with slightly different names (requires normalization)
-- Storing entities in the `documents` table means they participate in semantic search, but also means the table grows with every new entity
-- Generic entity types maximize reuse across domains but rely on the LLM to produce consistent type labels — normalization may be needed
-- No separate fact/triple store — all knowledge is captured through document relationships, keeping the schema simpler
-- Graph queries add latency to context assembly; cache frequently-accessed subgraphs
-- Multi-hop traversal can grow combinatorially; depth and breadth limits are essential
-- The graph is only as good as the conversations flowing through it — gaps in conversation coverage mean gaps in the graph
+- The knowledge graph is read-oriented — `getEntityContext()` queries existing relationships rather than extracting new ones from conversation text
+- Separate `scoring.js` and `enrichment.js` modules keep concerns clean — scoring is reusable across different query paths
+- Type-weighted scoring means some relationship types (works_on, owns) are inherently more relevant than others (mentioned_with), which may not suit all domains
+- Exponential recency decay with a 30-day half-life means relationships not refreshed in ~2 months decay to 25% relevance
+- Token budget awareness in enrichment prevents graph context from consuming the entire context window
+- All entity IDs are UUIDs (not integers), reflecting the document-based storage model
+- Multi-hop traversal can grow combinatorially — depth and breadth limits are essential
+- The graph module does not own entity extraction — that happens elsewhere in the pipeline, and the graph provides the query/scoring layer
 
 ## Code Example
 
 ```javascript
-// Full pipeline: extract from conversation, store, and query
-async function processConversation(message, conversationId) {
-  await extractAndStore(message, conversationId);
+// Context assembly integration
+const kg = require('./lib/knowledge-graph');
 
-  const entities = await extractEntities(message);
-  if (!entities.length) return { connections: [] };
+async function assembleContext(message, mentionedEntities) {
+  // Get enriched graph context for mentioned entities
+  const graphContext = await kg.enrichContext(
+    mentionedEntities.map(e => e.id),
+    { depth: 1, minStrength: 0.5, factLimit: 5 }
+  );
 
-  const doc = await findEntityDocument(entities[0].name);
-  if (!doc) return { connections: [] };
+  // Returns: { entities, relationships, facts } with scores
 
-  const connections = await expandGraph(doc.id, 2);
+  // Or get detailed context for a single entity
+  const entityContext = await kg.getEntityContext(entityId, {
+    depth: 1, minStrength: 0.3, limit: 10,
+  });
 
-  return {
-    directConnections: connections.filter(c => c.hops === 1),
-    indirectConnections: connections.filter(c => c.hops > 1),
-  };
+  // entityContext.relationships[0]:
+  // { target: { id, name: 'Sarah Chen', type: 'person' },
+  //   type: 'client_of', direction: 'outgoing', strength: 0.85, score: 0.72 }
 }
 ```
 
 ## Related Patterns
 
 - [Context Assembly Pipeline](./context-assembly-pipeline.md)
-- [Unified Search Across KBs](./unified-search-across-kbs.md)
+- [Domain-Aware Memory Scoring](./domain-aware-memory-scoring.md)
+- [Dynamic System Prompt Composition](./dynamic-system-prompt-composition.md)
