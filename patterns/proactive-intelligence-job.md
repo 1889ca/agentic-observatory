@@ -1,6 +1,6 @@
 # Proactive Intelligence Job
 
-> A consolidated autonomous cycle that replaces multiple standalone scheduled jobs with a single work-hour-aware job group, unifying autonomous thinking, worker dispatch, context sync, stuck task detection, and proactive context gathering under one schedule.
+> A planned consolidation of multiple standalone scheduled jobs into a single semantic job group. The trigger is registered and individual jobs are disabled, but the unified handler is not yet implemented — the trigger currently dispatches to a no-op.
 
 ## Problem
 
@@ -16,12 +16,41 @@ An orchestrator accumulates specialized scheduled jobs over time -- autonomous t
 
 ## Solution
 
-### Job Consolidation Into Semantic Groups
+### Current State: Trigger Registered, Handler Pending
 
-Rather than running 8+ independent cron jobs, the proactive intelligence job consolidates them into a single entry point that runs sub-tasks in a logical order with shared context:
+The unified-triggers system registers `proactive-intelligence` with a 1-minute schedule, but no `jobs/proactive-intelligence.js` file exists yet — the dispatcher logs and returns:
 
 ```javascript
-// jobs/proactive-intelligence.js (conceptual -- consolidates these disabled jobs)
+// lib/unified-triggers/system.js
+{ name: 'system:job:proactive-intelligence',
+  schedule: schedules.SCHEDULES.PROACTIVE_INTELLIGENCE,   // '* * * * *'
+  jobName: 'proactive-intelligence' }
+
+// lib/config/tunables/schedules.js
+defSchedule('PROACTIVE_INTELLIGENCE', '* * * * *', 'Proactive Intelligence (Group)')
+```
+
+The individual jobs that will eventually be consolidated are already disabled, each annotated with a pointer to the not-yet-built handler:
+
+```javascript
+// jobs/autonomous-agent.js (and seven siblings)
+module.exports = {
+  name: 'autonomous-agent',
+  schedule: schedules.SCHEDULES.AUTONOMOUS_AGENT,
+  autonomyLevel: 'NOTIFY',
+  enabled: false, // Consolidated into semantic job group jobs/proactive-intelligence.js
+  run,
+}
+```
+
+The disabled-but-present pattern keeps the run logic available as a building block for the future consolidated handler.
+
+### Planned Job Consolidation Into Semantic Groups
+
+When implemented, the proactive intelligence job will consolidate eight standalone jobs into a single entry point that runs sub-tasks in a logical order with shared context:
+
+```javascript
+// jobs/proactive-intelligence.js (planned -- consolidates these disabled jobs)
 //
 // Replaces:
 //   autonomous-agent.js    — every 30 min, work hours (enabled: false)
@@ -169,6 +198,7 @@ if (focusStatus.inFocus) {
 - A single consolidated job is a single point of failure -- if it crashes, all proactive intelligence stops. The standalone model was more resilient to individual failures
 - Budget checking across all sub-tasks (not just dispatch) prevents the autonomous thinking cycle from queuing expensive actions when the budget is tight
 - The consolidation pattern is a general principle: when you have N jobs with overlapping concerns and shared guards, consolidate them into a semantic group with ordered execution
+- **Status note**: the trigger is wired and individual jobs are disabled, but the `jobs/proactive-intelligence.js` handler is not yet implemented — the system is mid-migration. The cron fires every minute and currently dispatches to a no-op. This is intentional staging, not a bug
 
 ## Code Example
 

@@ -1,199 +1,172 @@
 # Entity Service and Universal CRUD
 
-> Universal CRUD abstraction for all entity types with type normalization, alias resolution, and automatic event emission.
+> Type-routed CRUD facade that dispatches to two storage backends (task-like vs. document) while normalizing inputs and outputs into a single canonical shape.
 
 ## Problem
 
-Every entity type (contacts, tasks, documents, projects) needs CRUD operations. Writing separate services for each leads to inconsistent behavior — some emit events, some don't; some normalize input, some don't; some support batch operations, some don't. The result is a patchwork of ad-hoc services with subtly different semantics.
+A system with twenty entity types (task, goal, project, person, client, note, area, event, recipe, …) needs CRUD. Writing separate services per type produces inconsistent semantics — different normalization, different return shapes, different event emission, different validation strictness. Worse, some entities are task-like (status lifecycle, due dates, completion) while others are pure structured documents — they need different storage but callers should not have to care.
 
 ## Context
 
-- An application manages many entity types that share common CRUD patterns
-- All mutations should emit events for downstream consumers (UI, audit, reflexes)
-- Input data arrives in inconsistent shapes from different sources (API, LLM, imports)
-- Batch operations are common (flow steps, bulk imports) and need transaction semantics
-- Entity types may be referenced by aliases ("person" → "contact", "todo" → "task")
+- An application manages many entity types with overlapping but non-identical lifecycles
+- Some entities have a status machine and time-bounds (task, goal); most do not (note, person, project)
+- All entity mutations should flow through one chokepoint so caches, events, and audits are consistent
+- Aliases ("todo" → "task", "person" → "contact") arrive from LLM-generated calls and external imports
+- Strict validation matters for some types (tasks) but would block legitimate creates for others
 
 ## Solution
 
-A single entity service (`lib/entity-service.js`) provides universal CRUD for any registered entity type, composed from four submodules:
+A single entity service (`lib/entity-service.js` — a thin re-export shim over `lib/entity-service/`) provides universal CRUD by routing each call to one of two storage backends and normalizing the result into a canonical shape.
 
-### Type Normalization (normalize submodule)
+### Two-Backend Routing
 
-Incoming entity data is normalized before any operation. Each entity type registers a normalizer that standardizes field names, coerces types, and applies defaults:
+`STORAGE_ROUTES` is a static map from entity type to one of two backends:
 
-```javascript
-// lib/entity-service/normalize.js
-const normalizers = new Map();
+- `document-tasks` — task-like entities with status lifecycle: `task`, `goal`, `limitation`, `worker_task`
+- `documents` — structured knowledge: `bill`, `project`, `person`, `client`, `event`, `note`, `area`, `organization`, `recipe`, `image`, `video`, `concept`, `tool`, `booking`, `gig`, …
 
-function registerNormalizer(entityType, fn) {
-  normalizers.set(entityType, fn);
-}
-
-function normalize(entityType, data) {
-  const fn = normalizers.get(entityType);
-  if (!fn) return data;
-  return fn(data);
-}
-
-// Example: contact normalizer
-registerNormalizer('contact', (data) => ({
-  name: data.name || data.full_name || data.displayName || '',
-  email: (data.email || '').toLowerCase().trim(),
-  phone: data.phone || data.tel || null,
-  tags: Array.isArray(data.tags) ? data.tags : [],
-  created_at: data.created_at || new Date().toISOString(),
-}));
-```
-
-### Alias Resolution (routing submodule)
-
-The routing submodule resolves aliases before dispatching to CRUD operations, so callers can use natural names:
-
-```javascript
-// lib/entity-service/routing.js
-const aliases = new Map();
-
-function registerAlias(alias, canonicalType) {
-  aliases.set(alias, canonicalType);
-}
-
-function resolve(type) {
-  return aliases.get(type) || type;
-}
-
-// Registration
-registerAlias('person', 'contact');
-registerAlias('todo', 'task');
-registerAlias('doc', 'document');
-```
-
-### Universal CRUD (crud submodule)
-
-Standard create/read/update/delete operations that work for any registered entity type. Operations automatically validate, normalize, persist, and emit events:
-
-```javascript
-// lib/entity-service/crud.js
-const { resolve } = require('./routing');
-const { normalize } = require('./normalize');
-const events = require('../events');
-
-async function create(type, data) {
-  const resolved = resolve(type);
-  const normalized = normalize(resolved, data);
-  // validate against schema, throw on failure
-  const entity = await db.insert(resolved, normalized);
-  events.emit('entity.created', { type: resolved, entity });
-  return entity;
-}
-
-async function update(type, id, data) {
-  const resolved = resolve(type);
-  const normalized = normalize(resolved, data);
-  const entity = await db.update(resolved, id, normalized);
-  events.emit('entity.updated', { type: resolved, entity });
-  return entity;
-}
-
-async function remove(type, id) {
-  const resolved = resolve(type);
-  await db.delete(resolved, id);
-  events.emit('entity.deleted', { type: resolved, id });
+```typescript
+// lib/entity-service/routing.ts
+export const STORAGE_ROUTES: Record<string, StorageBackend> = {
+  task: 'document-tasks',
+  goal: 'document-tasks',
+  limitation: 'document-tasks',
+  worker_task: 'document-tasks',
+  project: 'documents',
+  person: 'documents',
+  area: 'documents',     // migrated from dedicated table Jan 2026
+  // ...
 }
 ```
 
-### Batch Operations (batch submodule)
+`fact` is intentionally NOT routed through entity-service — facts use a separate triple-store (`lib/unified-memory/facts.js`) because subject-predicate-object semantics differ from row-oriented CRUD.
 
-Bulk create, update, and delete with transaction wrapping and partial failure handling. Each operation in the batch runs independently — failures are collected, not thrown:
+### Alias Resolution
 
-```javascript
-// lib/entity-service/batch.js
-const crud = require('./crud');
+Aliases let LLM-generated calls and natural language flow through unchanged:
 
-async function batchCreate(type, items) {
-  const results = { succeeded: [], failed: [] };
+```typescript
+export const TYPE_ALIASES: Record<string, string> = {
+  contact: 'person',
+  customer: 'client',
+  todo: 'task',
+  action: 'task',
+  reminder: 'task',
+  appointment: 'event',
+  meeting: 'event',
+  initiative: 'project',
+  journal: 'note',
+  doc: 'document',
+}
 
-  await db.transaction(async (tx) => {
-    for (const item of items) {
-      try {
-        const entity = await crud.create(type, item, { tx });
-        results.succeeded.push(entity);
-      } catch (err) {
-        results.failed.push({ item, error: err.message });
-      }
+export function resolveType(entityType: string): string {
+  return TYPE_ALIASES[entityType] || entityType
+}
+```
+
+### Output Normalization
+
+Each backend stores rows in its own shape (document-tasks has top-level `dueAt`/`status`/`completedAt`; documents nests everything under `data`). `normalizeEntity` collapses both into one canonical output so callers don't branch:
+
+```typescript
+export function normalizeEntity(entity: RawEntity | null, entityType: string): NormalizedEntity | null {
+  if (!entity) return null
+  const type = resolveType(entityType)
+
+  // document-tasks shape — task-like
+  if (entity.dueAt !== undefined || entity.completedAt !== undefined) {
+    return {
+      id: entity.id, type, title: entity.title,
+      status: entity.status, priority: entity.priority,
+      dueAt: entity.dueAt, completedAt: entity.completedAt,
+      tenantId: entity.tenantId ?? entity.tenant_id,
+      createdAt: entity.createdAt ?? entity.created_at,
+      updatedAt: entity.updatedAt ?? entity.updated_at,
+      data: entity.data || {},
     }
-  });
+  }
 
-  return results;
+  // documents shape — knowledge
+  return {
+    id: entity.id,
+    type: entity.type || type,
+    title: entity.title || entity.data?.name || entity.data?.title,
+    tenantId: entity.tenant_id ?? entity.tenantId,
+    createdAt: entity.created_at,
+    updatedAt: entity.updated_at,
+    data: entity.data || {},
+  }
 }
 ```
 
-### Service Facade
+### Strict vs. Permissive Validation
 
-The top-level entity service composes the submodules into a unified API:
+`STRICT_VALIDATION_TYPES` lists types that block on schema failure. Non-strict types log a warning and accept the create — this prevents the LLM from getting stuck when it produces a partially-valid `note` but should never silently store a malformed `task`.
+
+### Function-Based Facade
+
+The top-level shim (`lib/entity-service.js`) re-exports a flat function API — no classes, no `new`:
 
 ```javascript
-// lib/entity-service.js
-const crud = require('./entity-service/crud');
-const batch = require('./entity-service/batch');
-const { registerNormalizer } = require('./entity-service/normalize');
-const { registerAlias } = require('./entity-service/routing');
-
-module.exports = {
-  create: crud.create,
-  read: crud.read,
-  update: crud.update,
-  delete: crud.remove,
-  batchCreate: batch.batchCreate,
-  batchUpdate: batch.batchUpdate,
-  batchDelete: batch.batchDelete,
-  registerNormalizer,
-  registerAlias,
-};
+// lib/entity-service.js (auto-generated from .ts)
+exports.create = require('./entity-service/crud').create
+exports.read = require('./entity-service/crud').read
+exports.update = require('./entity-service/crud').update
+exports.remove = require('./entity-service/crud').remove
+exports.list = require('./entity-service/crud').list
+exports.complete = require('./entity-service/batch').complete
+exports.reopen = require('./entity-service/batch').reopen
+exports.archive = require('./entity-service/batch').archive
+exports.getMany = require('./entity-service/batch').getMany
+exports.updateMany = require('./entity-service/batch').updateMany
+exports.deleteMany = require('./entity-service/batch').deleteMany
+exports.getSupportedTypes = require('./entity-service/batch').getSupportedTypes
+exports.isValidType = require('./entity-service/batch').isValidType
+exports.getCanonicalType = require('./entity-service/batch').getCanonicalType
+exports.STORAGE_ROUTES = require('./entity-service/routing').STORAGE_ROUTES
+exports.delete = require('./entity-service/crud').remove  // backward-compat alias
 ```
 
 ## Implications
 
-- Single service reduces code but becomes a bottleneck if it grows too complex — the submodule split mitigates this by keeping each concern isolated
-- Automatic event emission ensures downstream systems always hear about changes, but means every CRUD call has event overhead even when no one is listening
-- Alias resolution simplifies the API surface but can create confusion about canonical names — callers may not know whether "person" or "contact" is the real type
-- Batch operations with partial failure handling are essential — bulk imports rarely succeed 100%, and the caller needs to know what failed and why
-- Normalizers are registered per-type, so adding a new entity type requires writing a normalizer or accepting raw data passthrough
-- The facade pattern keeps the public API flat while the internals stay modular
+- Adding a new entity type is one line in `STORAGE_ROUTES` plus (optionally) one line in `TYPE_ALIASES` — no new service, no new normalizer required to start
+- Two backends means two SQL shapes to keep in sync; the normalizer absorbs the divergence at read time so callers never see it
+- `getInvalidationKeys` lets the cache layer key off entity changes uniformly; one event emission point means audit and websocket-fanout stay coherent
+- Permissive validation on non-strict types trades correctness for forward progress — useful when the entity is mostly downstream-consumed by humans (notes) but dangerous if downstream code blindly trusts shape
+- The thin `.js` shim over `.ts` source keeps CommonJS callers working without a TypeScript build at runtime; backward-compat `delete` alias survives because rename-everything refactors are not free
+- `fact` being out-of-band is a load-bearing exception, not an oversight — triple-store semantics don't fit the row-CRUD model
 
 ## Code Example
 
 ```javascript
-const entityService = require('./lib/entity-service');
+const entities = require('./lib/entity-service')
 
-// Register a new entity type
-entityService.registerAlias('todo', 'task');
-entityService.registerNormalizer('task', (data) => ({
-  title: data.title || data.name || 'Untitled',
-  status: data.status || 'pending',
-  priority: Number(data.priority) || 3,
-}));
+// Alias resolves automatically — 'todo' → 'task' → document-tasks backend
+const task = await entities.create('todo', {
+  title: 'Fix bug',
+  dueAt: '2026-06-01T17:00:00Z',
+  priority: 1,
+})
+// Returns normalized: { id, type: 'task', title, status, dueAt, completedAt, ... }
 
-// Single operations — alias resolves automatically
-const task = await entityService.create('todo', { name: 'Fix bug', priority: '1' });
-// → normalized to { title: 'Fix bug', status: 'pending', priority: 1 }
-// → emits entity.created { type: 'task', entity: { id: '...', ... } }
+// Lifecycle helpers wrap update for common transitions
+await entities.complete('task', task.id)
+await entities.reopen('task', task.id)
+await entities.archive('task', task.id)
 
-await entityService.update('task', task.id, { status: 'done' });
-// → emits entity.updated
+// Same API for a non-task type — routes to documents backend
+const project = await entities.create('project', {
+  name: 'Q3 launch',
+  description: 'Ship the new dashboard',
+})
 
-// Batch operations
-const results = await entityService.batchCreate('task', [
-  { title: 'Task A' },
-  { title: 'Task B' },
-  { /* invalid — missing required fields */ },
-]);
-// → results.succeeded: [taskA, taskB]
-// → results.failed: [{ item: {}, error: 'title is required' }]
+// Bulk reads don't care about backend split
+const items = await entities.getMany('task', [task.id, otherId])
 ```
 
 ## Related Patterns
 
 - [Capability Manifest Registration](./capability-manifest-registration.md)
 - [Unified Event System](./unified-event-system.md)
-- [Declarative Socket Handler Factory](./declarative-socket-handler-factory.md)
+- [Document Type System](./document-type-system.md)
+- [Database Abstraction and Schema Management](./database-abstraction-and-schema-management.md)

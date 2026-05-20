@@ -46,20 +46,39 @@ async function acquire(jobName) {
 
 ### Per-Job Timeout Configuration
 
-Different jobs have different expected durations. Lock timeouts are configured per job type to prevent both premature expiration and indefinite holds:
+Different jobs have different expected durations. Lock timeouts are configured per job type to prevent both premature expiration and indefinite holds. The default is intentionally conservative (10 minutes) — anything that needs longer must opt in explicitly:
 
 ```javascript
-const JOB_TIMEOUTS = {
-  'morning-review':       60 * 60 * 1000,   // 60 min — complex analysis
-  'dependency-check':     30 * 60 * 1000,   // 30 min
-  'health-scan':          10 * 60 * 1000,   // 10 min — quick check
-  'learning-cycle':       20 * 60 * 1000,   // 20 min
-  'cognitive-tick':       5 * 60 * 1000,    // 5 min — fast tick
-  default:                30 * 60 * 1000,   // 30 min fallback
-};
+// Default timeout: 10 minutes (most jobs should complete faster)
+const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
 
-function getTimeout(jobName) {
-  return JOB_TIMEOUTS[jobName] || JOB_TIMEOUTS.default;
+const JOB_TIMEOUTS = {
+  // Long-running cognitive work
+  'self-improve':        45 * 60 * 1000,
+  'issue-solver':        45 * 60 * 1000,
+  'autonomous-agent':    30 * 60 * 1000,
+  'riley-work':          30 * 60 * 1000,
+  'free-time':           60 * 60 * 1000,   // exploratory
+  'daily-reflection':    15 * 60 * 1000,
+
+  // Standard jobs
+  'morning':             10 * 60 * 1000,
+  'weekly-digest':       10 * 60 * 1000,
+
+  // Quick jobs — sub-minute is fine
+  'reminders':                60 * 1000,
+  'cc-budget':                60 * 1000,
+  'email-triage':         5 * 60 * 1000,
+  'sync-github-issues':   5 * 60 * 1000,
+  'sync-calendar':        5 * 60 * 1000,
+
+  // Schedulers/processors — short timeout so a crash doesn't block scheduling
+  'template-scheduler':       60 * 1000,
+  'outbound-processor':       60 * 1000,
+}
+
+function getJobTimeout(jobName) {
+  return JOB_TIMEOUTS[jobName] || DEFAULT_TIMEOUT_MS
 }
 ```
 
@@ -115,23 +134,46 @@ async function sweepExpiredLocks() {
 }
 ```
 
-### Graceful Degradation
+### Graceful Degradation with Opt-Out
 
-When Redis is unavailable, the system falls back to in-memory locks. This provides single-instance safety without external dependencies:
+When Redis is unavailable, the system falls back to in-memory locks for single-instance safety. Critical jobs can refuse the fallback via `requireDistributed: true` — if Redis is down, the acquisition fails rather than risking a duplicate run across instances:
 
 ```javascript
-function acquireLocal(jobName, token, timeout) {
-  const existing = localLocks.get(jobName);
+async function tryAcquire(jobName, options = {}) {
+  const { requireDistributed = false } = options
+  const timeout = getJobTimeout(jobName)
 
-  if (existing && Date.now() < existing.expiresAt) {
-    return null; // Lock held
+  if (redis.isEnabled()) {
+    // ... Redis SET NX PX path
   }
 
-  // Expired or doesn't exist — acquire
-  localLocks.set(jobName, { token, expiresAt: Date.now() + timeout });
-  return token;
+  if (requireDistributed) {
+    return { acquired: false, reason: 'distributed-required' }
+  }
+
+  // Local fallback — single-instance only
+  return acquireLocal(jobName, timeout)
 }
 ```
+
+### Immortal Lock Detection
+
+A lock with TTL = -1 (no expiry) is a bug — usually a Redis SET that lost its PX. The system detects these on startup and during the periodic sweep, then force-clears them so the next acquisition can proceed:
+
+```javascript
+async function sweepImmortalLocks() {
+  const keys = await redis.keys(`${LOCK_PREFIX}*`)
+  for (const key of keys) {
+    const ttl = await redis.ttl(key)
+    if (ttl === -1) {
+      logger.warn({ key }, 'Sweep: clearing immortal Redis lock')
+      await redis.del(key)
+    }
+  }
+}
+```
+
+Sweeping only immortal locks (rather than any "old-looking" lock) avoids racing with legitimately long jobs that still own their TTL.
 
 ### Lazy Messenger Initialization
 
@@ -154,9 +196,11 @@ function getMessenger() {
 - Token-based ownership prevents the "delete someone else's lock" problem that plagues simple key-based locking
 - The Lua script for release is atomic — no window between reading and deleting where another process could interfere
 - In-memory fallback means single-instance deployments don't need Redis at all
-- Per-job timeouts require maintenance — adding a new job type may need a timeout entry
-- The expiration sweep runs on an interval, so there's a window (up to 5 minutes) where an expired lock isn't yet cleaned up
-- No lock queuing — if a lock is held, the caller gets `null` immediately. Retry logic is the caller's responsibility
+- Per-job timeouts require maintenance — adding a new job type may need a timeout entry; the 10-minute default is conservative on purpose
+- The expiration sweep runs on an interval, so there's a window where an expired lock isn't yet cleaned up
+- Immortal-lock sweeping only deletes TTL=-1 keys — long-running jobs with legitimate TTLs are never disturbed
+- `requireDistributed: true` is the right setting for any job whose double-execution would corrupt data (financial postings, external API calls with side effects)
+- No lock queuing — if a lock is held, the caller gets `acquired: false` immediately. Retry logic is the caller's responsibility
 
 ## Code Example
 

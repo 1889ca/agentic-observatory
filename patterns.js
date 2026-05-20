@@ -453,4 +453,28 @@ const PATTERNS = [
     summary: "Consolidated autonomous cycle that replaces multiple standalone scheduled jobs with a single work-hour-aware job group, unifying dispatch, context sync, and stuck task detection.",
     status: "published",
   },
+  {
+    slug: "time-boxed-autonomy-boost",
+    title: "Time-Boxed Autonomy Boost",
+    summary: "User-granted temporary elevation of an agent's autonomy level with auto-expiry, per-boost action quotas, cooldowns between boosts, and named presets (meeting, focus, away, deep_work) for common scenarios.",
+    status: "published",
+  },
+  {
+    slug: "multi-step-action-plan-approval",
+    title: "Multi-Step Action Plan Approval",
+    summary: "Bundle related actions into a single numbered plan with per-step approval tiers, supporting full approval, partial approval, and rejection — so the user decides on a coherent batch instead of N individual prompts.",
+    status: "published",
+  },
+  {
+    slug: "isolated-agent-session-spawning",
+    title: "Isolated Agent Session Spawning",
+    summary: "Spawn named sub-agent sessions with per-session allowed/denied tool lists, parent-child lineage, and inter-session messaging — using AsyncLocalStorage to enforce tool filtering transparently across deeply nested calls.",
+    status: "published",
+  },
+  {
+    slug: "vibe-engine-observational-learning",
+    title: "Vibe Engine: Observational Learning Loop",
+    summary: "Five-subsystem learning loop where the agent schedules follow-up checks on its actions, auto-resolves outcomes from inbound events, infers preferences from behavior, identifies knowledge gaps, and tracks per-domain confidence.",
+    status: "published",
+  },
 ];
